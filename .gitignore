@@ -1,0 +1,28 @@
+# Go build artifacts
+/eve
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# Frontend build artifacts
+/frontend/dist
+/frontend/node_modules
+
+# Local data / SQLite
+/data
+*.db
+*.db-wal
+*.db-shm
+
+# Air tmp
+/tmp
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

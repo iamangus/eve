@@ -1,0 +1,11 @@
+root = "."
+tmp_dir = "/tmp/personal-assistant-air"
+
+[build]
+cmd = "go build -o /tmp/personal-assistant-air/main ./cmd/server/"
+bin = "/tmp/personal-assistant-air/main"
+include_ext = ["go"]
+exclude_dir = ["frontend", "data", "tmp", "vendor"]
+delay = 500
+kill_delay = 500
+log = "/tmp/personal-assistant-air-errors.log"
