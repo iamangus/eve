@@ -2,10 +2,9 @@ package store
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
-	"errors"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -19,189 +18,194 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-var ErrNotFound = errors.New("conversation not found")
-
-type Conversation struct {
-	ID          string        `json:"id"`
-	Title       string        `json:"title"`
-	CreatedAt   time.Time     `json:"created_at"`
-	UpdatedAt   time.Time     `json:"updated_at"`
-	ActiveRunID string        `json:"active_run_id,omitempty"`
-	Messages    []Message     `json:"messages,omitempty"`
-}
-
-type Message struct {
-	ID        int64      `json:"id"`
-	Role      string     `json:"role"`
-	Content   string     `json:"content"`
-	RunID     string     `json:"run_id,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
-}
-
-type ConversationSummary struct {
-	ID            string    `json:"id"`
-	Title         string    `json:"title"`
-	UpdatedAt     time.Time `json:"updated_at"`
-	MessageCount  int       `json:"message_count"`
-	ActiveRunID   string    `json:"active_run_id,omitempty"`
-}
-
-func CreateConversation(db *sql.DB, title string) (*Conversation, error) {
-	id := newID()
-	now := time.Now()
+func (s *Store) CreateConversation(title string) (*Conversation, error) {
 	if title == "" {
 		title = "New chat"
 	}
-	_, err := db.Exec(`INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`,
-		id, title, now, now)
-	if err != nil {
-		return nil, fmt.Errorf("insert conversation: %w", err)
+	id := newID()
+	now := time.Now()
+	rec := &conversationRecord{
+		title:     title,
+		created:   now,
+		updated:   now,
+		nextMsgID: 1,
 	}
+	s.mu.Lock()
+	s.convs[id] = rec
+	s.mu.Unlock()
 	return &Conversation{ID: id, Title: title, CreatedAt: now, UpdatedAt: now}, nil
 }
 
-func ListConversations(db *sql.DB) ([]ConversationSummary, error) {
-	rows, err := db.Query(`
-		SELECT c.id, c.title, c.updated_at, COALESCE(c.active_run_id, ''),
-		       (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id)
-		FROM conversations c
-		ORDER BY c.updated_at DESC`)
-	if err != nil {
-		return nil, fmt.Errorf("list conversations: %w", err)
+func (s *Store) ListConversations() []ConversationSummary {
+	s.mu.RLock()
+	out := make([]ConversationSummary, 0, len(s.convs))
+	for id, r := range s.convs {
+		out = append(out, ConversationSummary{
+			ID:           id,
+			Title:        r.title,
+			UpdatedAt:    r.updated,
+			MessageCount: len(r.messages),
+			ActiveRunID:  r.activeRunID,
+		})
 	}
-	defer rows.Close()
-	var out []ConversationSummary
-	for rows.Next() {
-		var c ConversationSummary
-		if err := rows.Scan(&c.ID, &c.Title, &c.UpdatedAt, &c.ActiveRunID, &c.MessageCount); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	s.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
+	return out
 }
 
-func GetConversation(db *sql.DB, id string) (*Conversation, error) {
-	c := &Conversation{}
-	err := db.QueryRow(`SELECT id, title, created_at, updated_at, COALESCE(active_run_id, '') FROM conversations WHERE id = ?`, id).
-		Scan(&c.ID, &c.Title, &c.CreatedAt, &c.UpdatedAt, &c.ActiveRunID)
-	if errors.Is(err, sql.ErrNoRows) {
+func (s *Store) GetConversation(id string) (*Conversation, error) {
+	s.mu.RLock()
+	r, ok := s.convs[id]
+	if !ok {
+		s.mu.RUnlock()
 		return nil, ErrNotFound
 	}
-	if err != nil {
-		return nil, fmt.Errorf("get conversation: %w", err)
+	c := Conversation{
+		ID:          id,
+		Title:       r.title,
+		CreatedAt:   r.created,
+		UpdatedAt:   r.updated,
+		ActiveRunID: r.activeRunID,
 	}
-	rows, err := db.Query(`SELECT id, role, content, COALESCE(run_id, ''), created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC`, id)
-	if err != nil {
-		return nil, fmt.Errorf("get messages: %w", err)
+	if len(r.messages) > 0 {
+		c.Messages = append([]Message(nil), r.messages...)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var m Message
-		if err := rows.Scan(&m.ID, &m.Role, &m.Content, &m.RunID, &m.CreatedAt); err != nil {
-			return nil, err
-		}
-		c.Messages = append(c.Messages, m)
-	}
-	return c, rows.Err()
+	s.mu.RUnlock()
+	return &c, nil
 }
 
-func DeleteConversation(db *sql.DB, id string) error {
-	res, err := db.Exec(`DELETE FROM conversations WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete conversation: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
+func (s *Store) DeleteConversation(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.convs[id]; !ok {
 		return ErrNotFound
 	}
+	delete(s.convs, id)
 	return nil
 }
 
-func AppendUserMessage(db *sql.DB, convID, content string) error {
-	now := time.Now()
-	_, err := db.Exec(`INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, 'user', ?, ?)`,
-		convID, content, now)
-	if err != nil {
-		return fmt.Errorf("insert user message: %w", err)
+func (s *Store) AppendUserMessage(convID, content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.convs[convID]
+	if !ok {
+		return ErrNotFound
 	}
-	_, err = db.Exec(`UPDATE conversations SET updated_at = ? WHERE id = ?`, now, convID)
-	return err
+	now := time.Now()
+	r.messages = append(r.messages, Message{
+		ID:        r.nextMsgID,
+		Role:      "user",
+		Content:   content,
+		CreatedAt: now,
+	})
+	r.nextMsgID++
+	r.updated = now
+	return nil
 }
 
-func AppendAssistantMessage(db *sql.DB, convID, runID, content string) error {
-	now := time.Now()
-	_, err := db.Exec(`INSERT INTO messages (conversation_id, role, content, run_id, created_at) VALUES (?, 'assistant', ?, ?, ?)`,
-		convID, content, runID, now)
-	if err != nil {
-		return fmt.Errorf("insert assistant message: %w", err)
+func (s *Store) AppendAssistantMessage(convID, runID, content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.convs[convID]
+	if !ok {
+		return ErrNotFound
 	}
-	_, err = db.Exec(`UPDATE conversations SET updated_at = ? WHERE id = ?`, now, convID)
-	return err
+	now := time.Now()
+	r.messages = append(r.messages, Message{
+		ID:        r.nextMsgID,
+		Role:      "assistant",
+		Content:   content,
+		RunID:     runID,
+		CreatedAt: now,
+	})
+	r.nextMsgID++
+	r.updated = now
+	return nil
 }
 
-func ConversationHistory(db *sql.DB, convID string) ([]Message, error) {
-	rows, err := db.Query(`SELECT id, role, content, COALESCE(run_id, ''), created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC`, convID)
-	if err != nil {
-		return nil, fmt.Errorf("history: %w", err)
+func (s *Store) ConversationHistory(convID string) ([]Message, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, ok := s.convs[convID]
+	if !ok {
+		return nil, ErrNotFound
 	}
-	defer rows.Close()
-	var out []Message
-	for rows.Next() {
-		var m Message
-		if err := rows.Scan(&m.ID, &m.Role, &m.Content, &m.RunID, &m.CreatedAt); err != nil {
-			return nil, err
+	if len(r.messages) == 0 {
+		return []Message{}, nil
+	}
+	return append([]Message(nil), r.messages...), nil
+}
+
+func (s *Store) SetActiveRun(convID, runID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.convs[convID]
+	if !ok {
+		return ErrNotFound
+	}
+	r.activeRunID = runID
+	r.updated = time.Now()
+	return nil
+}
+
+func (s *Store) ClearActiveRun(convID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.convs[convID]
+	if !ok {
+		return ErrNotFound
+	}
+	r.activeRunID = ""
+	r.updated = time.Now()
+	return nil
+}
+
+func (s *Store) SetTitle(convID, title string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.convs[convID]
+	if !ok {
+		return ErrNotFound
+	}
+	r.title = title
+	return nil
+}
+
+func (s *Store) UserMessageCount(convID string) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, ok := s.convs[convID]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	n := 0
+	for _, m := range r.messages {
+		if m.Role == "user" {
+			n++
 		}
-		out = append(out, m)
 	}
-	return out, rows.Err()
+	return n, nil
 }
 
-func SetActiveRun(db *sql.DB, convID, runID string) error {
-	now := time.Now()
-	_, err := db.Exec(`UPDATE conversations SET active_run_id = ?, updated_at = ? WHERE id = ?`, runID, now, convID)
-	return err
-}
-
-func ClearActiveRun(db *sql.DB, convID string) error {
-	now := time.Now()
-	_, err := db.Exec(`UPDATE conversations SET active_run_id = NULL, updated_at = ? WHERE id = ?`, now, convID)
-	return err
-}
-
-func SetTitle(db *sql.DB, convID, title string) error {
-	_, err := db.Exec(`UPDATE conversations SET title = ? WHERE id = ?`, title, convID)
-	return err
-}
-
-func UserMessageCount(db *sql.DB, convID string) (int, error) {
-	var n int
-	err := db.QueryRow(`SELECT COUNT(*) FROM messages WHERE conversation_id = ? AND role = 'user'`, convID).Scan(&n)
-	return n, err
-}
-
-func ConversationByActiveRun(db *sql.DB, runID string) (string, error) {
-	var convID string
-	err := db.QueryRow(`SELECT id FROM conversations WHERE active_run_id = ?`, runID).Scan(&convID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
+func (s *Store) ConversationByActiveRun(runID string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for id, r := range s.convs {
+		if r.activeRunID == runID {
+			return id, nil
+		}
 	}
-	return convID, err
+	return "", nil
 }
 
-func ActiveRuns(db *sql.DB) (map[string]string, error) {
-	rows, err := db.Query(`SELECT id, active_run_id FROM conversations WHERE active_run_id IS NOT NULL`)
-	if err != nil {
-		return nil, fmt.Errorf("active runs: %w", err)
-	}
-	defer rows.Close()
+func (s *Store) ActiveRuns() (map[string]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := make(map[string]string)
-	for rows.Next() {
-		var convID, runID string
-		if err := rows.Scan(&convID, &runID); err != nil {
-			return nil, err
+	for id, r := range s.convs {
+		if r.activeRunID != "" {
+			out[id] = r.activeRunID
 		}
-		out[convID] = runID
 	}
-	return out, rows.Err()
+	return out, nil
 }

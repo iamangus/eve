@@ -10,10 +10,4 @@ services:
       AGENTFOUNDRY_API_KEY: ${AGENTFOUNDRY_API_KEY:?AGENTFOUNDRY_API_KEY is required}
       ASSISTANT_AGENT_ID: ${ASSISTANT_AGENT_ID:?ASSISTANT_AGENT_ID is required}
       TITLE_AGENT_ID: ${TITLE_AGENT_ID:-}
-      DB_PATH: /data/data.db
-    volumes:
-      - eve-data:/data
     restart: unless-stopped
-
-volumes:
-  eve-data:

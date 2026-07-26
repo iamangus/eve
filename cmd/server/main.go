@@ -29,20 +29,13 @@ func main() {
 	}
 	slog.Info("loaded config", "listen", cfg.Listen, "agentfoundry", cfg.AgentFoundryURL, "agent", cfg.AssistantAgentID, "title_agent", cfg.TitleAgentID)
 
-	db, err := store.Open(cfg.DBPath)
-	if err != nil {
-		slog.Error("open store", "error", err)
-		os.Exit(1)
-	}
-	defer db.Close()
-
 	af, err := agentfoundry.NewClient(cfg.AgentFoundryURL, cfg.AgentFoundryKey)
 	if err != nil {
 		slog.Error("agentfoundry client", "error", err)
 		os.Exit(1)
 	}
 
-	chatH := chat.NewHandler(db, af, cfg)
+	chatH := chat.NewHandler(store.New(), af, cfg)
 
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
@@ -69,7 +62,7 @@ func main() {
 	defer stop()
 
 	go func() {
-		slog.Info("personal-assistant starting", "addr", cfg.Listen)
+		slog.Info("eve starting", "addr", cfg.Listen)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server error", "error", err)
 			os.Exit(1)
@@ -84,5 +77,5 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("shutdown error", "error", err)
 	}
-	slog.Info("personal-assistant stopped")
+	slog.Info("eve stopped")
 }

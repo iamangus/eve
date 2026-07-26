@@ -23,7 +23,5 @@ WORKDIR /app
 COPY --from=backend /out/eve /app/eve
 USER eve
 ENV LISTEN=:8090
-ENV DB_PATH=/data/data.db
-VOLUME ["/data"]
 EXPOSE 8090
 ENTRYPOINT ["/app/eve"]

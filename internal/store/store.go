@@ -1,43 +1,54 @@
 package store
 
 import (
-	"database/sql"
-	"fmt"
-
-	_ "modernc.org/sqlite"
+	"errors"
+	"sync"
+	"time"
 )
 
-const schema = `
-CREATE TABLE IF NOT EXISTS conversations (
-  id            TEXT PRIMARY KEY,
-  title         TEXT NOT NULL,
-  created_at    TIMESTAMP NOT NULL,
-  updated_at    TIMESTAMP NOT NULL,
-  active_run_id TEXT
-);
-CREATE TABLE IF NOT EXISTS messages (
-  id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-  role            TEXT NOT NULL,
-  content         TEXT NOT NULL,
-  run_id          TEXT,
-  created_at      TIMESTAMP NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id);
-`
+var ErrNotFound = errors.New("conversation not found")
 
-func Open(path string) (*DB, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply schema: %w", err)
-	}
-	return &DB{DB: db}, nil
+type Message struct {
+	ID        int64     `json:"id"`
+	Role      string    `json:"role"`
+	Content   string    `json:"content"`
+	RunID     string    `json:"run_id,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
-type DB struct {
-	*sql.DB
+type Conversation struct {
+	ID          string    `json:"id"`
+	Title       string    `json:"title"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	ActiveRunID string    `json:"active_run_id,omitempty"`
+	Messages    []Message `json:"messages,omitempty"`
+}
+
+type ConversationSummary struct {
+	ID           string    `json:"id"`
+	Title        string    `json:"title"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	MessageCount int       `json:"message_count"`
+	ActiveRunID  string    `json:"active_run_id,omitempty"`
+}
+
+type conversationRecord struct {
+	title       string
+	created     time.Time
+	updated     time.Time
+	activeRunID string
+	messages    []Message
+	nextMsgID   int64
+}
+
+// Store is an in-memory conversation store. It is safe for concurrent use.
+// History is lost when the process exits.
+type Store struct {
+	mu   sync.RWMutex
+	convs map[string]*conversationRecord
+}
+
+func New() *Store {
+	return &Store{convs: make(map[string]*conversationRecord)}
 }

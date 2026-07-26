@@ -15,15 +15,15 @@ import (
 )
 
 type Handler struct {
-	db       *store.DB
-	client   *agentfoundry.Client
-	agentID  string
-	titleID  string
+	store   *store.Store
+	client  *agentfoundry.Client
+	agentID string
+	titleID string
 }
 
-func NewHandler(db *store.DB, client *agentfoundry.Client, cfg config.Config) *Handler {
+func NewHandler(store *store.Store, client *agentfoundry.Client, cfg config.Config) *Handler {
 	return &Handler{
-		db:      db,
+		store:   store,
 		client:  client,
 		agentID: cfg.AssistantAgentID,
 		titleID: cfg.TitleAgentID,
@@ -40,12 +40,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 }
 
 func (h *Handler) listConversations(w http.ResponseWriter, r *http.Request) {
-	convs, err := store.ListConversations(h.db.DB)
-	if err != nil {
-		slog.Error("list conversations", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return
-	}
+	convs := h.store.ListConversations()
 	if convs == nil {
 		convs = []store.ConversationSummary{}
 	}
@@ -57,7 +52,7 @@ func (h *Handler) createConversation(w http.ResponseWriter, r *http.Request) {
 		Title string `json:"title"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	conv, err := store.CreateConversation(h.db.DB, req.Title)
+	conv, err := h.store.CreateConversation(req.Title)
 	if err != nil {
 		slog.Error("create conversation", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -68,7 +63,7 @@ func (h *Handler) createConversation(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) getConversation(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	conv, err := store.GetConversation(h.db.DB, id)
+	conv, err := h.store.GetConversation(id)
 	if errors.Is(err, store.ErrNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
@@ -86,7 +81,7 @@ func (h *Handler) getConversation(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteConversation(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := store.DeleteConversation(h.db.DB, id); errors.Is(err, store.ErrNotFound) {
+	if err := h.store.DeleteConversation(id); errors.Is(err, store.ErrNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	} else if err != nil {
@@ -118,7 +113,7 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prior, err := store.ConversationHistory(h.db.DB, convID)
+	prior, err := h.store.ConversationHistory(convID)
 	if err != nil {
 		slog.Error("load history", "conv", convID, "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -128,14 +123,14 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		prior = []store.Message{}
 	}
 
-	userCount, err := store.UserMessageCount(h.db.DB, convID)
+	userCount, err := h.store.UserMessageCount(convID)
 	if err != nil {
 		slog.Error("count user messages", "conv", convID, "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
 
-	if err := store.AppendUserMessage(h.db.DB, convID, req.Content); err != nil {
+	if err := h.store.AppendUserMessage(convID, req.Content); err != nil {
 		slog.Error("append user message", "conv", convID, "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
@@ -146,7 +141,7 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		if len(defaultTitle) > 40 {
 			defaultTitle = strings.TrimSpace(defaultTitle[:40]) + "…"
 		}
-		_ = store.SetTitle(h.db.DB, convID, defaultTitle)
+		_ = h.store.SetTitle(convID, defaultTitle)
 	}
 
 	history := make([]agentfoundry.Message, 0, len(prior))
@@ -161,7 +156,7 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := store.SetActiveRun(h.db.DB, convID, runID); err != nil {
+	if err := h.store.SetActiveRun(convID, runID); err != nil {
 		slog.Error("set active run", "conv", convID, "run", runID, "error", err)
 	}
 
@@ -209,7 +204,7 @@ func (h *Handler) generateTitle(convID, firstMessage string) {
 	if title == "" {
 		return
 	}
-	if err := store.SetTitle(h.db.DB, convID, title); err != nil {
+	if err := h.store.SetTitle(convID, title); err != nil {
 		slog.Error("set title", "conv", convID, "error", err)
 		return
 	}

@@ -13,7 +13,7 @@
 - Go 1.25.3, module path `github.com/iamangus/eve`.
 - Standard library `net/http` with `http.ServeMux` path patterns (`GET /api/...`).
 - `log/slog` text handler for logging.
-- SQLite via pure-Go `modernc.org/sqlite` (no CGO). Driver name `sqlite`.
+- In-memory conversation/message store (`internal/store`). No external deps.
 - Frontend: Svelte 5 (runes, `$state`/`$effect`), Vite 6, `marked` for markdown. Mirrors `../agentfoundry-ui/frontend`.
 - Embed `frontend/dist` via `//go:embed all:dist` in `frontend/embed.go`.
 - SPA fallback: serve `index.html` for any non-API path (see `internal/web`).
@@ -21,7 +21,7 @@
 
 ## Architecture constraints
 
-- This service owns conversation history (SQLite). agentfoundry is stateless
+- This service owns conversation history (in-memory). agentfoundry is stateless
   w.r.t. our chats: we use the **stateless** run path
   `POST /api/v1/agents/{id}/run` with `history` (role+content only) and NO
   `session_id`. Never send `tool_calls`/`tool_call_id` in history.

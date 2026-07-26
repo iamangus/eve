@@ -9,9 +9,8 @@ type Config struct {
 	Listen            string
 	AgentFoundryURL   string
 	AgentFoundryKey   string
-	AssistantAgentID  string
-	TitleAgentID      string
-	DBPath            string
+	AssistantAgentID string
+	TitleAgentID     string
 }
 
 func Load() (Config, error) {
@@ -21,7 +20,6 @@ func Load() (Config, error) {
 		AgentFoundryKey:  os.Getenv("AGENTFOUNDRY_API_KEY"),
 		AssistantAgentID: os.Getenv("ASSISTANT_AGENT_ID"),
 		TitleAgentID:     os.Getenv("TITLE_AGENT_ID"),
-		DBPath:          envOr("DB_PATH", "./data.db"),
 	}
 	if cfg.AgentFoundryKey == "" {
 		return Config{}, fmt.Errorf("AGENTFOUNDRY_API_KEY is required")

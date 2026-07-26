@@ -2,7 +2,7 @@
 
 Chat interface and conversation owner for a single fixed agent that lives in
 [agentfoundry](../agentfoundry). This service owns conversation history locally
-(SQLite) and triggers agent runs in agentfoundry via its stateless run API.
+(in-memory) and triggers agent runs in agentfoundry via its stateless run API.
 agentfoundry remains responsible for the agent definition, tools/MCP servers,
 LLM inference, and run dispatch (Temporal).
 
@@ -10,16 +10,16 @@ LLM inference, and run dispatch (Temporal).
 
 ```
 Browser ──HTTP──> eve BFF ──HTTP + Bearer API key──> agentfoundry
-  (Svelte 5)     (Go, net/http, SQLite)    POST /api/v1/agents/{ASSISTANT_AGENT_ID}/run
+  (Svelte 5)     (Go, net/http, in-memory)    POST /api/v1/agents/{ASSISTANT_AGENT_ID}/run
                                            GET  /api/v1/runs/{run_id}/events (SSE)
 ```
 
-- Conversations and messages are stored in a local SQLite database.
+- Conversations and messages are kept in memory.
 - On send, the BFF reconstructs `History` (role+content) from stored messages
   and calls agentfoundry's **stateless** run path (`POST /api/v1/agents/{id}/run`
   with `history`, no `session_id`). agentfoundry never persists our history.
 - The BFF proxies agentfoundry's SSE run-events stream verbatim to the browser;
-  on the `done` event it persists the final assistant text to SQLite and clears
+  on the `done` event it persists the final assistant text in memory and clears
   the conversation's `active_run_id`. On `error` it clears `active_run_id`.
 - On startup the BFF reconciles any conversations with an in-flight
   `active_run_id` by polling agentfoundry's `GET /api/v1/runs/{id}`.
@@ -51,7 +51,6 @@ All configuration is via environment variables (no YAML).
 | `AGENTFOUNDRY_API_KEY` | *(required)* | Personal API key created in agentfoundry (`POST /api/v1/api-keys`). Sent as `Authorization: Bearer <key>`. Runs are attributed to the key owner. |
 | `ASSISTANT_AGENT_ID` | *(required)* | Agent id of the eve assistant agent in agentfoundry |
 | `TITLE_AGENT_ID` | *(empty, optional)* | Agent id of a small-model agent used to generate conversation titles. If empty, titles are truncated from the first user message. |
-| `DB_PATH` | `./data.db` | SQLite database file path |
 
 ## Build and Run
 
@@ -96,22 +95,27 @@ docker run -p 8090:8090 \
   eve
 ```
 
-## SQLite schema
+## In-memory store
 
-```sql
-CREATE TABLE conversations (
-  id            TEXT PRIMARY KEY,
-  title         TEXT NOT NULL,
-  created_at    TIMESTAMP NOT NULL,
-  updated_at    TIMESTAMP NOT NULL,
-  active_run_id TEXT
-);
-CREATE TABLE messages (
-  id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-  role            TEXT NOT NULL,            -- 'user' | 'assistant'
-  content         TEXT NOT NULL,
-  run_id          TEXT,
-  created_at      TIMESTAMP NOT NULL
-);
+History lives in a Go map guarded by a sync.RWMutex (`internal/store`).
+Each conversation holds its own ordered `[]Message`. All state is lost when
+the process exits.
+
+```go
+type Conversation struct {
+    ID          string
+    Title       string
+    CreatedAt   time.Time
+    UpdatedAt   time.Time
+    ActiveRunID string
+    Messages    []Message
+}
+
+type Message struct {
+    ID        int64
+    Role      string   // "user" | "assistant"
+    Content   string
+    RunID     string
+    CreatedAt time.Time
+}
 ```

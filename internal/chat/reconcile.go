@@ -4,14 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"time"
-
-	"github.com/iamangus/eve/internal/store"
 )
 
-// Reconcile periodically polls agentfoundry for conversations that have an
-// in-flight active_run_id (e.g. after a BFF crash mid-stream) and finalizes
-// them: persists the assistant text if the run completed, or clears the
-// active_run_id if the run is gone/errored.
 func (h *Handler) Reconcile(ctx context.Context) {
 	const pollInterval = 2 * time.Second
 
@@ -30,7 +24,7 @@ func (h *Handler) Reconcile(ctx context.Context) {
 }
 
 func (h *Handler) reconcileOnce(ctx context.Context) {
-	runs, err := store.ActiveRuns(h.db.DB)
+	runs, err := h.store.ActiveRuns()
 	if err != nil {
 		slog.Error("reconcile active runs", "error", err)
 		return
@@ -48,19 +42,19 @@ func (h *Handler) reconcileRun(ctx context.Context, convID, runID string) error 
 
 	rs, err := h.client.GetRun(pollCtx, runID)
 	if err != nil {
-		_ = store.ClearActiveRun(h.db.DB, convID)
+		_ = h.store.ClearActiveRun(convID)
 		return err
 	}
 	switch rs.Status {
 	case "completed":
 		if rs.Response != "" {
-			if err := store.AppendAssistantMessage(h.db.DB, convID, runID, rs.Response); err != nil {
+			if err := h.store.AppendAssistantMessage(convID, runID, rs.Response); err != nil {
 				return err
 			}
 		}
-		return store.ClearActiveRun(h.db.DB, convID)
+		return h.store.ClearActiveRun(convID)
 	case "failed", "cancelled", "canceled", "error", "unknown":
-		return store.ClearActiveRun(h.db.DB, convID)
+		return h.store.ClearActiveRun(convID)
 	default:
 		return nil
 	}
