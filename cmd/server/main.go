@@ -11,12 +11,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/iamangus/eve/frontend"
 	"github.com/iamangus/eve/internal/agentfoundry"
 	"github.com/iamangus/eve/internal/chat"
 	"github.com/iamangus/eve/internal/config"
+	"github.com/iamangus/eve/internal/email"
 	"github.com/iamangus/eve/internal/store"
+	"github.com/iamangus/eve/internal/trigger"
 	"github.com/iamangus/eve/internal/web"
-	"github.com/iamangus/eve/frontend"
 )
 
 func main() {
@@ -37,13 +39,29 @@ func main() {
 
 	chatH := chat.NewHandler(store.New(), af, cfg)
 
+	emailStore, err := store.NewEmailStore(cfg.DataDir)
+	if err != nil {
+		slog.Error("email store", "dir", cfg.DataDir, "error", err)
+		os.Exit(1)
+	}
+
+	const triggerRunTimeout = 5 * time.Minute
+	engine := trigger.NewEngine(emailStore, af, cfg.AssistantAgentID, triggerRunTimeout)
+	triggerH := trigger.NewHandler(emailStore, af, engine)
+
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
 
 	go chatH.Reconcile(rootCtx)
 
+	poller := email.NewPoller(emailStore, func(ctx context.Context, acct store.Account, msg store.EmailMessage) {
+		engine.HandleEmail(ctx, acct, msg)
+	}, cfg.EmailPollInterval)
+	go poller.Run(rootCtx)
+
 	mux := http.NewServeMux()
 	chatH.RegisterRoutes(mux)
+	triggerH.RegisterRoutes(mux)
 
 	distFS, err := fs.Sub(frontend.Dist, "dist")
 	if err != nil {

@@ -40,6 +40,27 @@ Near-term extensions along the same pattern (not yet implemented):
 - **Topic tagging / smart suggestions**: a small agent that tags
   conversations or suggests follow-up prompts for the sidebar.
 
+## Email triggers
+
+eve can watch IMAP inboxes and run the assistant agent when incoming mail
+matches a configured trigger.
+
+- Add an **email account** (IMAP host, port, credentials) from the UI and test
+  the connection.
+- Create **triggers** against an account with `contains` filters on `sender`,
+  `recipient`, `subject`, or `body`. All of a trigger's filters must match.
+  Each trigger also has a user **prompt**.
+- On every poll (`EMAIL_POLL_INTERVAL`), new mail (UID greater than the last
+  seen) is matched against each enabled trigger of its account. On a match eve
+  runs `ASSISTANT_AGENT_ID` with the trigger prompt plus the email details and
+  records the outcome in a **runs** log (status, agent result, error).
+- The first poll of a new account only ingests the last 7 days of mail.
+- Accounts, triggers, and run history persist as JSON in `DATA_DIR`
+  (`accounts.json`, `triggers.json`, `runs.json`). Account passwords are stored
+  in plaintext in `accounts.json` — fine for a single-user self-hosted
+  deployment, not for shared hosting. Run history is capped at the latest 1000
+  runs.
+
 ## Configuration
 
 All configuration is via environment variables (no YAML).
@@ -51,6 +72,8 @@ All configuration is via environment variables (no YAML).
 | `AGENTFOUNDRY_API_KEY` | *(required)* | Personal API key created in agentfoundry (`POST /api/v1/api-keys`). Sent as `Authorization: Bearer <key>`. Runs are attributed to the key owner. |
 | `ASSISTANT_AGENT_ID` | *(required)* | Agent id of the eve assistant agent in agentfoundry |
 | `TITLE_AGENT_ID` | *(empty, optional)* | Agent id of a small-model agent used to generate conversation titles. If empty, titles are truncated from the first user message. |
+| `DATA_DIR` | `./data` | Directory for JSON persistence of email accounts, triggers, and runs |
+| `EMAIL_POLL_INTERVAL` | `60s` | How often eve polls configured IMAP inboxes (Go duration, e.g. `30s`) |
 
 ## Build and Run
 
@@ -91,6 +114,7 @@ docker run -p 8090:8090 \
   -e AGENTFOUNDRY_URL=http://host.docker.internal:3000 \
   -e AGENTFOUNDRY_API_KEY=... \
   -e ASSISTANT_AGENT_ID=... \
+  -e DATA_DIR=/data \
   -v $(pwd)/data:/data \
   eve
 ```
