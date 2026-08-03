@@ -77,6 +77,16 @@ func FetchNew(a store.Account) ([]store.EmailMessage, uint32, error) {
 		return nil, a.LastUID, nil
 	}
 
+	// The search result is authoritative for the cursor: its UIDs are the
+	// exact messages that matched, independent of how (or whether) the per-
+	// message UID is populated in the FETCH response.
+	var maxUID uint32
+	for _, u := range uids {
+		if uint32(u) > maxUID {
+			maxUID = uint32(u)
+		}
+	}
+
 	fetchSet := imap.UIDSet{}
 	for _, u := range uids {
 		fetchSet.AddNum(u)
@@ -91,11 +101,7 @@ func FetchNew(a store.Account) ([]store.EmailMessage, uint32, error) {
 	}
 
 	var msgs []store.EmailMessage
-	var maxUID uint32
 	for _, b := range bufs {
-		if uint32(b.UID) > maxUID {
-			maxUID = uint32(b.UID)
-		}
 		if m := buildMessage(b); m != nil {
 			msgs = append(msgs, *m)
 		}

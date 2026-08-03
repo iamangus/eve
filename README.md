@@ -59,7 +59,8 @@ matches a configured trigger.
   (`accounts.json`, `triggers.json`, `runs.json`). Account passwords are stored
   in plaintext in `accounts.json` — fine for a single-user self-hosted
   deployment, not for shared hosting. Run history is capped at the latest 1000
-  runs.
+  runs. A `processed.json` set records delivered message IDs so a message is
+  handled at most once even if it is re-fetched.
 
 ## Configuration
 

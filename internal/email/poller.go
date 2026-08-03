@@ -59,7 +59,7 @@ func (p *Poller) pollAccount(ctx context.Context, acct store.Account) {
 	for _, m := range msgs {
 		p.sink(ctx, acct, m)
 	}
-	if len(msgs) > 0 && newUID > acct.LastUID {
+	if newUID > acct.LastUID {
 		if err := p.accounts.SetAccountLastUID(acct.ID, newUID); err != nil {
 			slog.Error("email poll cursor", "account", acct.Address, "error", err)
 		}

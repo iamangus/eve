@@ -98,3 +98,46 @@ func TestEmailStoreDeleteAccountCascades(t *testing.T) {
 		t.Fatal("expected cascading delete of account, triggers, and runs")
 	}
 }
+
+func TestEmailStoreAtMostOnce(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := NewEmailStore(dir)
+
+	if s.IsProcessed("acct1", "msg-1") {
+		t.Fatal("unprocessed message should not be marked")
+	}
+	if err := s.MarkProcessed("acct1", "msg-1"); err != nil {
+		t.Fatal(err)
+	}
+	if !s.IsProcessed("acct1", "msg-1") {
+		t.Fatal("processed message should be marked")
+	}
+	if s.IsProcessed("acct1", "msg-2") {
+		t.Fatal("different message should not be marked")
+	}
+	if s.IsProcessed("acct2", "msg-1") {
+		t.Fatal("same message id under different account should not be marked")
+	}
+
+	reloaded, err := NewEmailStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.IsProcessed("acct1", "msg-1") {
+		t.Fatal("processed set should survive restart")
+	}
+}
+
+func TestEmailStoreAtMostOnceEmptyMessageID(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := NewEmailStore(dir)
+	if s.IsProcessed("acct1", "") {
+		t.Fatal("empty message id should never be treated as processed")
+	}
+	if err := s.MarkProcessed("acct1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if s.IsProcessed("acct1", "") {
+		t.Fatal("empty message id should never be marked processed")
+	}
+}

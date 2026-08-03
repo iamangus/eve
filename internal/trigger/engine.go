@@ -23,16 +23,27 @@ func NewEngine(st *store.EmailStore, client *agentfoundry.Client, agentID string
 }
 
 // HandleEmail is the poller sink: it matches the message against every enabled
-// trigger of the account and fires the agent for each match.
+// trigger of the account and fires the agent for each match. Messages already
+// handled (by Message-ID) are skipped so a delivery never re-triggers.
 func (e *Engine) HandleEmail(ctx context.Context, acct store.Account, msg store.EmailMessage) {
+	if e.store.IsProcessed(acct.ID, msg.MessageID) {
+		return
+	}
 	triggers, err := e.store.EnabledTriggersForAccount(acct.ID)
 	if err != nil {
 		slog.Error("load triggers", "account", acct.ID, "error", err)
 		return
 	}
+	matched := false
 	for _, t := range triggers {
 		if Matches(t, msg) {
+			matched = true
 			e.fire(ctx, t, msg)
+		}
+	}
+	if matched {
+		if err := e.store.MarkProcessed(acct.ID, msg.MessageID); err != nil {
+			slog.Error("mark processed", "account", acct.ID, "error", err)
 		}
 	}
 }

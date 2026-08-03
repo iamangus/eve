@@ -14,6 +14,10 @@ import (
 
 const maxStoredRuns = 1000
 
+// maxProcessed bounds the dedup set of processed message IDs. Excess entries
+// are evicted oldest-first.
+const maxProcessed = 10000
+
 type Account struct {
 	ID        string    `json:"id"`
 	Address   string    `json:"address"`
@@ -68,11 +72,13 @@ type TriggerRun struct {
 // EmailStore is a JSON-file-backed store for email accounts, triggers, and
 // trigger runs. It survives process restarts and is safe for concurrent use.
 type EmailStore struct {
-	mu       sync.Mutex
-	dir      string
-	accounts []Account
-	triggers []Trigger
-	runs     []TriggerRun
+	mu           sync.Mutex
+	dir          string
+	accounts     []Account
+	triggers     []Trigger
+	runs         []TriggerRun
+	processed    []string
+	processedIdx map[string]bool
 }
 
 func NewEmailStore(dir string) (*EmailStore, error) {
@@ -102,6 +108,9 @@ func (s *EmailStore) load() error {
 	s.accounts = accounts
 	s.triggers = triggers
 	s.runs = runs
+	if err := s.loadProcessed(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -410,4 +419,59 @@ func (s *EmailStore) UpdateRun(r TriggerRun) error {
 	}
 	s.runs[i] = r
 	return s.saveJSON("runs.json", s.runs)
+}
+
+func processedKey(accountID, messageID string) string {
+	return accountID + "|" + messageID
+}
+
+func (s *EmailStore) loadProcessed() error {
+	var processed []string
+	if err := s.loadJSON("processed.json", &processed); err != nil {
+		return err
+	}
+	s.processed = processed
+	s.processedIdx = make(map[string]bool, len(processed))
+	for _, k := range processed {
+		s.processedIdx[k] = true
+	}
+	return nil
+}
+
+func (s *EmailStore) saveProcessed() error {
+	return s.saveJSON("processed.json", s.processed)
+}
+
+// IsProcessed reports whether a message (identified by its account and
+// Message-ID) has already been handled, enabling at-most-once delivery.
+func (s *EmailStore) IsProcessed(accountID, messageID string) bool {
+	if messageID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.processedIdx[processedKey(accountID, messageID)]
+}
+
+// MarkProcessed records a message as handled so it is not processed again.
+func (s *EmailStore) MarkProcessed(accountID, messageID string) error {
+	if messageID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := processedKey(accountID, messageID)
+	if s.processedIdx[k] {
+		return nil
+	}
+	s.processed = append(s.processed, k)
+	s.processedIdx[k] = true
+	if len(s.processed) > maxProcessed {
+		overflow := len(s.processed) - maxProcessed
+		for i := 0; i < overflow; i++ {
+			delete(s.processedIdx, s.processed[i])
+		}
+		s.processed = append([]string(nil), s.processed[overflow:]...)
+	}
+	return s.saveProcessed()
 }
