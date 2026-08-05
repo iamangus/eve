@@ -11,20 +11,23 @@ import (
 
 	"github.com/iamangus/eve/internal/agentfoundry"
 	"github.com/iamangus/eve/internal/config"
+	ctxmgr "github.com/iamangus/eve/internal/context"
 	"github.com/iamangus/eve/internal/store"
 )
 
 type Handler struct {
 	store   *store.Store
 	client  *agentfoundry.Client
+	ctxMgr  *ctxmgr.Manager
 	agentID string
 	titleID string
 }
 
-func NewHandler(store *store.Store, client *agentfoundry.Client, cfg config.Config) *Handler {
+func NewHandler(store *store.Store, client *agentfoundry.Client, cfg config.Config, ctxMgr *ctxmgr.Manager) *Handler {
 	return &Handler{
 		store:   store,
 		client:  client,
+		ctxMgr:  ctxMgr,
 		agentID: cfg.AssistantAgentID,
 		titleID: cfg.TitleAgentID,
 	}
@@ -144,9 +147,13 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		_ = h.store.SetTitle(convID, defaultTitle)
 	}
 
-	history := make([]agentfoundry.Message, 0, len(prior))
-	for _, m := range prior {
-		history = append(history, agentfoundry.Message{Role: m.Role, Content: m.Content})
+	history, _, renderErr := h.ctxMgr.RenderHistory(convID)
+	if renderErr != nil {
+		slog.Warn("render history", "conv", convID, "error", renderErr)
+		history = make([]agentfoundry.Message, 0, len(prior))
+		for _, m := range prior {
+			history = append(history, agentfoundry.Message{Role: m.Role, Content: m.Content})
+		}
 	}
 
 	runID, err := h.client.RunAgent(r.Context(), h.agentID, req.Content, history)

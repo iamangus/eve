@@ -34,6 +34,7 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 			slog.Warn("reconcile run", "conv", convID, "run", runID, "error", err)
 		}
 	}
+	h.ctxMgr.MaybeCompact(ctx)
 }
 
 func (h *Handler) reconcileRun(ctx context.Context, convID, runID string) error {

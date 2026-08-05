@@ -3,12 +3,10 @@
   import { marked } from 'marked'
   marked.setOptions({ gfm: true, breaks: true })
 
-  let conversations = $state([])
   let currentConv = $state(null)
   let messages = $state([])
   let newMessage = $state('')
   let loading = $state(true)
-  let sidebarOpen = $state(true)
   let messageListEl = $state(null)
 
   let streamBubbles = $state([])
@@ -18,32 +16,38 @@
   let eventSource = $state(null)
 
   $effect(() => {
-    loadConversations()
+    loadPrimary()
     return () => {
       eventSource?.close()
     }
   })
 
-  async function loadConversations() {
+  async function loadPrimary() {
     try {
-      conversations = await api.get('/api/conversations')
+      const convs = await api.get('/api/conversations')
 
       const url = new URL(window.location.href)
       const convId = url.searchParams.get('conv')
+      let conv = null
       if (convId) {
-        const c = conversations.find(s => s.id === convId)
-        if (c) await selectConversation(c)
+        conv = convs.find(s => s.id === convId)
       }
+      if (!conv && convs.length > 0) {
+        conv = convs[0]
+      }
+      if (!conv) {
+        conv = await api.post('/api/conversations', {})
+        navigate('/?conv=' + conv.id)
+      }
+      await selectConversation(conv)
     } catch (e) {
-      console.error('Failed to load conversations', e)
+      console.error('Failed to load conversation', e)
     } finally {
       loading = false
     }
   }
 
   async function selectConversation(conv) {
-    currentConv = conv
-    navigate('/?conv=' + conv.id)
     try {
       const full = await api.get('/api/conversations/' + conv.id)
       currentConv = full
@@ -59,31 +63,6 @@
       }
     } catch (e) {
       console.error('Failed to load conversation', e)
-    }
-  }
-
-  async function newConversation() {
-    try {
-      const conv = await api.post('/api/conversations', {})
-      conversations = [conv, ...conversations]
-      await selectConversation(conv)
-    } catch (e) {
-      console.error('Failed to create conversation', e)
-    }
-  }
-
-  async function deleteConversation(conv) {
-    if (!confirm('Delete this conversation?')) return
-    try {
-      await api.del('/api/conversations/' + conv.id)
-      conversations = conversations.filter(c => c.id !== conv.id)
-      if (currentConv?.id === conv.id) {
-        currentConv = null
-        messages = []
-        navigate('/?')
-      }
-    } catch (e) {
-      console.error('Failed to delete conversation', e)
     }
   }
 
@@ -192,8 +171,28 @@
   async function refreshConversationMeta() {
     try {
       const list = await api.get('/api/conversations')
-      conversations = list
+      if (list.length > 0) {
+        const full = await api.get('/api/conversations/' + list[0].id)
+        currentConv = full
+      }
     } catch {}
+  }
+
+  function summarizedBoundary() {
+    return currentConv?.summarized_up_to || 0
+  }
+
+  function gapBetween(prev, next) {
+    if (!prev || !next) return ''
+    const d = new Date(next.created_at).getTime() - new Date(prev.created_at).getTime()
+    if (d < 5 * 60 * 1000) return ''
+    const mins = Math.floor(d / 60000)
+    const h = Math.floor(mins / 60)
+    const m = mins % 60
+    const days = Math.floor(h / 24)
+    if (days > 0) return '+' + days + 'd ' + (h % 24) + 'h'
+    if (h > 0) return '+' + h + 'h' + (m > 0 ? ' ' + m + 'm' : '')
+    return '+' + m + 'm'
   }
 
   function scrollDown() {
@@ -215,56 +214,29 @@
   }
 </script>
 
-<aside class="sidebar" class:collapsed={!sidebarOpen}>
-  <div class="sidebar-inner">
-    <div class="sidebar-section">
-      <button class="new-chat-btn" onclick={newConversation}>
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width:16px;height:16px;">
-          <path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-        </svg>
-        New chat
-      </button>
-    </div>
-    <div class="sidebar-section" style="padding-top:0;">
-      <div class="sb-section-label">Conversations</div>
-    </div>
-    <div class="session-list">
-      {#if loading}
-        <div class="session-empty">Loading…</div>
-      {:else if conversations.length === 0}
-        <div class="session-empty">No chats yet</div>
-      {:else}
-        {#each conversations as c}
-          <button
-            class="session-row"
-            class:active={currentConv?.id === c.id}
-            onclick={() => selectConversation(c)}
-          >
-            <span class="session-name">{c.title}</span>
-            <span class="session-preview">{c.message_count} messages</span>
-            <span class="session-del" onclick={(e) => { e.stopPropagation(); deleteConversation(c) }} title="Delete">✕</span>
-          </button>
-        {/each}
-      {/if}
-    </div>
-  </div>
-</aside>
-
 <main class="chat">
-  {#if currentConv}
+  {#if loading}
+    <div class="empty-state">
+      <p class="empty-title">Loading…</p>
+    </div>
+  {:else if currentConv}
     <div class="chat-layout">
       <div class="chat-head">
-        <button class="sidebar-toggle-btn" onclick={() => sidebarOpen = !sidebarOpen} aria-label="Toggle sidebar">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/>
-          </svg>
-        </button>
         <span class="chat-head-name">{currentConv.title}</span>
         <span class="chat-head-badge">{messages.length} messages</span>
+        {#if summarizedBoundary() > 0}
+          <span class="chat-head-badge summary-badge">summarized</span>
+        {/if}
       </div>
 
       <div class="chat-body" bind:this={messageListEl}>
-        {#each messages as msg}
+        {#each messages as msg, i (msg.id || i)}
+          {#if i > 0 && gapBetween(messages[i - 1], msg)}
+            <div class="time-gap">{gapBetween(messages[i - 1], msg)}</div>
+          {/if}
+          {#if msg.id > summarizedBoundary() && i > 0 && messages[i - 1].id <= summarizedBoundary()}
+            <div class="summ-divider">↑ earlier conversation summarized</div>
+          {/if}
           <div class="msg-row" class:msg-right={msg.role === 'user'} class:msg-left={msg.role !== 'user'}>
             <div class="bubble" class:bubble-user={msg.role === 'user'} class:bubble-bot={msg.role !== 'user'}>
               {#if msg.role === 'user'}
@@ -316,87 +288,14 @@
       </div>
     </div>
   {:else}
-    <div class="chat-layout">
-      <div class="chat-head">
-        <button class="sidebar-toggle-btn" onclick={() => sidebarOpen = !sidebarOpen} aria-label="Toggle sidebar">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/>
-          </svg>
-        </button>
-      </div>
-      <div class="empty-state">
-        <div class="empty-icon">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-          </svg>
-        </div>
-        <p class="empty-title">No chat selected</p>
-        <p class="empty-sub">Start a new chat from the sidebar.</p>
-      </div>
+    <div class="empty-state">
+      <p class="empty-title">No chat selected</p>
+      <p class="empty-sub">Start a new chat from the sidebar.</p>
     </div>
   {/if}
 </main>
 
 <style>
-  .sidebar {
-    background: var(--bg-sidebar);
-    border-right: 1px solid var(--border);
-    width: 260px;
-    min-width: 260px;
-    overflow: hidden;
-    transition: width 0.2s ease, min-width 0.2s ease;
-  }
-  .sidebar.collapsed {
-    width: 0; min-width: 0; border-right: none;
-  }
-  .sidebar-inner {
-    display: flex; flex-direction: column; height: 100%;
-  }
-  .sidebar-section {
-    padding: 16px 12px 10px;
-  }
-  .sb-section-label {
-    font-size: 0.65rem; font-weight: 600; text-transform: uppercase;
-    letter-spacing: 0.08em; color: #52525b; margin-bottom: 6px; padding: 0 4px;
-  }
-  .new-chat-btn {
-    width: 100%; display: flex; align-items: center; justify-content: center; gap: 6px;
-    padding: 9px 12px; border-radius: 9px; border: 1px solid var(--border);
-    background: var(--purple-dim); color: var(--text-base); cursor: pointer;
-    font-family: inherit; font-size: 0.85rem; font-weight: 500;
-    transition: background 0.12s, border-color 0.12s;
-  }
-  .new-chat-btn:hover { background: oklch(34% 0.14 292.7); border-color: oklch(59.1% 0.249 292.7 / 0.4); }
-  .session-list {
-    flex: 1; overflow-y: auto; padding: 4px 12px;
-  }
-  .session-empty {
-    padding: 16px 4px; color: var(--text-muted); font-size: 0.82rem;
-  }
-  .session-row {
-    display: flex; flex-direction: column; position: relative;
-    padding: 8px 10px; border-radius: 8px;
-    cursor: pointer; border: none; background: none; color: inherit;
-    width: 100%; text-align: left; font-family: inherit;
-    transition: background 0.12s, border-color 0.12s;
-    border: 1px solid transparent; margin: 2px 0;
-  }
-  .session-row:hover { background: var(--bg-card); color: var(--text-base); }
-  .session-row:hover .session-del { opacity: 1; }
-  .session-row.active {
-    background: var(--purple-dim);
-    border-color: oklch(59.1% 0.249 292.7 / 0.25);
-    color: var(--text-base);
-  }
-  .session-name { font-size: 0.82rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 16px; }
-  .session-preview { font-size: 0.72rem; color: var(--text-muted); margin-top: 2px; }
-  .session-del {
-    position: absolute; top: 50%; right: 6px; transform: translateY(-50%);
-    font-size: 0.7rem; color: var(--text-muted); opacity: 0;
-    cursor: pointer; padding: 2px 4px; border-radius: 4px; transition: opacity 0.1s, background 0.1s;
-  }
-  .session-del:hover { background: oklch(20% 0.04 0); color: oklch(70% 0.2 20); }
-
   .chat { display: flex; flex-direction: column; height: 100%; overflow: hidden; flex: 1; }
   .chat-layout { display: flex; flex-direction: column; height: 100%; }
 
@@ -412,6 +311,7 @@
     border: 1px solid oklch(59.1% 0.249 292.7 / 0.3);
     padding: 2px 8px; border-radius: 20px;
   }
+  .summary-badge { color: oklch(80% 0.18 145); border-color: oklch(65% 0.18 145 / 0.3); }
 
   .chat-body {
     flex: 1; overflow-y: auto; padding: 28px 24px;
@@ -430,6 +330,17 @@
   }
   .bubble-bot {
     background: var(--bg-card); border: 1px solid var(--border); border-bottom-left-radius: 4px;
+  }
+
+  .time-gap {
+    align-self: center; font-size: 0.68rem; color: var(--text-muted);
+    background: var(--bg-card); border: 1px solid var(--border);
+    padding: 1px 10px; border-radius: 10px; margin: 8px 0 4px;
+  }
+  .summ-divider {
+    align-self: stretch; text-align: center; font-size: 0.68rem; color: var(--text-muted);
+    border-top: 1px dashed var(--border); margin: 14px 0 10px; padding-top: 8px;
+    text-transform: uppercase; letter-spacing: 0.08em;
   }
 
   .chat-foot {
@@ -463,15 +374,6 @@
   .send-btn:disabled { opacity: 0.5; pointer-events: none; }
   .send-btn svg { width: 16px; height: 16px; }
 
-  .sidebar-toggle-btn {
-    flex-shrink: 0; width: 30px; height: 30px; border-radius: 7px;
-    border: 1px solid var(--border); background: var(--bg-card); color: var(--text-muted);
-    cursor: pointer; display: flex; align-items: center; justify-content: center;
-    transition: background 0.12s, color 0.12s;
-  }
-  .sidebar-toggle-btn:hover { background: var(--purple-dim); color: var(--text-base); }
-  .sidebar-toggle-btn svg { width: 14px; height: 14px; pointer-events: none; }
-
   .thinking-bubble {
     background: var(--bg-card); border: 1px solid var(--border); border-bottom-left-radius: 4px;
     padding: 14px 18px; border-radius: 14px;
@@ -493,7 +395,6 @@
     flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
     color: var(--text-muted);
   }
-  .empty-icon svg { width: 56px; height: 56px; }
   .empty-title { font-size: 1.05rem; font-weight: 600; color: var(--text-base); margin: 14px 0 4px; }
   .empty-sub { font-size: 0.85rem; margin: 0; }
 </style>

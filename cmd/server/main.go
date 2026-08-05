@@ -15,6 +15,7 @@ import (
 	"github.com/iamangus/eve/internal/agentfoundry"
 	"github.com/iamangus/eve/internal/chat"
 	"github.com/iamangus/eve/internal/config"
+	ctxmgr "github.com/iamangus/eve/internal/context"
 	"github.com/iamangus/eve/internal/email"
 	"github.com/iamangus/eve/internal/store"
 	"github.com/iamangus/eve/internal/trigger"
@@ -37,7 +38,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	chatH := chat.NewHandler(store.New(), af, cfg)
+	st, err := store.New(cfg.DataDir)
+	if err != nil {
+		slog.Error("store", "dir", cfg.DataDir, "error", err)
+		os.Exit(1)
+	}
+
+	ctxMgr := ctxmgr.NewManager(st, af, ctxmgr.Config{
+		AgentID:             cfg.HistorianAgentID,
+		BudgetTokens:        cfg.ContextBudgetTokens,
+		TriggerFraction:     cfg.ContextTriggerFraction,
+		ProtectedTailTokens: cfg.ContextProtectedTailTokens,
+		ChunkTokens:         cfg.ContextChunkTokens,
+		MemoryLimit:         cfg.ContextMemoryLimit,
+		CurateInterval:      cfg.ContextCurateInterval,
+	})
+
+	chatH := chat.NewHandler(st, af, cfg, ctxMgr)
 
 	emailStore, err := store.NewEmailStore(cfg.DataDir)
 	if err != nil {
@@ -53,6 +70,7 @@ func main() {
 	defer rootCancel()
 
 	go chatH.Reconcile(rootCtx)
+	go ctxMgr.Loop(rootCtx)
 
 	poller := email.NewPoller(emailStore, func(ctx context.Context, acct store.Account, msg store.EmailMessage) {
 		engine.HandleEmail(ctx, acct, msg)
@@ -61,6 +79,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	chatH.RegisterRoutes(mux)
+	ctxMgr.RegisterRoutes(mux)
 	triggerH.RegisterRoutes(mux)
 
 	distFS, err := fs.Sub(frontend.Dist, "dist")

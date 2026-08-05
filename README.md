@@ -34,11 +34,8 @@ it empty to fall back to a truncated first-message title.
 
 Near-term extensions along the same pattern (not yet implemented):
 
-- **Long-history summarization**: a small agent that periodically compresses
-  older turns of a conversation into a compact context block, which is then
-  sent as the leading `History` entry instead of every prior message.
 - **Topic tagging / smart suggestions**: a small agent that tags
-  conversations or suggests follow-up prompts for the sidebar.
+  conversations or suggests follow-up prompts.
 
 ## Email triggers
 
@@ -73,7 +70,14 @@ All configuration is via environment variables (no YAML).
 | `AGENTFOUNDRY_API_KEY` | *(required)* | Personal API key created in agentfoundry (`POST /api/v1/api-keys`). Sent as `Authorization: Bearer <key>`. Runs are attributed to the key owner. |
 | `ASSISTANT_AGENT_ID` | *(required)* | Agent id of the eve assistant agent in agentfoundry |
 | `TITLE_AGENT_ID` | *(empty, optional)* | Agent id of a small-model agent used to generate conversation titles. If empty, titles are truncated from the first user message. |
-| `DATA_DIR` | `./data` | Directory for JSON persistence of email accounts, triggers, and runs |
+| `HISTORIAN_AGENT_ID` | *(empty, optional)* | Agent id of the historian agent (see `definitions/historian.yaml` in agentfoundry). When set, eve compresses old history into tiered summaries, captures durable memories, and renders a decayed context within the budget. When empty, full raw history is sent. |
+| `CONTEXT_BUDGET_TOKENS` | `64000` | Target size of the rendered conversation history in tokens. |
+| `CONTEXT_TRIGGER_FRACTION` | `0.5` | Fraction of the budget at which the unsummarized tail triggers a historian run. |
+| `CONTEXT_PROTECTED_TAIL_TOKENS` | `12000` | Newest raw history (tokens) that always stays raw, never summarized or truncated. |
+| `CONTEXT_CHUNK_TOKENS` | `20000` | Max input size (tokens) of one historian run. |
+| `CONTEXT_MEMORY_LIMIT` | `200` | Cap on the durable memory pool (oldest low-importance entries are curated away). |
+| `CONTEXT_CURATE_INTERVAL` | `24h` | How often the memory pool is curated (Go duration). |
+| `DATA_DIR` | `./data` | Directory for JSON persistence of email accounts, triggers, conversations, compartments, and memories |
 | `EMAIL_POLL_INTERVAL` | `60s` | How often eve polls configured IMAP inboxes (Go duration, e.g. `30s`) |
 
 ## Build and Run
@@ -120,11 +124,15 @@ docker run -p 8090:8090 \
   eve
 ```
 
-## In-memory store
+## Store
 
-History lives in a Go map guarded by a sync.RWMutex (`internal/store`).
-Each conversation holds its own ordered `[]Message`. All state is lost when
-the process exits.
+Conversations live in a Go map guarded by a sync.RWMutex (`internal/store`)
+and persist as JSON in `DATA_DIR` (`conversations.json`,
+`compartments.json`, `memories.json`) via atomic tmp-file + rename writes,
+so history survives restarts. Compartments hold the tiered summaries
+produced by the historian (raw messages are retained in
+`conversations.json`); memories are the durable facts promoted from
+compartment manifests.
 
 ```go
 type Conversation struct {

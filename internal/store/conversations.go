@@ -25,14 +25,18 @@ func (s *Store) CreateConversation(title string) (*Conversation, error) {
 	id := newID()
 	now := time.Now()
 	rec := &conversationRecord{
-		title:     title,
-		created:   now,
-		updated:   now,
-		nextMsgID: 1,
+		Title:     title,
+		Created:   now,
+		Updated:   now,
+		NextMsgID: 1,
 	}
 	s.mu.Lock()
 	s.convs[id] = rec
+	err := s.saveConversations()
 	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	return &Conversation{ID: id, Title: title, CreatedAt: now, UpdatedAt: now}, nil
 }
 
@@ -42,15 +46,32 @@ func (s *Store) ListConversations() []ConversationSummary {
 	for id, r := range s.convs {
 		out = append(out, ConversationSummary{
 			ID:           id,
-			Title:        r.title,
-			UpdatedAt:    r.updated,
-			MessageCount: len(r.messages),
-			ActiveRunID:  r.activeRunID,
+			Title:        r.Title,
+			UpdatedAt:    r.Updated,
+			MessageCount: len(r.Messages),
+			ActiveRunID:  r.ActiveRunID,
 		})
 	}
 	s.mu.RUnlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
 	return out
+}
+
+// PrimaryConversationID returns the ID of the earliest-created conversation,
+// or "" when none exists. With the single-conversation UI this is the one
+// conversation the user talks to.
+func (s *Store) PrimaryConversationID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var bestID string
+	var bestCreated time.Time
+	for id, r := range s.convs {
+		if bestID == "" || r.Created.Before(bestCreated) {
+			bestID = id
+			bestCreated = r.Created
+		}
+	}
+	return bestID
 }
 
 func (s *Store) GetConversation(id string) (*Conversation, error) {
@@ -61,14 +82,15 @@ func (s *Store) GetConversation(id string) (*Conversation, error) {
 		return nil, ErrNotFound
 	}
 	c := Conversation{
-		ID:          id,
-		Title:       r.title,
-		CreatedAt:   r.created,
-		UpdatedAt:   r.updated,
-		ActiveRunID: r.activeRunID,
+		ID:            id,
+		Title:         r.Title,
+		CreatedAt:     r.Created,
+		UpdatedAt:     r.Updated,
+		ActiveRunID:   r.ActiveRunID,
+		SummarizedUpTo: s.boundaryLocked(id),
 	}
-	if len(r.messages) > 0 {
-		c.Messages = append([]Message(nil), r.messages...)
+	if len(r.Messages) > 0 {
+		c.Messages = append([]Message(nil), r.Messages...)
 	}
 	s.mu.RUnlock()
 	return &c, nil
@@ -81,7 +103,10 @@ func (s *Store) DeleteConversation(id string) error {
 		return ErrNotFound
 	}
 	delete(s.convs, id)
-	return nil
+	if err := s.saveConversations(); err != nil {
+		return err
+	}
+	return s.saveCompartments()
 }
 
 func (s *Store) AppendUserMessage(convID, content string) error {
@@ -92,15 +117,15 @@ func (s *Store) AppendUserMessage(convID, content string) error {
 		return ErrNotFound
 	}
 	now := time.Now()
-	r.messages = append(r.messages, Message{
-		ID:        r.nextMsgID,
+	r.Messages = append(r.Messages, Message{
+		ID:        r.NextMsgID,
 		Role:      "user",
 		Content:   content,
 		CreatedAt: now,
 	})
-	r.nextMsgID++
-	r.updated = now
-	return nil
+	r.NextMsgID++
+	r.Updated = now
+	return s.saveConversations()
 }
 
 func (s *Store) AppendAssistantMessage(convID, runID, content string) error {
@@ -111,16 +136,16 @@ func (s *Store) AppendAssistantMessage(convID, runID, content string) error {
 		return ErrNotFound
 	}
 	now := time.Now()
-	r.messages = append(r.messages, Message{
-		ID:        r.nextMsgID,
+	r.Messages = append(r.Messages, Message{
+		ID:        r.NextMsgID,
 		Role:      "assistant",
 		Content:   content,
 		RunID:     runID,
 		CreatedAt: now,
 	})
-	r.nextMsgID++
-	r.updated = now
-	return nil
+	r.NextMsgID++
+	r.Updated = now
+	return s.saveConversations()
 }
 
 func (s *Store) ConversationHistory(convID string) ([]Message, error) {
@@ -130,10 +155,10 @@ func (s *Store) ConversationHistory(convID string) ([]Message, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	if len(r.messages) == 0 {
+	if len(r.Messages) == 0 {
 		return []Message{}, nil
 	}
-	return append([]Message(nil), r.messages...), nil
+	return append([]Message(nil), r.Messages...), nil
 }
 
 func (s *Store) SetActiveRun(convID, runID string) error {
@@ -143,9 +168,9 @@ func (s *Store) SetActiveRun(convID, runID string) error {
 	if !ok {
 		return ErrNotFound
 	}
-	r.activeRunID = runID
-	r.updated = time.Now()
-	return nil
+	r.ActiveRunID = runID
+	r.Updated = time.Now()
+	return s.saveConversations()
 }
 
 func (s *Store) ClearActiveRun(convID string) error {
@@ -155,9 +180,9 @@ func (s *Store) ClearActiveRun(convID string) error {
 	if !ok {
 		return ErrNotFound
 	}
-	r.activeRunID = ""
-	r.updated = time.Now()
-	return nil
+	r.ActiveRunID = ""
+	r.Updated = time.Now()
+	return s.saveConversations()
 }
 
 func (s *Store) SetTitle(convID, title string) error {
@@ -167,8 +192,8 @@ func (s *Store) SetTitle(convID, title string) error {
 	if !ok {
 		return ErrNotFound
 	}
-	r.title = title
-	return nil
+	r.Title = title
+	return s.saveConversations()
 }
 
 func (s *Store) UserMessageCount(convID string) (int, error) {
@@ -179,7 +204,7 @@ func (s *Store) UserMessageCount(convID string) (int, error) {
 		return 0, ErrNotFound
 	}
 	n := 0
-	for _, m := range r.messages {
+	for _, m := range r.Messages {
 		if m.Role == "user" {
 			n++
 		}
@@ -191,7 +216,7 @@ func (s *Store) ConversationByActiveRun(runID string) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for id, r := range s.convs {
-		if r.activeRunID == runID {
+		if r.ActiveRunID == runID {
 			return id, nil
 		}
 	}
@@ -203,8 +228,8 @@ func (s *Store) ActiveRuns() (map[string]string, error) {
 	defer s.mu.RUnlock()
 	out := make(map[string]string)
 	for id, r := range s.convs {
-		if r.activeRunID != "" {
-			out[id] = r.activeRunID
+		if r.ActiveRunID != "" {
+			out[id] = r.ActiveRunID
 		}
 	}
 	return out, nil
