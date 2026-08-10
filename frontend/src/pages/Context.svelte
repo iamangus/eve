@@ -46,7 +46,7 @@
   }
 
   function fmtTime(t) {
-    if (!t) return 'never'
+    if (!t || String(t).startsWith('0001')) return 'never'
     const d = Date.now() - new Date(t).getTime()
     if (d < 60000) return 'just now'
     if (d < 3600000) return Math.floor(d / 60000) + 'm ago'
@@ -65,6 +65,8 @@
     FACTS: 'fact',
     NAMING: 'naming',
   }
+
+  const arr = (x) => (x || [])
 </script>
 
 <div class="ctx-page">
@@ -128,12 +130,12 @@
     </div>
 
     <div class="ctx-section">
-      <h2 class="ctx-title">Compartments <span class="count-badge">{status.compartments.length}</span></h2>
-      {#if status.compartments.length === 0}
+      <h2 class="ctx-title">Compartments <span class="count-badge">{arr(status.compartments).length}</span></h2>
+      {#if arr(status.compartments).length === 0}
         <div class="ctx-empty">Nothing summarized yet. The historian runs automatically once the conversation grows past the trigger threshold.</div>
       {:else}
         <div class="comp-list">
-          {#each status.compartments as c}
+          {#each arr(status.compartments) as c}
             <div class="comp-card">
               <div class="comp-head">
                 <span class="tier-badge tier-{c.tier}">{c.tier}</span>
@@ -142,9 +144,9 @@
                 <span class="comp-date">{fmtDate(c.created_at)}</span>
               </div>
               <div class="comp-summary">{c.summary}</div>
-              {#if c.facts.length > 0}
+              {#if arr(c.facts).length > 0}
                 <div class="comp-facts">
-                  {#each c.facts as f}
+                  {#each arr(c.facts) as f}
                     <span class="fact-chip cat-{catColors[f.category] || 'fact'}">{f.category}: {f.content}</span>
                   {/each}
                 </div>
@@ -156,12 +158,12 @@
     </div>
 
     <div class="ctx-section">
-      <h2 class="ctx-title">Memories <span class="count-badge">{status.memories.length}</span></h2>
-      {#if status.memories.length === 0}
+      <h2 class="ctx-title">Memories <span class="count-badge">{arr(status.memories).length}</span></h2>
+      {#if arr(status.memories).length === 0}
         <div class="ctx-empty">No memories captured yet. Durable facts from your conversation appear here.</div>
       {:else}
         <div class="mem-list">
-          {#each status.memories as m}
+          {#each arr(status.memories) as m}
             <div class="mem-row">
               <span class="cat-chip cat-{catColors[m.category] || 'fact'}">{m.category}</span>
               <span class="mem-content">{m.content}</span>

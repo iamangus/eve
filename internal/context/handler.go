@@ -56,10 +56,15 @@ type CompView struct {
 
 // Snapshot builds the current context state for the primary conversation.
 func (m *Manager) Snapshot() Status {
+	mems := m.store.Memories()
+	if mems == nil {
+		mems = []store.Memory{}
+	}
 	status := Status{
 		Enabled:      m.Enabled(),
 		BudgetTokens: m.cfg.BudgetTokens,
-		Memories:     m.store.Memories(),
+		Memories:     mems,
+		Compartments: []CompView{},
 	}
 	convID := m.store.PrimaryConversationID()
 	if convID == "" {
