@@ -46,6 +46,7 @@ type Manager struct {
 	running   atomic.Bool
 	lastRunAt atomic.Value // time.Time
 	lastError atomic.Value // string
+	lifeCtx   atomic.Value // context.Context, set by Loop
 	wake      chan struct{}
 }
 
@@ -66,6 +67,7 @@ func (m *Manager) Loop(ctx context.Context) {
 	if !m.Enabled() {
 		return
 	}
+	m.lifeCtx.Store(ctx)
 	triggerTicker := time.NewTicker(30 * time.Second)
 	defer triggerTicker.Stop()
 	curateTicker := time.NewTicker(m.curateInterval())
@@ -111,7 +113,18 @@ func (m *Manager) MaybeCompact(ctx context.Context) {
 	if tailTokens < int(float64(m.cfg.BudgetTokens)*m.cfg.TriggerFraction) {
 		return
 	}
-	go m.runOnce(ctx, convID)
+	go m.runOnce(m.runCtx(), convID)
+}
+
+// runCtx returns the process-lifetime context that background historian runs
+// use, falling back to a detached background context if Loop hasn't started.
+// Never the caller's request context: compacting must survive the HTTP
+// handler that triggered it returning.
+func (m *Manager) runCtx() context.Context {
+	if v, ok := m.lifeCtx.Load().(context.Context); ok {
+		return v
+	}
+	return context.Background()
 }
 
 // ForceCompact triggers a historian run regardless of size. Non-blocking.
@@ -126,7 +139,7 @@ func (m *Manager) ForceCompact(ctx context.Context) error {
 	if convID == "" {
 		return fmt.Errorf("no conversation yet")
 	}
-	go m.runOnce(ctx, convID)
+	go m.runOnce(m.runCtx(), convID)
 	return nil
 }
 
