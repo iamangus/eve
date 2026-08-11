@@ -21,15 +21,22 @@ type Handler struct {
 	ctxMgr  *ctxmgr.Manager
 	agentID string
 	titleID string
+
+	// failedRuns tracks consecutive GetRun failures per run ID so the
+	// Reconcile loop can retry transient agentfoundry errors instead of
+	// abandoning a run (which would lose the response forever). Only touched
+	// from the single Reconcile goroutine.
+	failedRuns map[string]int
 }
 
 func NewHandler(store *store.Store, client *agentfoundry.Client, cfg config.Config, ctxMgr *ctxmgr.Manager) *Handler {
 	return &Handler{
-		store:   store,
-		client:  client,
-		ctxMgr:  ctxMgr,
-		agentID: cfg.AssistantAgentID,
-		titleID: cfg.TitleAgentID,
+		store:      store,
+		client:     client,
+		ctxMgr:     ctxMgr,
+		agentID:    cfg.AssistantAgentID,
+		titleID:    cfg.TitleAgentID,
+		failedRuns: make(map[string]int),
 	}
 }
 

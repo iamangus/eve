@@ -1,26 +1,40 @@
 <script>
+  import { onMount } from 'svelte'
   import { api } from '../lib/api.js'
   import { marked } from 'marked'
+  import DOMPurify from 'dompurify'
+
   marked.setOptions({ gfm: true, breaks: true })
 
   let currentConv = $state(null)
   let messages = $state([])
   let newMessage = $state('')
   let loading = $state(true)
+  let sending = $state(false)
+  let notice = $state('')
   let messageListEl = $state(null)
+  let inputEl = $state(null)
 
-  let streamBubbles = $state([])
-  let streamingRaw = ''
-  let streamingStatus = $state('')
-  let activeRunId = $state('')
-  let eventSource = $state(null)
+  let stream = $state({ runId: '', status: '', raw: '', html: '' })
+  let eventSource = null
 
-  $effect(() => {
+  onMount(() => {
     loadPrimary()
+    window.addEventListener('popstate', handlePopState)
     return () => {
       eventSource?.close()
+      eventSource = null
+      window.removeEventListener('popstate', handlePopState)
     }
   })
+
+  function sanitize(html) {
+    return DOMPurify.sanitize(html)
+  }
+
+  function renderMarkdown(raw) {
+    return sanitize(marked.parse(raw || ''))
+  }
 
   async function loadPrimary() {
     try {
@@ -37,7 +51,7 @@
       }
       if (!conv) {
         conv = await api.post('/api/conversations', {})
-        navigate('/?conv=' + conv.id)
+        pushUrl('/?conv=' + conv.id)
       }
       await selectConversation(conv)
     } catch (e) {
@@ -47,134 +61,151 @@
     }
   }
 
-  async function selectConversation(conv) {
+  async function handlePopState() {
+    const convId = new URL(window.location.href).searchParams.get('conv')
+    if (convId && convId !== currentConv?.id) {
+      await selectConversationById(convId)
+    }
+  }
+
+  async function selectConversationById(id) {
     try {
-      const full = await api.get('/api/conversations/' + conv.id)
-      currentConv = full
-      messages = (full.messages || []).map(msg => {
-        if (msg.role === 'assistant') {
-          return { ...msg, content: marked.parse(msg.content) }
-        }
-        return msg
-      })
-      requestAnimationFrame(() => scrollDown())
-      if (full.active_run_id) {
-        startStream(full.active_run_id)
-      }
+      const full = await api.get('/api/conversations/' + id)
+      applyConversation(full)
     } catch (e) {
       console.error('Failed to load conversation', e)
     }
   }
 
+  async function selectConversation(conv) {
+    try {
+      const full = await api.get('/api/conversations/' + conv.id)
+      applyConversation(full)
+    } catch (e) {
+      console.error('Failed to load conversation', e)
+    }
+  }
+
+  function applyConversation(full) {
+    currentConv = full
+    messages = full.messages || []
+    pushUrl('/?conv=' + full.id)
+    requestAnimationFrame(() => scrollDown())
+    if (full.active_run_id) {
+      startStream(full.active_run_id)
+    }
+  }
+
   async function sendMessage() {
-    if (!newMessage.trim() || !currentConv) return
+    if (sending || !newMessage.trim() || !currentConv) return
     const content = newMessage
     newMessage = ''
+    if (inputEl) inputEl.style.height = 'auto'
+    sending = true
+    notice = ''
     messages = [...messages, { role: 'user', content }]
     requestAnimationFrame(() => scrollDown())
 
     try {
       const result = await api.post('/api/conversations/' + currentConv.id + '/messages', { content })
-      activeRunId = result.run_id
       startStream(result.run_id)
     } catch (e) {
+      sending = false
       console.error('Failed to send message', e)
-      messages = [...messages, { role: 'assistant', content: marked.parse('⚠️ Failed to send message. (' + e.message + ')') }]
+      messages = [...messages, { role: 'assistant', content: '⚠️ Failed to send message. (' + e.message + ')' }]
+      scrollDown()
     }
   }
 
   function startStream(runId) {
     eventSource?.close()
-    activeRunId = runId
-    streamingStatus = 'Thinking'
-    streamBubbles = []
-    streamingRaw = ''
+    eventSource = null
+    stream = { runId, status: 'Thinking', raw: '', html: '' }
 
     const es = new EventSource('/runs/' + runId + '/events')
     eventSource = es
 
-    es.addEventListener('response_start', () => {
-      if (streamBubbles.length > 0) {
-        for (const bubble of streamBubbles) {
-          if (bubble && bubble.trim()) {
-            messages = [...messages, { role: 'assistant', content: bubble }]
-          }
-        }
-      }
-      streamingStatus = ''
-      streamingRaw = ''
-      streamBubbles = ['']
-    })
-
     es.addEventListener('token', (e) => {
-      streamingStatus = ''
-      streamingRaw += e.data
-      if (streamBubbles.length === 0) {
-        streamBubbles = ['']
-      }
-      try {
-        const html = marked.parse(streamingRaw)
-        streamBubbles[streamBubbles.length - 1] = html
-      } catch (err) {
-        streamBubbles[streamBubbles.length - 1] = streamingRaw
-      }
+      stream.status = ''
+      stream.raw += e.data
+      stream.html = renderMarkdown(stream.raw)
       scrollDown()
     })
 
     es.addEventListener('status', (e) => {
-      streamingStatus = e.data
+      stream.status = e.data
     })
 
     es.addEventListener('done', (e) => {
       es.close()
       eventSource = null
-      finalizeStream(e.data)
+      if (e.data) {
+        messages = [...messages, { role: 'assistant', content: e.data }]
+      }
+      stream = { runId: '', status: '', raw: '', html: '' }
+      sending = false
+      scrollDown()
       refreshConversationMeta()
     })
 
     es.addEventListener('error', (e) => {
-      if (es.readyState === EventSource.CLOSED) return
+      if (!e.data) return
       es.close()
       eventSource = null
-      if (e.data) {
-        finalizeStream(e.data)
-      } else {
-        streamingStatus = ''
-        streamBubbles = []
-        streamingRaw = ''
-      }
-      activeRunId = ''
+      stream = { runId: '', status: '', raw: '', html: '' }
+      messages = [...messages, { role: 'assistant', content: e.data }]
+      scrollDown()
+      sending = false
       refreshConversationMeta()
     })
 
     es.onerror = () => {
+      if (es.readyState === EventSource.CLOSED) return
       es.close()
       eventSource = null
-      activeRunId = ''
+      const partial = stream.raw
+      stream = { runId: '', status: '', raw: '', html: '' }
+      if (partial && partial.trim()) {
+        messages = [...messages, { role: 'assistant', content: partial }]
+        scrollDown()
+      }
+      sending = false
+      healConversation()
     }
   }
 
-  function finalizeStream(mdText) {
-    streamingStatus = ''
-    if (streamBubbles.length > 0) {
-      streamBubbles[streamBubbles.length - 1] = marked.parse(mdText || '')
-      for (let i = 0; i < streamBubbles.length; i++) {
-        messages = [...messages, { role: 'assistant', content: streamBubbles[i] }]
+  async function healConversation() {
+    const convId = currentConv?.id
+    if (!convId) return
+    const deadline = Date.now() + 20000
+    while (Date.now() < deadline) {
+      await sleep(500)
+      let full
+      try {
+        full = await api.get('/api/conversations/' + convId)
+      } catch {
+        continue
       }
+      currentConv = full
+      if (full.active_run_id) continue
+      if (full.messages && full.messages.length > 0) {
+        messages = full.messages
+        requestAnimationFrame(() => scrollDown())
+      }
+      return
     }
-    streamBubbles = []
-    streamingRaw = ''
-    activeRunId = ''
-    requestAnimationFrame(() => scrollDown())
+    notice = 'The connection to the agent was lost. The response may still be processing — try refreshing.'
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
   async function refreshConversationMeta() {
+    if (!currentConv) return
     try {
-      const list = await api.get('/api/conversations')
-      if (list.length > 0) {
-        const full = await api.get('/api/conversations/' + list[0].id)
-        currentConv = full
-      }
+      const full = await api.get('/api/conversations/' + currentConv.id)
+      currentConv = full
     } catch {}
   }
 
@@ -200,14 +231,16 @@
     messageListEl.scrollTop = messageListEl.scrollHeight
   }
 
-  function navigate(href) {
-    if (window.history.length) {
+  function pushUrl(href) {
+    if (window.location.pathname + window.location.search === href) {
       window.history.replaceState({}, '', href)
+    } else {
+      window.history.pushState({}, '', href)
     }
   }
 
   function handleKeydown(e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault()
       sendMessage()
     }
@@ -230,7 +263,7 @@
       </div>
 
       <div class="chat-body" bind:this={messageListEl}>
-        {#each messages as msg, i (msg.id || i)}
+        {#each messages as msg, i (msg.id ?? i)}
           {#if i > 0 && gapBetween(messages[i - 1], msg)}
             <div class="time-gap">{gapBetween(messages[i - 1], msg)}</div>
           {/if}
@@ -242,27 +275,25 @@
               {#if msg.role === 'user'}
                 {msg.content}
               {:else}
-                {@html msg.content}
+                {@html renderMarkdown(msg.content)}
               {/if}
             </div>
           </div>
         {/each}
 
-        {#each streamBubbles as content}
+        {#if stream.raw || stream.status}
           <div class="msg-row msg-left">
             <div class="bubble bubble-bot">
-              {@html content || ''}
-            </div>
-          </div>
-        {/each}
-
-        {#if streamingStatus}
-          <div class="msg-row msg-left">
-            <div class="thinking-bubble">
-              <span class="thinking-label">{streamingStatus}</span>
-              <div class="thinking-dot"></div>
-              <div class="thinking-dot" style="animation-delay:0.2s"></div>
-              <div class="thinking-dot" style="animation-delay:0.4s"></div>
+              {#if stream.html}
+                {@html stream.html}
+              {:else}
+                <div class="thinking-bubble">
+                  <span class="thinking-label">{stream.status || 'Thinking'}</span>
+                  <div class="thinking-dot"></div>
+                  <div class="thinking-dot" style="animation-delay:0.2s"></div>
+                  <div class="thinking-dot" style="animation-delay:0.4s"></div>
+                </div>
+              {/if}
             </div>
           </div>
         {/if}
@@ -271,15 +302,19 @@
       </div>
 
       <div class="chat-foot">
+        {#if notice}
+          <div class="chat-notice">{notice}</div>
+        {/if}
         <div class="input-wrap">
           <textarea
-            value={newMessage}
+            bind:this={inputEl}
+            bind:value={newMessage}
             onkeydown={handleKeydown}
             rows="1"
             placeholder="Message…"
-            oninput={(e) => { newMessage = e.target.value; e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px'; }}
+            oninput={(e) => { e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px'; }}
           ></textarea>
-          <button onclick={sendMessage} class="send-btn" aria-label="Send" disabled={!currentConv}>
+          <button onclick={sendMessage} class="send-btn" aria-label="Send" disabled={sending || !currentConv}>
             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" d="M6 12 3.269 3.125A59.769 59.769 0 0 1 21.485 12 59.768 59.768 0 0 1 3.27 20.875L5.999 12Zm0 0h7.5" />
             </svg>
@@ -290,7 +325,7 @@
   {:else}
     <div class="empty-state">
       <p class="empty-title">No chat selected</p>
-      <p class="empty-sub">Start a new chat from the sidebar.</p>
+      <p class="empty-sub">A conversation is created automatically the first time you send a message.</p>
     </div>
   {/if}
 </main>
@@ -347,6 +382,12 @@
     padding: 16px 24px; border-top: 1px solid var(--border);
     background: var(--bg-base); flex-shrink: 0;
   }
+  .chat-notice {
+    font-size: 0.75rem; color: oklch(75% 0.12 45);
+    background: oklch(50% 0.12 45 / 0.12);
+    border: 1px solid oklch(60% 0.14 45 / 0.35);
+    border-radius: 8px; padding: 6px 12px; margin-bottom: 10px;
+  }
   .input-wrap {
     display: flex; gap: 10px; align-items: flex-end;
     background: var(--bg-card); border: 1px solid var(--border);
@@ -375,8 +416,6 @@
   .send-btn svg { width: 16px; height: 16px; }
 
   .thinking-bubble {
-    background: var(--bg-card); border: 1px solid var(--border); border-bottom-left-radius: 4px;
-    padding: 14px 18px; border-radius: 14px;
     display: flex; align-items: baseline; gap: 4px;
   }
   .thinking-label { font-size: 0.9rem; color: var(--text-muted); }

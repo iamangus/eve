@@ -23,6 +23,11 @@ func (h *Handler) Reconcile(ctx context.Context) {
 	}
 }
 
+// maxReconcileRetries is how many consecutive GetRun failures (network or 5xx)
+// the Reconcile loop tolerates before giving up on a run. A single transient
+// agentfoundry blip must not abandon a run, or its response is lost forever.
+const maxReconcileRetries = 3
+
 func (h *Handler) reconcileOnce(ctx context.Context) {
 	runs, err := h.store.ActiveRuns()
 	if err != nil {
@@ -43,9 +48,18 @@ func (h *Handler) reconcileRun(ctx context.Context, convID, runID string) error 
 
 	rs, err := h.client.GetRun(pollCtx, runID)
 	if err != nil {
-		_ = h.store.ClearActiveRun(convID)
+		// Transient agentfoundry error (network or 5xx): keep the run active
+		// and retry on a later tick so the response is not lost. A 404 already
+		// surfaces as status "unknown" below (no error) and is treated as
+		// terminal. Only give up after several consecutive failures.
+		h.failedRuns[runID]++
+		if h.failedRuns[runID] >= maxReconcileRetries {
+			delete(h.failedRuns, runID)
+			return h.store.ClearActiveRun(convID)
+		}
 		return err
 	}
+	delete(h.failedRuns, runID)
 	switch rs.Status {
 	case "completed":
 		if rs.Response != "" {
