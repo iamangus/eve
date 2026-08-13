@@ -2,6 +2,7 @@
   import Chat from './pages/Chat.svelte'
   import EmailTriggers from './pages/EmailTriggers.svelte'
   import Context from './pages/Context.svelte'
+  import Channels from './pages/Channels.svelte'
 
   let tab = $state('chat')
 </script>
@@ -12,14 +13,17 @@
     <button class:active={tab === 'chat'} onclick={() => (tab = 'chat')}>Chat</button>
     <button class:active={tab === 'email'} onclick={() => (tab = 'email')}>Email Triggers</button>
     <button class:active={tab === 'context'} onclick={() => (tab = 'context')}>Context</button>
+    <button class:active={tab === 'channels'} onclick={() => (tab = 'channels')}>Channels</button>
   </nav>
   <div class="app-shell">
     {#if tab === 'chat'}
       <Chat />
     {:else if tab === 'email'}
       <EmailTriggers />
-    {:else}
+    {:else if tab === 'context'}
       <Context />
+    {:else}
+      <Channels />
     {/if}
   </div>
 </div>

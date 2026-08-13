@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/iamangus/eve/internal/agentfoundry"
@@ -46,6 +47,43 @@ type Manager struct {
 	Matrix MatrixConfig
 	// Cal is the calendar store (nil when the calendar channel is disabled).
 	Cal *CalStore
+
+	healthMu sync.Mutex
+	health   map[string]PollHealth
+}
+
+// PollHealth records the latest outcome of a background poller loop (email,
+// matrix, calendar). lastCheck is when the poller last completed a cycle;
+// lastError is empty when the last cycle succeeded.
+type PollHealth struct {
+	LastCheck time.Time `json:"last_check,omitempty"`
+	LastError string    `json:"last_error,omitempty"`
+}
+
+// RecordPollHealth updates the health snapshot for a poller. A nil error
+// clears any previous error; a non-nil error records it alongside the check
+// timestamp so the UI can show when a path last failed.
+func (m *Manager) RecordPollHealth(id string, err error) {
+	m.healthMu.Lock()
+	defer m.healthMu.Unlock()
+	h := m.health[id]
+	h.LastCheck = time.Now()
+	if err != nil {
+		h.LastError = err.Error()
+	} else {
+		h.LastError = ""
+	}
+	m.health[id] = h
+}
+
+func (m *Manager) healthSnapshot() map[string]PollHealth {
+	m.healthMu.Lock()
+	defer m.healthMu.Unlock()
+	out := make(map[string]PollHealth, len(m.health))
+	for id, h := range m.health {
+		out[id] = h
+	}
+	return out
 }
 
 func NewManager(st *store.Store, client *agentfoundry.Client, cfg Config) (*Manager, error) {
@@ -87,7 +125,43 @@ func NewManager(st *store.Store, client *agentfoundry.Client, cfg Config) (*Mana
 		client: client,
 		mcpSrv: mcpSrv,
 		agent:  cfg.AssistantAgentID,
+		health: make(map[string]PollHealth),
 	}, nil
+}
+
+// RunPresenceLoop periodically marks channels with stale activity as
+// disconnected so the presence badges stay truthful (e.g. a web tab closed
+// without a goodbye heartbeat). Blocks until ctx is cancelled.
+func (m *Manager) RunPresenceLoop(ctx context.Context) {
+	if m.Reg.activityTimeout <= 0 {
+		return
+	}
+	tick := m.Reg.activityTimeout / 2
+	if tick < time.Second {
+		tick = time.Second
+	}
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			changed := false
+			for _, s := range m.Reg.Snapshot() {
+				if !s.Presence.Connected {
+					continue
+				}
+				if time.Since(s.Presence.LastActivity) >= m.Reg.activityTimeout {
+					m.Reg.SetConnected(s.ID, false)
+					changed = true
+				}
+			}
+			if changed {
+				m.Hub.Broadcast(Event{Type: EventChannels})
+			}
+		}
+	}
 }
 
 func (m *Manager) RegisterRoutes(mux *http.ServeMux) {
@@ -131,12 +205,17 @@ func (m *Manager) PresenceSummary() string {
 // routing decisions know the user is at the computer.
 func (m *Manager) presence(w http.ResponseWriter, r *http.Request) {
 	m.Reg.SetConnected("web", true)
+	m.Hub.Broadcast(Event{Type: EventChannels})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// channels returns the current endpoint snapshot (for the UI and debugging).
+// channels returns the current endpoint snapshot plus poller health (for the
+// UI and debugging).
 func (m *Manager) channels(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, m.Reg.Snapshot())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"channels": m.Reg.Snapshot(),
+		"health":   m.healthSnapshot(),
+	})
 }
 
 // notify is the proactive-send surface: any system (or a manual curl) can
@@ -206,9 +285,11 @@ func (m *Manager) Inbound(ctx context.Context, msg InboundMessage) (runID string
 		}
 		convID = c.ID
 	}
-	if err := m.store.AppendUserMessage(convID, msg.Text, string(msg.Channel), sender); err != nil {
+	appended, err := m.store.AppendUserMessageReturn(convID, msg.Text, string(msg.Channel), sender)
+	if err != nil {
 		return "", err
 	}
+	m.Hub.Broadcast(Event{Type: EventMessage, ConvID: convID, Data: appended})
 	m.Reg.Touch(string(msg.Channel))
 	if sender != "owner" {
 		return "", nil
@@ -263,7 +344,7 @@ func (m *Manager) EnableEmail(cfg SMTPConfig) {
 		DefaultRecipient: cfg.From,
 		Preference:       50,
 	})
-	m.Router.RegisterAdapter(&emailAdapter{cfg: cfg, reg: m.Reg})
+	m.Router.RegisterAdapter(&emailAdapter{cfg: cfg, reg: m.Reg, store: m.store, hub: m.Hub})
 }
 
 // EnableMatrix registers the matrix channel and its adapter. Called by main
@@ -285,7 +366,7 @@ func (m *Manager) EnableMatrix(cfg MatrixConfig) {
 		DefaultRecipient: cfg.UserID,
 		Preference:       30,
 	})
-	m.Router.RegisterAdapter(&matrixAdapter{cfg: cfg, reg: m.Reg})
+	m.Router.RegisterAdapter(&matrixAdapter{cfg: cfg, reg: m.Reg, store: m.store, hub: m.Hub})
 }
 
 // EnableCalendar activates the CalDAV calendar channel. Called by main when

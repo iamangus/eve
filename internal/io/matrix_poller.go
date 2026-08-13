@@ -66,6 +66,7 @@ func (p *MatrixPoller) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			next, err := p.sync(ctx, p.cursor)
+			p.manager.RecordPollHealth("matrix", err)
 			if err != nil {
 				slog.Warn("matrix sync", "error", err)
 				continue

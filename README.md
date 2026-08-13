@@ -100,6 +100,8 @@ All configuration is via environment variables (no YAML).
 | `SMS_WEBHOOK_TOKEN` | _unset_ | Token guarding the SMS inbound webhook `POST /api/inbound/sms`. When set, the SMS channel is registered as input-only: messages land in the primary conversation and replies/notifications are routed to whichever output channel is reachable (there is no SMS gateway in v1). Auth via `?token=` query param or `Authorization: Bearer <token>`. |
 | `VOICE_WEBHOOK_TOKEN` | _unset_ | Token guarding the voice-device inbound webhook `POST /api/inbound/voice`. Same behavior as SMS: input-only, with an optional `transcript` field for STT payloads, exercising the fallback router since a speakerless device cannot receive Eve's answer. |
 
+The web UI has a **Channels** tab (`GET /api/channels`) showing every registered channel's capabilities, presence (`connected`, last activity, which lapses after `WEB_PRESENCE_TIMEOUT`), and the health of each background poller (email/matrix/calendar — last check time and last error). It refreshes every 5s and live-updates via the `/api/events` stream when presence changes.
+
 ## Build and Run
 
 ### Frontend

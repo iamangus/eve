@@ -128,6 +128,7 @@ func main() {
 	go chatH.Reconcile(rootCtx)
 	go ctxMgr.Loop(rootCtx)
 	go taskMgr.Run(rootCtx)
+	go ioMgr.RunPresenceLoop(rootCtx)
 
 	poller := email.NewPoller(emailStore, func(ctx context.Context, acct store.Account, msg store.EmailMessage) {
 		sender := msg.From
@@ -147,6 +148,9 @@ func main() {
 		}
 		engine.HandleEmail(ctx, acct, msg)
 	}, cfg.EmailPollInterval)
+	poller.SetHealthHook(func(err error) {
+		ioMgr.RecordPollHealth("email", err)
+	})
 	go poller.Run(rootCtx)
 
 	if ioMgr.Matrix.Enabled() {

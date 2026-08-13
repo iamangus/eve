@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net/smtp"
 	"strings"
+
+	"github.com/iamangus/eve/internal/store"
+
 )
 
 // SMTPConfig configures outbound email delivery. Empty host disables the
@@ -26,8 +29,10 @@ func (c SMTPConfig) Enabled() bool {
 // be an identity name or a raw address; raw addresses pass through, identity
 // names resolve through the registry.
 type emailAdapter struct {
-	cfg SMTPConfig
-	reg *Registry
+	cfg   SMTPConfig
+	reg   *Registry
+	store *store.Store
+	hub   *Hub
 }
 
 func (a *emailAdapter) Type() ChannelType { return ChannelEmail }
@@ -45,7 +50,21 @@ func (a *emailAdapter) Send(ctx context.Context, msg OutboundMessage) error {
 			return fmt.Errorf("email: unresolved recipient %q", msg.Recipient)
 		}
 	}
-	return a.cfg.Send(ctx, to, msg.Text)
+	if err := a.cfg.Send(ctx, to, msg.Text); err != nil {
+		return err
+	}
+	// Record the delivery in the conversation so the web UI shows it as a
+	// message Eve sent via email, tagged with the email channel.
+	m, err := a.store.AppendAssistantMessageReturn(msg.ConversationID, "", msg.Text, "email", "eve")
+	if err != nil {
+		return err
+	}
+	a.hub.Broadcast(Event{
+		Type:   EventMessage,
+		ConvID: msg.ConversationID,
+		Data:   m,
+	})
+	return nil
 }
 
 // Send delivers a plain-text email to one recipient through the configured

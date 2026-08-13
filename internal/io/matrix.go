@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/iamangus/eve/internal/store"
+
 )
 
 // MatrixConfig configures the matrix channel. Empty Homeserver disables it.
@@ -26,8 +29,10 @@ func (c MatrixConfig) Enabled() bool {
 // Recipient may be a room ID, a matrix user ID, or an identity name that
 // resolves through the registry. ThreadRef carries the room id.
 type matrixAdapter struct {
-	cfg MatrixConfig
-	reg *Registry
+	cfg   MatrixConfig
+	reg   *Registry
+	store *store.Store
+	hub   *Hub
 }
 
 func (a *matrixAdapter) Type() ChannelType { return ChannelMatrix }
@@ -49,7 +54,21 @@ func (a *matrixAdapter) Send(ctx context.Context, msg OutboundMessage) error {
 			return fmt.Errorf("matrix: unresolved recipient %q", msg.Recipient)
 		}
 	}
-	return a.cfg.SendRoom(ctx, roomID, msg.Text)
+	if err := a.cfg.SendRoom(ctx, roomID, msg.Text); err != nil {
+		return err
+	}
+	// Record the delivery in the conversation so the web UI shows it as a
+	// message Eve sent via matrix, tagged with the matrix channel.
+	m, err := a.store.AppendAssistantMessageReturn(msg.ConversationID, "", msg.Text, "matrix", "eve")
+	if err != nil {
+		return err
+	}
+	a.hub.Broadcast(Event{
+		Type:   EventMessage,
+		ConvID: msg.ConversationID,
+		Data:   m,
+	})
+	return nil
 }
 
 // SendRoom delivers a plain-text message to a matrix room using the client

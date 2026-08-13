@@ -302,6 +302,12 @@
     return '+' + m + 'm'
   }
 
+  function channelLabel(ch) {
+    if (!ch || ch === 'web') return ''
+    const names = { matrix: 'Matrix', email: 'Email', sms: 'SMS', voice: 'Voice' }
+    return names[ch] || ch
+  }
+
   function scrollDown() {
     if (!messageListEl) return
     messageListEl.scrollTop = messageListEl.scrollHeight
@@ -381,8 +387,8 @@
                 {@html renderMarkdown(msg.content)}
               {/if}
             </div>
-            {#if msg.role !== 'user' && msg.channel && msg.channel !== 'web'}
-              <span class="chan-badge">{msg.channel}</span>
+            {#if msg.channel && msg.channel !== 'web'}
+              <span class="chan-badge" class:chan-badge-right={msg.role === 'user'}>{channelLabel(msg.channel)}</span>
             {/if}
           </div>
         {/each}
@@ -477,6 +483,9 @@
     text-transform: uppercase; letter-spacing: 0.06em;
     color: var(--text-muted); background: var(--bg-card);
     border: 1px solid var(--border); border-radius: 8px; padding: 2px 7px;
+  }
+  .chan-badge-right {
+    align-self: flex-end; margin-left: 0; margin-right: 8px;
   }
 
   .time-gap {

@@ -503,6 +503,7 @@ func (p *CalPoller) Run(ctx context.Context) {
 
 func (p *CalPoller) check(ctx context.Context) {
 	evs, err := p.cal.List(ctx)
+	p.manager.RecordPollHealth("calendar", err)
 	if err != nil {
 		slog.Warn("calendar poll", "error", err)
 		return

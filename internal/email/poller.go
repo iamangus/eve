@@ -23,10 +23,17 @@ type Poller struct {
 	accounts AccountSource
 	sink     MessageSink
 	interval time.Duration
+	onHealth func(error)
 }
 
 func NewPoller(accounts AccountSource, sink MessageSink, interval time.Duration) *Poller {
 	return &Poller{accounts: accounts, sink: sink, interval: interval}
+}
+
+// SetHealthHook registers a callback invoked after each account poll with its
+// outcome, so callers can surface poller health (last check / last error).
+func (p *Poller) SetHealthHook(fn func(error)) {
+	p.onHealth = fn
 }
 
 func (p *Poller) Run(ctx context.Context) {
@@ -52,6 +59,9 @@ func (p *Poller) pollOnce(ctx context.Context) {
 
 func (p *Poller) pollAccount(ctx context.Context, acct store.Account) {
 	msgs, newUID, err := FetchNew(acct)
+	if p.onHealth != nil {
+		p.onHealth(err)
+	}
 	if err != nil {
 		slog.Warn("email poll", "account", acct.Address, "error", err)
 		return
