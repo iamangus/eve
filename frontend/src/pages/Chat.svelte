@@ -17,16 +17,92 @@
 
   let stream = $state({ runId: '', status: '', raw: '', html: '' })
   let eventSource = null
+  let globalEvents = null
+  let heartbeatTimer = null
+  let tasksTimer = null
+  let tasks = $state([])
+  let taskReplies = $state({})
+  let tasksOpen = $state(false)
 
   onMount(() => {
     loadPrimary()
+    openGlobalEvents()
+    startHeartbeat()
+    loadTasks()
+    tasksTimer = setInterval(loadTasks, 5000)
     window.addEventListener('popstate', handlePopState)
     return () => {
       eventSource?.close()
       eventSource = null
+      globalEvents?.close()
+      globalEvents = null
+      if (heartbeatTimer) clearInterval(heartbeatTimer)
+      heartbeatTimer = null
+      if (tasksTimer) clearInterval(tasksTimer)
+      tasksTimer = null
       window.removeEventListener('popstate', handlePopState)
     }
   })
+
+  // openGlobalEvents subscribes to the IO hub: proactive messages Eve sends
+  // outside a turn (via send_message) arrive here and are appended live.
+  function openGlobalEvents() {
+    const es = new EventSource('/api/events')
+    globalEvents = es
+    es.addEventListener('message', (e) => {
+      let ev
+      try {
+        ev = JSON.parse(e.data)
+      } catch {
+        return
+      }
+      if (ev.type !== 'message' || !ev.conv_id || !currentConv) return
+      if (ev.conv_id !== currentConv.id) return
+      const msg = ev.data
+      if (!msg || !msg.id) return
+      if (messages.some((m) => m.id === msg.id)) return
+      messages = [...messages, msg]
+      requestAnimationFrame(() => scrollDown())
+    })
+    es.onerror = () => {
+      es.close()
+      globalEvents = null
+      setTimeout(openGlobalEvents, 3000)
+    }
+  }
+
+  // startHeartbeat marks the web channel present so the router knows the user
+  // is at the computer when deciding where to deliver proactive messages.
+  function startHeartbeat() {
+    const beat = () => {
+      fetch('/api/presence', { method: 'POST' }).catch(() => {})
+    }
+    beat()
+    heartbeatTimer = setInterval(beat, 30000)
+  }
+
+  async function loadTasks() {
+    try {
+      const list = await api.get('/api/tasks')
+      tasks = Array.isArray(list) ? list.filter(t => t.status === 'running' || t.status === 'needs_input') : []
+      if (tasks.length > 0) tasksOpen = true
+    } catch {
+      // tasks endpoint unavailable; ignore
+    }
+  }
+
+  async function replyToTask(id) {
+    const content = (taskReplies[id] || '').trim()
+    if (!content) return
+    await api.post('/api/tasks/' + id + '/reply', { content })
+    taskReplies[id] = ''
+    loadTasks()
+  }
+
+  async function cancelTask(id) {
+    await api.post('/api/tasks/' + id + '/cancel', {})
+    loadTasks()
+  }
 
   function sanitize(html) {
     return DOMPurify.sanitize(html)
@@ -260,7 +336,34 @@
         {#if summarizedBoundary() > 0}
           <span class="chat-head-badge summary-badge">summarized</span>
         {/if}
+        {#if tasks.length > 0}
+          <button class="tasks-toggle" onclick={() => { tasksOpen = !tasksOpen }}>
+            tasks ({tasks.length})
+          </button>
+        {/if}
       </div>
+
+      {#if tasksOpen && tasks.length > 0}
+        <div class="tasks-panel">
+          {#each tasks as t (t.id)}
+            <div class="task-item">
+              <div class="task-line">
+                <span class="task-status task-{t.status}">{t.status}</span>
+                <span class="task-name">{t.agent_name}</span>
+                <button class="task-x" onclick={() => cancelTask(t.id)} aria-label="Cancel">✕</button>
+              </div>
+              <div class="task-msg">{t.message}</div>
+              {#if t.status === 'needs_input' && t.question}
+                <div class="task-q">→ {t.question}</div>
+                <div class="task-reply">
+                  <input bind:value={taskReplies[t.id]} placeholder="Reply…" onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); replyToTask(t.id) } }} />
+                  <button onclick={() => replyToTask(t.id)}>Reply</button>
+                </div>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
 
       <div class="chat-body" bind:this={messageListEl}>
         {#each messages as msg, i (msg.id ?? i)}
@@ -278,6 +381,9 @@
                 {@html renderMarkdown(msg.content)}
               {/if}
             </div>
+            {#if msg.role !== 'user' && msg.channel && msg.channel !== 'web'}
+              <span class="chan-badge">{msg.channel}</span>
+            {/if}
           </div>
         {/each}
 
@@ -366,6 +472,12 @@
   .bubble-bot {
     background: var(--bg-card); border: 1px solid var(--border); border-bottom-left-radius: 4px;
   }
+  .chan-badge {
+    align-self: flex-start; margin-left: 8px; font-size: 0.62rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--text-muted); background: var(--bg-card);
+    border: 1px solid var(--border); border-radius: 8px; padding: 2px 7px;
+  }
 
   .time-gap {
     align-self: center; font-size: 0.68rem; color: var(--text-muted);
@@ -436,4 +548,49 @@
   }
   .empty-title { font-size: 1.05rem; font-weight: 600; color: var(--text-base); margin: 14px 0 4px; }
   .empty-sub { font-size: 0.85rem; margin: 0; }
+
+  .tasks-toggle {
+    font-size: 0.7rem; font-weight: 600; cursor: pointer;
+    background: var(--bg-card); color: oklch(75% 0.2 292.0);
+    border: 1px solid oklch(59.1% 0.249 292.7 / 0.3);
+    padding: 3px 10px; border-radius: 20px; flex-shrink: 0;
+  }
+  .tasks-toggle:hover { background: var(--purple-dim); }
+
+  .tasks-panel {
+    flex-shrink: 0; max-height: 40%; overflow-y: auto;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-base); padding: 10px 24px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .task-item {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px 12px;
+  }
+  .task-line { display: flex; align-items: center; gap: 8px; }
+  .task-status {
+    font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 1px 7px; border-radius: 8px;
+  }
+  .task-running { background: oklch(55% 0.2 250 / 0.15); color: oklch(75% 0.2 250); }
+  .task-needs_input { background: oklch(55% 0.18 80 / 0.15); color: oklch(75% 0.18 80); }
+  .task-name { font-size: 0.82rem; font-weight: 600; color: var(--text-base); flex: 1; }
+  .task-x {
+    border: none; background: transparent; color: var(--text-muted);
+    cursor: pointer; font-size: 0.8rem; padding: 2px 4px; border-radius: 6px;
+  }
+  .task-x:hover { color: oklch(70% 0.2 25); }
+  .task-msg { font-size: 0.78rem; color: var(--text-muted); margin: 2px 0 0; }
+  .task-q { font-size: 0.8rem; color: oklch(80% 0.18 80); margin: 6px 0 0; }
+  .task-reply { display: flex; gap: 6px; margin-top: 6px; }
+  .task-reply input {
+    flex: 1; background: var(--bg-base); border: 1px solid var(--border);
+    border-radius: 8px; padding: 5px 10px; color: var(--text-base);
+    font-size: 0.8rem; outline: none;
+  }
+  .task-reply input:focus { border-color: oklch(59.1% 0.249 292.7 / 0.6); }
+  .task-reply button {
+    border: none; background: var(--purple-solid); color: #fff;
+    border-radius: 8px; padding: 5px 12px; font-size: 0.78rem; cursor: pointer;
+  }
 </style>

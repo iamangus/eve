@@ -12,15 +12,20 @@ import (
 	"github.com/iamangus/eve/internal/agentfoundry"
 	"github.com/iamangus/eve/internal/config"
 	ctxmgr "github.com/iamangus/eve/internal/context"
+	"github.com/iamangus/eve/internal/io"
 	"github.com/iamangus/eve/internal/store"
+	"github.com/iamangus/eve/internal/tasks"
 )
 
 type Handler struct {
 	store   *store.Store
 	client  *agentfoundry.Client
 	ctxMgr  *ctxmgr.Manager
+	ioMgr   *io.Manager
 	agentID string
 	titleID string
+	mcpSrv  []agentfoundry.MCPServer
+	tasks   *tasks.Manager
 
 	// failedRuns tracks consecutive GetRun failures per run ID so the
 	// Reconcile loop can retry transient agentfoundry errors instead of
@@ -29,13 +34,23 @@ type Handler struct {
 	failedRuns map[string]int
 }
 
-func NewHandler(store *store.Store, client *agentfoundry.Client, cfg config.Config, ctxMgr *ctxmgr.Manager) *Handler {
+func NewHandler(store *store.Store, client *agentfoundry.Client, cfg config.Config, ctxMgr *ctxmgr.Manager, ioMgr *io.Manager) *Handler {
+	mcpSrv := []agentfoundry.MCPServer{}
+	if cfg.EVEMCPURL != "" {
+		mcpSrv = append(mcpSrv, agentfoundry.MCPServer{
+			Name:      "eve",
+			URL:       cfg.EVEMCPURL,
+			Transport: "streamable-http",
+		})
+	}
 	return &Handler{
 		store:      store,
 		client:     client,
 		ctxMgr:     ctxMgr,
+		ioMgr:      ioMgr,
 		agentID:    cfg.AssistantAgentID,
 		titleID:    cfg.TitleAgentID,
+		mcpSrv:     mcpSrv,
 		failedRuns: make(map[string]int),
 	}
 }
@@ -47,6 +62,15 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/conversations/{id}", h.deleteConversation)
 	mux.HandleFunc("POST /api/conversations/{id}/messages", h.sendMessage)
 	mux.HandleFunc("GET /runs/{id}/events", h.runEvents)
+	mux.HandleFunc("GET /api/tasks", h.listTasks)
+	mux.HandleFunc("POST /api/tasks/{id}/reply", h.replyTask)
+	mux.HandleFunc("POST /api/tasks/{id}/cancel", h.cancelTask)
+}
+
+// SetTasks attaches the background-task manager so the task board can be
+// injected into every assistant run and the task endpoints work.
+func (h *Handler) SetTasks(tm *tasks.Manager) {
+	h.tasks = tm
 }
 
 func (h *Handler) listConversations(w http.ResponseWriter, r *http.Request) {
@@ -123,6 +147,8 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.ioMgr.Reg.Touch("web")
+
 	prior, err := h.store.ConversationHistory(convID)
 	if err != nil {
 		slog.Error("load history", "conv", convID, "error", err)
@@ -140,7 +166,7 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.AppendUserMessage(convID, req.Content); err != nil {
+	if err := h.store.AppendUserMessage(convID, req.Content, "web", "owner"); err != nil {
 		slog.Error("append user message", "conv", convID, "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
@@ -163,7 +189,13 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	runID, err := h.client.RunAgent(r.Context(), h.agentID, req.Content, history)
+	history = prependTaskBoard(h.tasks, history)
+
+	runID, err := h.client.RunAgentWith(r.Context(), h.agentID, agentfoundry.RunOptions{
+		Message:    req.Content,
+		History:    history,
+		MCPServers: h.mcpSrv,
+	})
 	if err != nil {
 		slog.Error("agentfoundry run", "conv", convID, "error", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "agent run failed"})
@@ -233,6 +265,71 @@ func cleanTitle(s string) string {
 		s = strings.TrimSpace(s[:80]) + "…"
 	}
 	return s
+}
+
+// prependTaskBoard injects the current background-task state into the run so
+// Eve always knows what is running, what needs input, and what just finished.
+func prependTaskBoard(tm *tasks.Manager, history []agentfoundry.Message) []agentfoundry.Message {
+	if tm == nil {
+		return history
+	}
+	board := tm.ContextBlock()
+	if board == "" {
+		return history
+	}
+	ctxMsg := agentfoundry.Message{
+		Role:    "user",
+		Content: board,
+	}
+	out := make([]agentfoundry.Message, 0, len(history)+1)
+	out = append(out, ctxMsg)
+	out = append(out, history...)
+	return out
+}
+
+func (h *Handler) listTasks(w http.ResponseWriter, r *http.Request) {
+	if h.tasks == nil {
+		writeJSON(w, http.StatusOK, []tasks.Task{})
+		return
+	}
+	list := h.tasks.List()
+	if list == nil {
+		list = []tasks.Task{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (h *Handler) replyTask(w http.ResponseWriter, r *http.Request) {
+	if h.tasks == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tasks unavailable"})
+		return
+	}
+	id := r.PathValue("id")
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Content) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content is required"})
+		return
+	}
+	if err := h.tasks.Reply(r.Context(), id, req.Content); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
+}
+
+func (h *Handler) cancelTask(w http.ResponseWriter, r *http.Request) {
+	if h.tasks == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tasks unavailable"})
+		return
+	}
+	id := r.PathValue("id")
+	if err := h.tasks.Cancel(id); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

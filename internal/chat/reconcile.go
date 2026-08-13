@@ -63,7 +63,7 @@ func (h *Handler) reconcileRun(ctx context.Context, convID, runID string) error 
 	switch rs.Status {
 	case "completed":
 		if rs.Response != "" {
-			if err := h.store.AppendAssistantMessage(convID, runID, rs.Response); err != nil {
+			if err := h.store.AppendAssistantMessage(convID, runID, rs.Response, "web", "eve"); err != nil {
 				return err
 			}
 		}

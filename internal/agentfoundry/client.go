@@ -19,8 +19,26 @@ type Message struct {
 }
 
 type runRequest struct {
-	Message string   `json:"message"`
-	History []Message `json:"history,omitempty"`
+	Message        string          `json:"message"`
+	History        []Message       `json:"history,omitempty"`
+	MCPServers     []MCPServer     `json:"mcp_servers,omitempty"`
+	ResponseSchema *ResponseSchema `json:"response_schema,omitempty"`
+}
+
+// MCPServer is an ephemeral MCP server attached to a single run. Agentfoundry
+// dials it when the run starts so the agent can call the tools it exposes.
+type MCPServer struct {
+	Name      string `json:"name"`
+	URL       string `json:"url"`
+	Transport string `json:"transport"`
+}
+
+// ResponseSchema constrains the run's reply to a JSON Schema (OpenAI
+// json_schema structured output).
+type ResponseSchema struct {
+	Name   string          `json:"name"`
+	Schema json.RawMessage `json:"schema"`
+	Strict bool            `json:"strict,omitempty"`
 }
 
 type runResponse struct {
@@ -52,7 +70,25 @@ func NewClient(baseURL, apiKey string) (*Client, error) {
 }
 
 func (c *Client) RunAgent(ctx context.Context, agentID, message string, history []Message) (string, error) {
-	body := runRequest{Message: message, History: history}
+	return c.RunAgentWith(ctx, agentID, RunOptions{Message: message, History: history})
+}
+
+// RunOptions configures a run beyond message+history: ephemeral MCP servers
+// and a response schema.
+type RunOptions struct {
+	Message        string
+	History        []Message
+	MCPServers     []MCPServer
+	ResponseSchema *ResponseSchema
+}
+
+func (c *Client) RunAgentWith(ctx context.Context, agentID string, opts RunOptions) (string, error) {
+	body := runRequest{
+		Message:        opts.Message,
+		History:        opts.History,
+		MCPServers:     opts.MCPServers,
+		ResponseSchema: opts.ResponseSchema,
+	}
 	data, err := json.Marshal(body)
 	if err != nil {
 		return "", fmt.Errorf("marshal run request: %w", err)

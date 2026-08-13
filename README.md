@@ -70,6 +70,15 @@ All configuration is via environment variables (no YAML).
 | `AGENTFOUNDRY_API_KEY` | *(required)* | Personal API key created in agentfoundry (`POST /api/v1/api-keys`). Sent as `Authorization: Bearer <key>`. Runs are attributed to the key owner. |
 | `ASSISTANT_AGENT_ID` | *(required)* | Agent id of the eve assistant agent in agentfoundry |
 | `TITLE_AGENT_ID` | *(empty, optional)* | Agent id of a small-model agent used to generate conversation titles. If empty, titles are truncated from the first user message. |
+| `ROUTER_AGENT_ID` | *(empty, optional)* | Agent id of the message router (see `definitions/router.yaml` in agentfoundry). When set, proactive and async sends are routed by this agent; when empty, delivery falls back mechanically to the best reachable output channel. |
+| `EVEMCP_URL` | `http://localhost:8090/mcp` | URL agentfoundry dials to reach eve's MCP server. Attached as an ephemeral server to every assistant run, exposing `send_message` and `list_channels` so Eve can proactively message the user. In Docker, use `http://eve:8090/mcp`. |
+| `PROACTIVE_ENABLED` | `true` | Whether Eve may deliver messages outside a conversation turn (notifications, reminders, questions via `send_message`). |
+| `PROACTIVE_COOLDOWN` | `2m` | Minimum gap between proactive messages (Go duration). |
+| `PROACTIVE_BACKOFF_MAX` | `10m` | Max retry backoff when delivery is deferred (e.g. user absent, conversation busy) (Go duration). |
+| `TASK_POLL_INTERVAL` | `2s` | How often eve polls background task runs in agentfoundry (Go duration). |
+| `TASK_DECISION_AGENT` | *(empty, optional)* | Agent id of the proactive decision engine (see `definitions/router.yaml` in agentfoundry). When set, task transitions ask this agent whether to speak; when empty, transitions are surfaced mechanically. |
+| `TASKS_FILE` | `./data/tasks.json` | JSON file persisting background tasks (task board). |
+| `WEB_PRESENCE_TIMEOUT` | `60s` | How long the web channel counts as "present" after the last heartbeat or message. Drives routing decisions for proactive sends. |
 | `HISTORIAN_AGENT_ID` | *(empty, optional)* | Agent id of the historian agent (see `definitions/historian.yaml` in agentfoundry). When set, eve compresses old history into tiered summaries, captures durable memories, and renders a decayed context within the budget. When empty, full raw history is sent. |
 | `CONTEXT_BUDGET_TOKENS` | `64000` | Target size of the rendered conversation history in tokens. |
 | `CONTEXT_TRIGGER_FRACTION` | `0.5` | Fraction of the budget at which the unsummarized tail triggers a historian run. |
@@ -79,6 +88,21 @@ All configuration is via environment variables (no YAML).
 | `CONTEXT_CURATE_INTERVAL` | `24h` | How often the memory pool is curated (Go duration). |
 | `DATA_DIR` | `./data` | Directory for JSON persistence of email accounts, triggers, conversations, compartments, and memories |
 | `EMAIL_POLL_INTERVAL` | `60s` | How often eve polls configured IMAP inboxes (Go duration, e.g. `30s`) |
+| `SMTP_HOST` | _unset_ | SMTP server for outbound email. When set, the email channel is enabled: Eve's `send_message` and proactive notifications can be delivered by email. Owner emails routed into the primary conversation (full duplex) still require SMTP config. |
+| `SMTP_PORT` | `587` | SMTP port (STARTTLS; use `465` for implicit TLS). |
+| `SMTP_USERNAME` | _unset_ | SMTP auth username (empty disables auth). |
+| `SMTP_PASSWORD` | _unset_ | SMTP auth password. |
+| `SMTP_FROM` | _unset_ | Sender address used on outbound mail, e.g. `eve@example.com`. Also the default recipient for email replies. |
+| `MATRIX_HOMESERVER` | _unset_ | Matrix homeserver base URL, e.g. `https://matrix.example.com`. When set, the matrix channel is enabled: Eve's `send_message` and proactive notifications can be delivered to a room, and incoming `m.room.message` events are ingested into the primary conversation. |
+| `MATRIX_ACCESS_TOKEN` | _unset_ | Matrix client access token for the bot account. |
+| `MATRIX_USER_ID` | _unset_ | Matrix user ID of the bot (own messages are never re-ingested). Also the default recipient for matrix sends. |
+| `CALDAV_URL` | _unset_ | CalDAV server base URL. When set, the calendar channel is enabled: Eve gets `get_calendar` / `create_event` / `update_event` / `delete_event` / `free_busy` MCP tools, and a poller fires proactive reminders for events starting within `CAL_REMINDER_LEAD`. Quiet hours are expressed as daily recurring events. |
+| `CALDAV_USERNAME` | _unset_ | CalDAV basic-auth username. |
+| `CALDAV_PASSWORD` | _unset_ | CalDAV basic-auth password. |
+| `CALDAV_CALENDAR_PATH` | _unset_ | Path of the calendar collection relative to `CALDAV_URL` (e.g. `calendars/eve/default`). |
+| `CAL_REMINDER_LEAD` | `15m` | How far ahead the calendar poller looks to fire reminders (Go duration). |
+| `SMS_WEBHOOK_TOKEN` | _unset_ | Token guarding the SMS inbound webhook `POST /api/inbound/sms`. When set, the SMS channel is registered as input-only: messages land in the primary conversation and replies/notifications are routed to whichever output channel is reachable (there is no SMS gateway in v1). Auth via `?token=` query param or `Authorization: Bearer <token>`. |
+| `VOICE_WEBHOOK_TOKEN` | _unset_ | Token guarding the voice-device inbound webhook `POST /api/inbound/voice`. Same behavior as SMS: input-only, with an optional `transcript` field for STT payloads, exercising the fallback router since a speakerless device cannot receive Eve's answer. |
 
 ## Build and Run
 

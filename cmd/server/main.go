@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,7 +18,9 @@ import (
 	"github.com/iamangus/eve/internal/config"
 	ctxmgr "github.com/iamangus/eve/internal/context"
 	"github.com/iamangus/eve/internal/email"
+	"github.com/iamangus/eve/internal/io"
 	"github.com/iamangus/eve/internal/store"
+	"github.com/iamangus/eve/internal/tasks"
 	"github.com/iamangus/eve/internal/trigger"
 	"github.com/iamangus/eve/internal/web"
 )
@@ -54,7 +57,60 @@ func main() {
 		CurateInterval:      cfg.ContextCurateInterval,
 	})
 
-	chatH := chat.NewHandler(st, af, cfg, ctxMgr)
+	ioMgr, err := io.NewManager(st, af, io.Config{
+		DataDir:          cfg.DataDir,
+		ActivityTimeout:  cfg.WebPresenceTimeout,
+		RouterAgentID:    cfg.RouterAgentID,
+		AssistantAgentID: cfg.AssistantAgentID,
+		ProactiveEnabled: cfg.ProactiveEnabled,
+		EVEMCPURL:        cfg.EVEMCPURL,
+	})
+	if err != nil {
+		slog.Error("io manager", "error", err)
+		os.Exit(1)
+	}
+	ioMgr.EnableEmail(io.SMTPConfig{
+		Host:     cfg.SMTPHost,
+		Port:     cfg.SMTPPort,
+		Username: cfg.SMTPUsername,
+		Password: cfg.SMTPPassword,
+		From:     cfg.SMTPFrom,
+	})
+	ioMgr.EnableMatrix(io.MatrixConfig{
+		Homeserver:  cfg.MatrixHomeserver,
+		AccessToken: cfg.MatrixAccessToken,
+		UserID:      cfg.MatrixUserID,
+	})
+	ioMgr.EnableCalendar(io.CalDAVConfig{
+		URL:           cfg.CalDAVURL,
+		Username:      cfg.CalDAVUsername,
+		Password:      cfg.CalDAVPassword,
+		CalendarPath:  cfg.CalDAVCalendarPath,
+		ReminderLead:  cfg.CalReminderLead,
+	})
+	ioMgr.SetContext(ctxMgr)
+
+	chatH := chat.NewHandler(st, af, cfg, ctxMgr, ioMgr)
+
+	taskStore, err := tasks.NewStore(cfg.DataDir)
+	if err != nil {
+		slog.Error("task store", "dir", cfg.DataDir, "error", err)
+		os.Exit(1)
+	}
+	taskMgr := tasks.NewManager(taskStore, af, tasks.Config{
+		PollInterval:  2 * time.Second,
+		DecisionAgent: cfg.AssistantAgentID,
+		Cooldown:      30 * time.Second,
+		Proactive:     cfg.ProactiveEnabled,
+		Router:        ioMgr.Router.Notify,
+		Presence:      ioMgr.PresenceSummary,
+		IsBusy: func(convID string) bool {
+			runID, err := st.ActiveRunForConversation(convID)
+			return err == nil && runID != ""
+		},
+	})
+	ioMgr.Tasks = taskMgr
+	chatH.SetTasks(taskMgr)
 
 	emailStore, err := store.NewEmailStore(cfg.DataDir)
 	if err != nil {
@@ -71,16 +127,50 @@ func main() {
 
 	go chatH.Reconcile(rootCtx)
 	go ctxMgr.Loop(rootCtx)
+	go taskMgr.Run(rootCtx)
 
 	poller := email.NewPoller(emailStore, func(ctx context.Context, acct store.Account, msg store.EmailMessage) {
+		sender := msg.From
+		if fromAddr := extractAddress(sender); fromAddr != "" {
+			sender = fromAddr
+		}
+		if ident := ioMgr.Ident.Resolve(io.ChannelEmail, sender); ident != nil && ident.Owner {
+			_, err := ioMgr.Inbound(ctx, io.InboundMessage{
+				Channel: io.ChannelEmail,
+				Sender:  sender,
+				Text:    msg.Body,
+			})
+			if err != nil {
+				slog.Warn("email inbound", "from", sender, "error", err)
+			}
+			return
+		}
 		engine.HandleEmail(ctx, acct, msg)
 	}, cfg.EmailPollInterval)
 	go poller.Run(rootCtx)
+
+	if ioMgr.Matrix.Enabled() {
+		mp := io.NewMatrixPoller(ioMgr.Matrix, ioMgr, cfg.DataDir)
+		go mp.Run(rootCtx)
+	}
+
+	if ioMgr.Cal != nil {
+		cp := io.NewCalPoller(ioMgr.Cal, ioMgr, cfg.CalReminderLead)
+		go cp.Run(rootCtx)
+	}
 
 	mux := http.NewServeMux()
 	chatH.RegisterRoutes(mux)
 	ctxMgr.RegisterRoutes(mux)
 	triggerH.RegisterRoutes(mux)
+	ioMgr.RegisterRoutes(mux)
+	ioMgr.RegisterWebhooks(mux, io.WebhookConfig{
+		SMSToken:   cfg.SMSToken,
+		VoiceToken: cfg.VoiceToken,
+	})
+
+	mcpSrv := io.NewMCP(ioMgr)
+	mux.Handle("/mcp", mcpSrv)
 
 	distFS, err := fs.Sub(frontend.Dist, "dist")
 	if err != nil {
@@ -115,4 +205,16 @@ func main() {
 		slog.Error("shutdown error", "error", err)
 	}
 	slog.Info("eve stopped")
+}
+
+// extractAddress pulls the bare email address out of a RFC 5322 sender
+// header, e.g. "Alice <alice@example.com>" -> "alice@example.com". Returns
+// the input unchanged when there is no angle-bracket form.
+func extractAddress(from string) string {
+	open := strings.LastIndex(from, "<")
+	close := strings.LastIndex(from, ">")
+	if open >= 0 && close > open {
+		return from[open+1 : close]
+	}
+	return from
 }

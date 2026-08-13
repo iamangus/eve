@@ -25,10 +25,11 @@ func (s *Store) CreateConversation(title string) (*Conversation, error) {
 	id := newID()
 	now := time.Now()
 	rec := &conversationRecord{
-		Title:     title,
-		Created:   now,
-		Updated:   now,
-		NextMsgID: 1,
+		Title:        title,
+		Created:      now,
+		Updated:      now,
+		NextMsgID:    1,
+		Participants: []string{"owner"},
 	}
 	s.mu.Lock()
 	s.convs[id] = rec
@@ -109,7 +110,7 @@ func (s *Store) DeleteConversation(id string) error {
 	return s.saveCompartments()
 }
 
-func (s *Store) AppendUserMessage(convID, content string) error {
+func (s *Store) AppendUserMessage(convID, content, channel, sender string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.convs[convID]
@@ -121,6 +122,8 @@ func (s *Store) AppendUserMessage(convID, content string) error {
 		ID:        r.NextMsgID,
 		Role:      "user",
 		Content:   content,
+		Channel:   channel,
+		Sender:    sender,
 		CreatedAt: now,
 	})
 	r.NextMsgID++
@@ -128,7 +131,7 @@ func (s *Store) AppendUserMessage(convID, content string) error {
 	return s.saveConversations()
 }
 
-func (s *Store) AppendAssistantMessage(convID, runID, content string) error {
+func (s *Store) AppendAssistantMessage(convID, runID, content, channel, sender string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.convs[convID]
@@ -141,11 +144,56 @@ func (s *Store) AppendAssistantMessage(convID, runID, content string) error {
 		Role:      "assistant",
 		Content:   content,
 		RunID:     runID,
+		Channel:   channel,
+		Sender:    sender,
 		CreatedAt: now,
 	})
 	r.NextMsgID++
 	r.Updated = now
 	return s.saveConversations()
+}
+
+// AppendAssistantMessageReturn appends an assistant message and returns the
+// stored message so callers can broadcast its full shape.
+func (s *Store) AppendAssistantMessageReturn(convID, runID, content, channel, sender string) (*Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.convs[convID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	now := time.Now()
+	m := Message{
+		ID:        r.NextMsgID,
+		Role:      "assistant",
+		Content:   content,
+		RunID:     runID,
+		Channel:   channel,
+		Sender:    sender,
+		CreatedAt: now,
+	}
+	r.Messages = append(r.Messages, m)
+	r.NextMsgID++
+	r.Updated = now
+	if err := s.saveConversations(); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// ConversationParticipants returns the identity names participating in a
+// conversation. It defaults to just the owner.
+func (s *Store) ConversationParticipants(convID string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, ok := s.convs[convID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if len(r.Participants) == 0 {
+		return []string{"owner"}, nil
+	}
+	return append([]string(nil), r.Participants...), nil
 }
 
 func (s *Store) ConversationHistory(convID string) ([]Message, error) {
@@ -171,6 +219,18 @@ func (s *Store) SetActiveRun(convID, runID string) error {
 	r.ActiveRunID = runID
 	r.Updated = time.Now()
 	return s.saveConversations()
+}
+
+// ActiveRunForConversation returns the run id currently in flight for a
+// conversation, or "" when it is idle.
+func (s *Store) ActiveRunForConversation(convID string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, ok := s.convs[convID]
+	if !ok {
+		return "", ErrNotFound
+	}
+	return r.ActiveRunID, nil
 }
 
 func (s *Store) ClearActiveRun(convID string) error {

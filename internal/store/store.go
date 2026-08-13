@@ -18,6 +18,8 @@ type Message struct {
 	Role      string    `json:"role"`
 	Content   string    `json:"content"`
 	RunID     string    `json:"run_id,omitempty"`
+	Channel   string    `json:"channel,omitempty"`
+	Sender    string    `json:"sender,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -46,6 +48,7 @@ type conversationRecord struct {
 	ActiveRunID    string    `json:"active_run_id,omitempty"`
 	Messages       []Message `json:"messages"`
 	NextMsgID      int64     `json:"next_msg_id"`
+	Participants   []string  `json:"participants,omitempty"`
 	HistorianRunAt time.Time `json:"historian_run_at,omitempty"`
 	HistorianError string    `json:"historian_error,omitempty"`
 }

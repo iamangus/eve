@@ -178,7 +178,7 @@ func TestStorePersistence_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := st.AppendUserMessage(conv.ID, "hello"); err != nil {
+	if err := st.AppendUserMessage(conv.ID, "hello", "web", "owner"); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	comp := store.Compartment{
