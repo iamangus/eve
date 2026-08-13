@@ -172,6 +172,56 @@ func (m *Manager) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/presence", m.presence)
 	mux.HandleFunc("GET /api/channels", m.channels)
 	mux.HandleFunc("POST /api/notify", m.notify)
+	mux.HandleFunc("GET /api/identities", m.listIdentities)
+	mux.HandleFunc("POST /api/identities", m.createIdentity)
+	mux.HandleFunc("PUT /api/identities/{name}", m.updateIdentity)
+	mux.HandleFunc("DELETE /api/identities/{name}", m.deleteIdentity)
+}
+
+func (m *Manager) listIdentities(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"identities": m.Ident.List()})
+}
+
+func (m *Manager) createIdentity(w http.ResponseWriter, r *http.Request) {
+	var in Identity
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body: " + err.Error()})
+		return
+	}
+	if in.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"})
+		return
+	}
+	if err := m.Ident.Upsert(in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, in)
+}
+
+func (m *Manager) updateIdentity(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var in Identity
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body: " + err.Error()})
+		return
+	}
+	// Identity names are immutable keys: the URL name wins.
+	in.Name = name
+	if err := m.Ident.Upsert(in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, in)
+}
+
+func (m *Manager) deleteIdentity(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := m.Ident.Delete(name); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"ok": "deleted"})
 }
 
 // PresenceSummary renders a compact human-readable snapshot of the user's

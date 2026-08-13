@@ -4,6 +4,7 @@
   import Context from './pages/Context.svelte'
   import Channels from './pages/Channels.svelte'
   import Tasks from './pages/Tasks.svelte'
+  import Identities from './pages/Identities.svelte'
 
   let tab = $state('chat')
 </script>
@@ -16,6 +17,7 @@
     <button class:active={tab === 'context'} onclick={() => (tab = 'context')}>Context</button>
     <button class:active={tab === 'channels'} onclick={() => (tab = 'channels')}>Channels</button>
     <button class:active={tab === 'tasks'} onclick={() => (tab = 'tasks')}>Tasks</button>
+    <button class:active={tab === 'identities'} onclick={() => (tab = 'identities')}>Identities</button>
   </nav>
   <div class="app-shell">
     {#if tab === 'chat'}
@@ -28,6 +30,8 @@
       <Channels />
     {:else if tab === 'tasks'}
       <Tasks />
+    {:else if tab === 'identities'}
+      <Identities />
     {:else}
       <Channels />
     {/if}
