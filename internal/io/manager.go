@@ -344,7 +344,7 @@ func (m *Manager) Inbound(ctx context.Context, msg InboundMessage) (runID string
 	}
 	m.Hub.Broadcast(Event{Type: EventMessage, ConvID: convID, Data: appended})
 	m.Reg.Touch(string(msg.Channel))
-	if sender != "owner" {
+	if !m.Ident.IsOwner(sender) {
 		// Unknown / non-owner senders are persisted so Eve sees them, but no
 		// run is triggered. Log loudly: a missing identities.json entry must
 		// never look like the message vanished.

@@ -93,8 +93,11 @@ func key(t ChannelType, address string) string {
 	return string(t) + "/" + address
 }
 
-// Resolve returns the identity for a given {channel, address}. Unknown
-// senders resolve to a generic "other" identity.
+// Resolve returns the identity for a given {channel, address}. The address is
+// first matched against the provenance map; if no channel/address key matches,
+// it is tried as an identity name directly (adapters that pass the owner's
+// name, e.g. webhook defaults). Unknown senders resolve to the generic
+// "other" identity.
 func (r *Resolver) Resolve(t ChannelType, address string) *Identity {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -102,6 +105,9 @@ func (r *Resolver) Resolve(t ChannelType, address string) *Identity {
 		if id, ok := r.byName[name]; ok {
 			return id
 		}
+	}
+	if id, ok := r.byName[address]; ok {
+		return id
 	}
 	o := r.other
 	return &o

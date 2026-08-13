@@ -72,7 +72,7 @@ func (m *Manager) webhookInbound(ch ChannelType, token string) http.HandlerFunc 
 			return
 		}
 		if body.Sender == "" {
-			body.Sender = "owner"
+			body.Sender = m.Ident.Owner().Name
 		}
 		if _, err := m.Inbound(r.Context(), InboundMessage{
 			Channel: ch,
