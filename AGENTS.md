@@ -34,7 +34,5 @@
   and persists the final assistant text from the `done` event.
 - Auth to agentfoundry is a single personal API key (`AGENTFOUNDRY_API_KEY`)
   sent as `Authorization: Bearer <key>`. No OIDC in this service (single-user).
-- Title generation: if `TITLE_AGENT_ID` is set, after the first user message of
-  a conversation the BFF fires a background goroutine that runs the title agent
-  (stateless) and updates `conversations.title`. Failures fall back to the
-  truncated-first-message default already set at send time.
+- Conversation titles are truncated from the first user message at send time;
+  there is no title-generating agent.

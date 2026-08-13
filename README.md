@@ -26,11 +26,8 @@ Browser ──HTTP──> eve BFF ──HTTP + Bearer API key──> agentfoundr
 
 ## Leveraging agentfoundry for derived tasks
 
-agentfoundry agents are cheap to spin up and composable. This service uses a
-secondary small-model agent (configured in agentfoundry) to generate concise
-conversation titles asynchronously after the first user message. Set
-`TITLE_AGENT_ID` to the agent id of a lightweight title-generating agent; leave
-it empty to fall back to a truncated first-message title.
+agentfoundry agents are cheap to spin up and composable. Conversation titles
+are truncated from the first user message; there is no title-generating agent.
 
 Near-term extensions along the same pattern (not yet implemented):
 
@@ -69,7 +66,6 @@ All configuration is via environment variables (no YAML).
 | `AGENTFOUNDRY_URL` | `http://localhost:3000` | agentfoundry backend API URL |
 | `AGENTFOUNDRY_API_KEY` | *(required)* | Personal API key created in agentfoundry (`POST /api/v1/api-keys`). Sent as `Authorization: Bearer <key>`. Runs are attributed to the key owner. |
 | `ASSISTANT_AGENT_ID` | *(required)* | Agent id of the eve assistant agent in agentfoundry |
-| `TITLE_AGENT_ID` | *(empty, optional)* | Agent id of a small-model agent used to generate conversation titles. If empty, titles are truncated from the first user message. |
 | `ROUTER_AGENT_ID` | *(empty, optional)* | Agent id of the message router (see `definitions/router.yaml` in agentfoundry). When set, proactive and async sends are routed by this agent; when empty, delivery falls back mechanically to the best reachable output channel. |
 | `EVEMCP_URL` | `http://localhost:8090/mcp` | URL agentfoundry dials to reach eve's MCP server. Attached as an ephemeral server to every assistant run, exposing `send_message` and `list_channels` so Eve can proactively message the user. In Docker, use `http://eve:8090/mcp`. |
 | `PROACTIVE_ENABLED` | `true` | Whether Eve may deliver messages outside a conversation turn (notifications, reminders, questions via `send_message`). |

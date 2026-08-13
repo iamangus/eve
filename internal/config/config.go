@@ -12,7 +12,6 @@ type Config struct {
 	AgentFoundryURL    string
 	AgentFoundryKey    string
 	AssistantAgentID   string
-	TitleAgentID       string
 	RouterAgentID      string
 	EVEMCPURL          string
 	ProactiveEnabled   bool
@@ -51,7 +50,6 @@ func Load() (Config, error) {
 		AgentFoundryURL:    envOr("AGENTFOUNDRY_URL", "http://localhost:3000"),
 		AgentFoundryKey:    os.Getenv("AGENTFOUNDRY_API_KEY"),
 		AssistantAgentID:   os.Getenv("ASSISTANT_AGENT_ID"),
-		TitleAgentID:       os.Getenv("TITLE_AGENT_ID"),
 		RouterAgentID:      os.Getenv("ROUTER_AGENT_ID"),
 		EVEMCPURL:          envOr("EVEMCP_URL", "http://localhost:8090/mcp"),
 		ProactiveEnabled:   boolEnv("PROACTIVE_ENABLED", true),

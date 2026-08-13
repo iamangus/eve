@@ -1,13 +1,11 @@
 package chat
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/iamangus/eve/internal/agentfoundry"
 	"github.com/iamangus/eve/internal/config"
@@ -23,7 +21,6 @@ type Handler struct {
 	ctxMgr  *ctxmgr.Manager
 	ioMgr   *io.Manager
 	agentID string
-	titleID string
 	mcpSrv  []agentfoundry.MCPServer
 	tasks   *tasks.Manager
 
@@ -49,7 +46,6 @@ func NewHandler(store *store.Store, client *agentfoundry.Client, cfg config.Conf
 		ctxMgr:     ctxMgr,
 		ioMgr:      ioMgr,
 		agentID:    cfg.AssistantAgentID,
-		titleID:    cfg.TitleAgentID,
 		mcpSrv:     mcpSrv,
 		failedRuns: make(map[string]int),
 	}
@@ -206,10 +202,6 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		slog.Error("set active run", "conv", convID, "run", runID, "error", err)
 	}
 
-	if userCount == 0 && h.titleID != "" {
-		go h.generateTitle(convID, req.Content)
-	}
-
 	writeJSON(w, http.StatusAccepted, sendMessageResponse{RunID: runID})
 }
 
@@ -229,42 +221,6 @@ func (h *Handler) runEvents(w http.ResponseWriter, r *http.Request) {
 	// single writer to messages + active_run_id), avoiding a race where both the
 	// SSE done path and a reconcile poll would persist the same assistant msg.
 	proxySSE(w, body, func(ev SSEEvent) {})
-}
-
-func (h *Handler) generateTitle(convID, firstMessage string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	prompt := "Generate a concise title (at most 6 words) for a conversation that starts with the following user message. Reply with only the title text, no quotes, no punctuation.\n\nUser message:\n" + firstMessage
-	runID, err := h.client.RunAgent(ctx, h.titleID, prompt, nil)
-	if err != nil {
-		slog.Warn("title run", "conv", convID, "error", err)
-		return
-	}
-	text, err := h.client.AwaitRunText(ctx, runID, 25*time.Second)
-	if err != nil {
-		slog.Warn("title await", "conv", convID, "run", runID, "error", err)
-		return
-	}
-	title := cleanTitle(text)
-	if title == "" {
-		return
-	}
-	if err := h.store.SetTitle(convID, title); err != nil {
-		slog.Error("set title", "conv", convID, "error", err)
-		return
-	}
-	slog.Info("title generated", "conv", convID, "title", title)
-}
-
-func cleanTitle(s string) string {
-	s = strings.TrimSpace(s)
-	s = strings.Trim(s, "\"'`")
-	s = strings.TrimSpace(s)
-	if len(s) > 80 {
-		s = strings.TrimSpace(s[:80]) + "…"
-	}
-	return s
 }
 
 // prependTaskBoard injects the current background-task state into the run so

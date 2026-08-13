@@ -33,7 +33,7 @@ func main() {
 		slog.Error("config", "error", err)
 		os.Exit(1)
 	}
-	slog.Info("loaded config", "listen", cfg.Listen, "agentfoundry", cfg.AgentFoundryURL, "agent", cfg.AssistantAgentID, "title_agent", cfg.TitleAgentID)
+	slog.Info("loaded config", "listen", cfg.Listen, "agentfoundry", cfg.AgentFoundryURL, "agent", cfg.AssistantAgentID)
 
 	af, err := agentfoundry.NewClient(cfg.AgentFoundryURL, cfg.AgentFoundryKey)
 	if err != nil {
