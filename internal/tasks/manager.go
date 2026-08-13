@@ -120,17 +120,34 @@ func (m *Manager) Reply(ctx context.Context, id, content string) error {
 	return m.startRun(ctx, &t)
 }
 
-func (m *Manager) Cancel(id string) error {
+// Cancel stops a background task. If the task's child run is still executing
+// in agentfoundry it is cancelled first; needs_input tasks have no live run,
+// so only the local status is flipped.
+func (m *Manager) Cancel(ctx context.Context, id string) error {
+	existing, err := m.store.Get(id)
+	if err != nil {
+		return err
+	}
+	if existing.Terminal() {
+		return fmt.Errorf("task %s is %s and cannot be cancelled", id, existing.Status)
+	}
+	if existing.RunID != "" && existing.Status == StatusRunning {
+		if err := m.client.CancelRun(ctx, existing.RunID); err != nil {
+			slog.Warn("cancel task run", "task", id, "run", existing.RunID, "error", err)
+		}
+	}
 	return m.store.Cancel(id)
 }
 
 // startRun launches the child agent for a task and records the run id. The
-// prompt carries the full task context plus any prior replies.
+// prompt carries the full task context plus any prior replies. The run is
+// tagged with the task id so it can be rediscovered after an eve restart.
 func (m *Manager) startRun(ctx context.Context, t *Task) error {
 	prompt := m.buildPrompt(t)
 	runID, err := m.client.RunAgentWith(ctx, t.AgentID, agentfoundry.RunOptions{
 		Message:        prompt,
 		ResponseSchema: taskSchema(),
+		TaskID:         t.ID,
 	})
 	if err != nil {
 		return fmt.Errorf("task agent run: %w", err)
@@ -157,8 +174,60 @@ func (m *Manager) buildPrompt(t *Task) string {
 	return b.String()
 }
 
-// Run is the background poller: it advances task runs to their terminal or
-// needs_input state and drives the decision engine for transitions.
+// Reconcile re-attaches task runs after an eve restart. Tasks whose run id
+// was lost (empty) or no longer resolves in agentfoundry are looked up by
+// task id; if the run is found it is re-attached and advanced to its current
+// state, otherwise the task is marked failed so it does not hang as running
+// forever. Call once before the poller starts.
+func (m *Manager) Reconcile(ctx context.Context) {
+	for _, t := range m.store.Active() {
+		rs, err := m.resolveRun(ctx, t)
+		if err != nil {
+			slog.Warn("task reconcile", "task", t.ID, "error", err)
+			continue
+		}
+		if rs == nil {
+			if t.RunID == "" {
+				slog.Warn("task reconcile: no run found", "task", t.ID)
+				_ = m.store.SetFailed(t.ID, "task run was lost during restart")
+			}
+			continue
+		}
+		switch rs.Status {
+		case "completed":
+			outcome := parseOutcome(rs.Response)
+			if err := m.store.SetOutcome(t.ID, outcome.Status, outcome.Text); err != nil {
+				slog.Warn("task reconcile outcome", "task", t.ID, "error", err)
+			} else {
+				slog.Info("task reconciled", "task", t.ID, "status", outcome.Status)
+			}
+		case "failed", "error", "cancelled", "canceled":
+			_ = m.store.SetFailed(t.ID, "child agent run did not complete")
+		case "running", "":
+			if t.RunID == "" {
+				slog.Info("task run reattached", "task", t.ID)
+			}
+		}
+	}
+}
+
+// resolveRun returns the current status for a task's run. When the stored run
+// id is missing or stale (unknown/404), it falls back to looking the run up
+// by the task id that was tagged on the run request.
+func (m *Manager) resolveRun(ctx context.Context, t Task) (*agentfoundry.RunStatus, error) {
+	if t.RunID != "" {
+		rs, err := m.client.GetRun(ctx, t.RunID)
+		if err == nil && rs.Status != "unknown" {
+			return rs, nil
+		}
+		if err != nil {
+			slog.Warn("task reconcile get run", "task", t.ID, "run", t.RunID, "error", err)
+		}
+	}
+	return m.client.FindRunByTaskID(ctx, t.ID)
+}
+
+
 func (m *Manager) Run(ctx context.Context) {
 	ticker := time.NewTicker(m.cfg.PollInterval)
 	defer ticker.Stop()

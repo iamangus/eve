@@ -127,6 +127,7 @@ func main() {
 
 	go chatH.Reconcile(rootCtx)
 	go ctxMgr.Loop(rootCtx)
+	taskMgr.Reconcile(rootCtx)
 	go taskMgr.Run(rootCtx)
 	go ioMgr.RunPresenceLoop(rootCtx)
 

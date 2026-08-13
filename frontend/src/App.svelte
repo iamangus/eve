@@ -3,6 +3,7 @@
   import EmailTriggers from './pages/EmailTriggers.svelte'
   import Context from './pages/Context.svelte'
   import Channels from './pages/Channels.svelte'
+  import Tasks from './pages/Tasks.svelte'
 
   let tab = $state('chat')
 </script>
@@ -14,6 +15,7 @@
     <button class:active={tab === 'email'} onclick={() => (tab = 'email')}>Email Triggers</button>
     <button class:active={tab === 'context'} onclick={() => (tab = 'context')}>Context</button>
     <button class:active={tab === 'channels'} onclick={() => (tab = 'channels')}>Channels</button>
+    <button class:active={tab === 'tasks'} onclick={() => (tab = 'tasks')}>Tasks</button>
   </nav>
   <div class="app-shell">
     {#if tab === 'chat'}
@@ -22,6 +24,10 @@
       <EmailTriggers />
     {:else if tab === 'context'}
       <Context />
+    {:else if tab === 'channels'}
+      <Channels />
+    {:else if tab === 'tasks'}
+      <Tasks />
     {:else}
       <Channels />
     {/if}

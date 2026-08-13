@@ -21,6 +21,7 @@ type Message struct {
 type runRequest struct {
 	Message        string          `json:"message"`
 	History        []Message       `json:"history,omitempty"`
+	TaskID         string          `json:"task_id,omitempty"`
 	MCPServers     []MCPServer     `json:"mcp_servers,omitempty"`
 	ResponseSchema *ResponseSchema `json:"response_schema,omitempty"`
 }
@@ -45,7 +46,7 @@ type runResponse struct {
 	RunID string `json:"run_id"`
 }
 
-type runStatus struct {
+type RunStatus struct {
 	Status   string `json:"status"`
 	Response string `json:"response"`
 	Error    string `json:"error"`
@@ -73,19 +74,22 @@ func (c *Client) RunAgent(ctx context.Context, agentID, message string, history 
 	return c.RunAgentWith(ctx, agentID, RunOptions{Message: message, History: history})
 }
 
-// RunOptions configures a run beyond message+history: ephemeral MCP servers
-// and a response schema.
+// RunOptions configures a run beyond message+history: ephemeral MCP servers,
+// a response schema, and an optional task id used to rediscover task runs
+// after a restart.
 type RunOptions struct {
 	Message        string
 	History        []Message
 	MCPServers     []MCPServer
 	ResponseSchema *ResponseSchema
+	TaskID         string
 }
 
 func (c *Client) RunAgentWith(ctx context.Context, agentID string, opts RunOptions) (string, error) {
 	body := runRequest{
 		Message:        opts.Message,
 		History:        opts.History,
+		TaskID:         opts.TaskID,
 		MCPServers:     opts.MCPServers,
 		ResponseSchema: opts.ResponseSchema,
 	}
@@ -116,7 +120,7 @@ func (c *Client) RunAgentWith(ctx context.Context, agentID string, opts RunOptio
 	return out.RunID, nil
 }
 
-func (c *Client) GetRun(ctx context.Context, runID string) (*runStatus, error) {
+func (c *Client) GetRun(ctx context.Context, runID string) (*RunStatus, error) {
 	u := c.baseURL.JoinPath("/api/v1/runs/" + url.PathEscape(runID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
@@ -129,13 +133,65 @@ func (c *Client) GetRun(ctx context.Context, runID string) (*runStatus, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return &runStatus{Status: "unknown"}, nil
+		return &RunStatus{Status: "unknown"}, nil
 	}
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("agentfoundry get run: %s: %s", resp.Status, string(b))
 	}
-	var rs runStatus
+	var rs RunStatus
+	if err := json.NewDecoder(resp.Body).Decode(&rs); err != nil {
+		return nil, fmt.Errorf("decode run status: %w", err)
+	}
+	return &rs, nil
+}
+
+// CancelRun cancels a running agentfoundry run (terminates its workflow).
+func (c *Client) CancelRun(ctx context.Context, runID string) error {
+	u := c.baseURL.JoinPath("/api/v1/runs/" + url.PathEscape(runID) + "/cancel")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	c.withAuth(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("agentfoundry cancel run: %s: %s", resp.Status, string(b))
+	}
+	return nil
+}
+
+// FindRunByTaskID returns the agentfoundry run associated with a background
+// task id, or nil when none exists. Used to rediscover in-flight task runs
+// after an eve restart.
+func (c *Client) FindRunByTaskID(ctx context.Context, taskID string) (*RunStatus, error) {
+	u := c.baseURL.JoinPath("/api/v1/runs")
+	q := u.Query()
+	q.Set("task_id", taskID)
+	u.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	c.withAuth(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("agentfoundry find run by task: %s: %s", resp.Status, string(b))
+	}
+	var rs RunStatus
 	if err := json.NewDecoder(resp.Body).Decode(&rs); err != nil {
 		return nil, fmt.Errorf("decode run status: %w", err)
 	}

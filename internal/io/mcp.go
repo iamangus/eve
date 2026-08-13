@@ -174,7 +174,7 @@ func (m *MCP) handleCancelTask(ctx context.Context, req mcp.CallToolRequest) (*m
 	if id == "" {
 		return mcp.NewToolResultError("task_id is required"), nil
 	}
-	if err := tm.Cancel(id); err != nil {
+	if err := tm.Cancel(ctx, id); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("cancel failed: %v", err)), nil
 	}
 	return mcp.NewToolResultText("Task cancelled"), nil

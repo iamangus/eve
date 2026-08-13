@@ -281,7 +281,7 @@ func (h *Handler) cancelTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	if err := h.tasks.Cancel(id); err != nil {
+	if err := h.tasks.Cancel(r.Context(), id); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
