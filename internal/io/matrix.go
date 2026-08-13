@@ -10,6 +10,7 @@ import (
 
 	"github.com/iamangus/eve/internal/store"
 
+	"maunium.net/go/mautrix/id"
 )
 
 // MatrixConfig configures the matrix channel. Empty Homeserver disables it.
@@ -27,12 +28,15 @@ func (c MatrixConfig) Enabled() bool {
 
 // matrixAdapter delivers canonical outbound messages to a matrix room.
 // Recipient may be a room ID, a matrix user ID, or an identity name that
-// resolves through the registry. ThreadRef carries the room id.
+// resolves through the registry. ThreadRef carries the room id. Sending goes
+// through the mautrix client so messages in E2EE rooms are encrypted; rooms
+// without encryption are sent in plaintext as before.
 type matrixAdapter struct {
 	cfg   MatrixConfig
 	reg   *Registry
 	store *store.Store
 	hub   *Hub
+	e2ee  *MatrixE2EE
 }
 
 func (a *matrixAdapter) Type() ChannelType { return ChannelMatrix }
@@ -54,7 +58,7 @@ func (a *matrixAdapter) Send(ctx context.Context, msg OutboundMessage) error {
 			return fmt.Errorf("matrix: unresolved recipient %q", msg.Recipient)
 		}
 	}
-	if err := a.cfg.SendRoom(ctx, roomID, msg.Text); err != nil {
+	if err := a.sendText(ctx, roomID, msg.Text); err != nil {
 		return err
 	}
 	// Record the delivery in the conversation so the web UI shows it as a
@@ -69,6 +73,20 @@ func (a *matrixAdapter) Send(ctx context.Context, msg OutboundMessage) error {
 		Data:   m,
 	})
 	return nil
+}
+
+// sendText delivers a message through the mautrix client so encrypted rooms
+// get encrypted messages. If the crypto client is unavailable (should not
+// happen once enabled), it falls back to plaintext via the client-server API.
+func (a *matrixAdapter) sendText(ctx context.Context, roomID, body string) error {
+	if a.e2ee != nil {
+		_, err := a.e2ee.Client().SendText(ctx, id.RoomID(roomID), body)
+		if err != nil {
+			return fmt.Errorf("matrix: send: %w", err)
+		}
+		return nil
+	}
+	return a.cfg.SendRoom(ctx, roomID, body)
 }
 
 // SendRoom delivers a plain-text message to a matrix room using the client

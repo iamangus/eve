@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io/fs"
 	"log/slog"
@@ -69,6 +70,9 @@ func main() {
 		slog.Error("io manager", "error", err)
 		os.Exit(1)
 	}
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+
 	ioMgr.EnableEmail(io.SMTPConfig{
 		Host:     cfg.SMTPHost,
 		Port:     cfg.SMTPPort,
@@ -76,11 +80,28 @@ func main() {
 		Password: cfg.SMTPPassword,
 		From:     cfg.SMTPFrom,
 	})
-	ioMgr.EnableMatrix(io.MatrixConfig{
+	matrixCfg := io.MatrixConfig{
 		Homeserver:  cfg.MatrixHomeserver,
 		AccessToken: cfg.MatrixAccessToken,
 		UserID:      cfg.MatrixUserID,
-	})
+	}
+	var matrixE2EE *io.MatrixE2EE
+	if matrixCfg.Enabled() {
+		pickleKey := []byte(cfg.MatrixPickleKey)
+		if len(pickleKey) == 0 {
+			sum := sha256.Sum256([]byte(cfg.MatrixAccessToken))
+			pickleKey = sum[:]
+		}
+		me, err := io.NewMatrixE2EE(rootCtx, matrixCfg, cfg.DataDir, pickleKey)
+		if err != nil {
+			slog.Error("matrix e2ee init failed; matrix channel disabled", "error", err)
+			matrixCfg = io.MatrixConfig{}
+		} else {
+			matrixE2EE = me
+			defer me.Close()
+		}
+	}
+	ioMgr.EnableMatrix(matrixCfg, matrixE2EE)
 	ioMgr.EnableCalendar(io.CalDAVConfig{
 		URL:           cfg.CalDAVURL,
 		Username:      cfg.CalDAVUsername,
@@ -122,9 +143,6 @@ func main() {
 	engine := trigger.NewEngine(emailStore, af, cfg.AssistantAgentID, triggerRunTimeout)
 	triggerH := trigger.NewHandler(emailStore, af, engine)
 
-	rootCtx, rootCancel := context.WithCancel(context.Background())
-	defer rootCancel()
-
 	go chatH.Reconcile(rootCtx)
 	go ctxMgr.Loop(rootCtx)
 	taskMgr.Reconcile(rootCtx)
@@ -155,7 +173,7 @@ func main() {
 	go poller.Run(rootCtx)
 
 	if ioMgr.Matrix.Enabled() {
-		mp := io.NewMatrixPoller(ioMgr.Matrix, ioMgr, cfg.DataDir)
+		mp := io.NewMatrixPoller(ioMgr.Matrix, ioMgr, matrixE2EE)
 		go mp.Run(rootCtx)
 	}
 

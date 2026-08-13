@@ -2,160 +2,177 @@ package io
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
+	"errors"
 	"log/slog"
-	"net/http"
-	"net/url"
-	"os"
 	"strings"
 	"time"
+
+	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 )
 
-// matrixSyncResponse is the subset of the /sync response we care about:
-// the next_batch token and room timeline events.
-type matrixSyncResponse struct {
-	NextBatch string `json:"next_batch"`
-	Rooms     struct {
-		Join map[string]struct {
-			Timeline struct {
-				Events []matrixEvent `json:"events"`
-			} `json:"timeline"`
-		} `json:"join"`
-	} `json:"rooms"`
-}
-
-type matrixEvent struct {
-	Type    string          `json:"type"`
-	RoomID  string          `json:"room_id"`
-	EventID string          `json:"event_id"`
-	Sender  string          `json:"sender"`
-	Content map[string]any `json:"content"`
-}
-
-// MatrixPoller long-polls the matrix sync API and forwards timeline m.room.message
-// events to the manager's inbound path. It keeps a cursor file in DataDir so
-// the since token survives restarts (a message is ingested at most once).
+// MatrixPoller runs the matrix sync loop through the mautrix client. The
+// Olm machine's ProcessSyncResponse is wired in as a sync listener so
+// to-device room keys, device lists and one-time-key counts are handled
+// automatically; room message events (plaintext or encrypted) are forwarded
+// to the manager's inbound path. Undecryptable events are never silently
+// dropped: they trigger a key request and are logged with a reason.
 type MatrixPoller struct {
-	cfg    MatrixConfig
+	cfg     MatrixConfig
 	manager *Manager
-	dataDir string
-	cursor string
+	e2ee    *MatrixE2EE
 }
 
-// NewMatrixPoller returns a sync poller for the configured matrix channel.
-func NewMatrixPoller(cfg MatrixConfig, m *Manager, dataDir string) *MatrixPoller {
-	return &MatrixPoller{cfg: cfg, manager: m, dataDir: dataDir}
+// NewMatrixPoller returns the sync poller for the configured matrix channel.
+// e2ee must be non-nil (it owns the client and crypto machine).
+func NewMatrixPoller(cfg MatrixConfig, m *Manager, e2ee *MatrixE2EE) *MatrixPoller {
+	return &MatrixPoller{cfg: cfg, manager: m, e2ee: e2ee}
 }
 
-// Run blocks until ctx is cancelled, long-polling /sync with a 30s timeout.
+// Run blocks until ctx is cancelled, running mautrix's sync loop. The
+// DefaultSyncer dispatches events to the handlers registered in setup.
+// Sync errors are logged and surfaced in poller health, then the loop
+// retries after a short backoff so a transient network blip does not take
+// the channel down silently.
 func (p *MatrixPoller) Run(ctx context.Context) {
-	p.loadCursor()
-	if p.cursor == "" {
-		// First sync without a cursor returns all state — we only care about
-		// messages from here on, so start with a full sync to seed the token.
-		if _, err := p.sync(ctx, ""); err != nil {
-			slog.Warn("matrix sync initial", "error", err)
-		}
+	client := p.e2ee.Client()
+	syncer, ok := client.Syncer.(mautrix.ExtensibleSyncer)
+	if !ok {
+		slog.Error("matrix: client syncer does not implement ExtensibleSyncer", "user", client.UserID)
+		p.manager.RecordPollHealth("matrix", errors.New("syncer does not implement ExtensibleSyncer"))
+		return
 	}
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	p.setupHandlers(syncer)
+
+	slog.Info("matrix sync started", "user", client.UserID, "device", client.DeviceID)
+	const backoff = 5 * time.Second
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			next, err := p.sync(ctx, p.cursor)
+		err := client.SyncWithContext(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Warn("matrix sync error; retrying", "error", err, "backoff", backoff)
 			p.manager.RecordPollHealth("matrix", err)
-			if err != nil {
-				slog.Warn("matrix sync", "error", err)
-				continue
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
 			}
-			if next != "" && next != p.cursor {
-				p.cursor = next
-				p.saveCursor()
+			continue
+		}
+		p.manager.RecordPollHealth("matrix", nil)
+	}
+}
+
+// setupHandlers registers the crypto machine's sync/state handlers plus our
+// message handlers. Order matters: the machine must see to-device and state
+// events before we try to decrypt timeline events.
+func (p *MatrixPoller) setupHandlers(syncer mautrix.ExtensibleSyncer) {
+	mach := p.e2ee.Mach()
+	syncer.OnSync(mach.ProcessSyncResponse)
+	syncer.OnEventType(event.StateMember, mach.HandleMemberEvent)
+	syncer.OnEventType(event.EventEncrypted, p.handleEncrypted)
+	syncer.OnEventType(event.EventMessage, p.handleMessage)
+}
+
+// handleEncrypted decrypts a timeline m.room.encrypted event and forwards
+// the decrypted message. If no room key is available it waits briefly for
+// keys (the machine handles incoming m.room_key to-device events), then
+// requests the key from the sender. Undecryptable events are logged with a
+// reason — never silently dropped.
+func (p *MatrixPoller) handleEncrypted(ctx context.Context, evt *event.Event) {
+	if evt.Sender == id.UserID(p.cfg.UserID) {
+		return
+	}
+	mach := p.e2ee.Mach()
+	content := evt.Content.AsEncrypted()
+	if content == nil {
+		slog.Warn("matrix: encrypted event has no content", "room", evt.RoomID, "sender", evt.Sender)
+		return
+	}
+	if content.Algorithm != id.AlgorithmMegolmV1 {
+		slog.Warn("matrix: unsupported encryption algorithm", "room", evt.RoomID, "sender", evt.Sender, "algorithm", content.Algorithm)
+		return
+	}
+
+	decrypted, err := mach.DecryptMegolmEvent(ctx, evt)
+	if errors.Is(err, crypto.ErrNoSessionFound) {
+		slog.Info("matrix: no session, waiting for keys", "room", evt.RoomID, "sender", evt.Sender, "session_id", content.SessionID)
+		if mach.WaitForSession(ctx, evt.RoomID, content.SenderKey, content.SessionID, 3*time.Second) {
+			if decrypted, err = mach.DecryptMegolmEvent(ctx, evt); err != nil {
+				slog.Warn("matrix decrypt after wait", "room", evt.RoomID, "error", err)
+				p.manager.RecordPollHealth("matrix", err)
+				return
+			}
+		} else {
+			p.requestKeys(ctx, evt, content)
+			if !mach.WaitForSession(ctx, evt.RoomID, content.SenderKey, content.SessionID, 22*time.Second) {
+				err := errors.New("undecryptable message: no session after key request")
+				slog.Warn("matrix: still no session after key request; message undecryptable",
+					"room", evt.RoomID, "sender", evt.Sender, "session_id", content.SessionID)
+				p.manager.RecordPollHealth("matrix", err)
+				return
+			}
+			if decrypted, err = mach.DecryptMegolmEvent(ctx, evt); err != nil {
+				slog.Warn("matrix decrypt after key request", "room", evt.RoomID, "error", err)
+				p.manager.RecordPollHealth("matrix", err)
+				return
 			}
 		}
-	}
-}
-
-// sync performs one /sync call and forwards any new message events.
-func (p *MatrixPoller) sync(ctx context.Context, since string) (string, error) {
-	endpoint := strings.TrimSuffix(p.cfg.Homeserver, "/") + "/_matrix/client/v3/sync"
-	q := url.Values{}
-	q.Set("timeout", "25000")
-	if since != "" {
-		q.Set("since", since)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+q.Encode(), nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+p.cfg.AccessToken)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		var er struct {
-			Error string `json:"error"`
+	} else if err != nil {
+		var withheld *event.RoomKeyWithheldEventContent
+		if errors.As(err, &withheld) {
+			slog.Warn("matrix key withheld", "room", evt.RoomID, "sender", evt.Sender, "code", withheld.Code, "reason", withheld.Reason)
+		} else {
+			slog.Warn("matrix decrypt failed", "room", evt.RoomID, "sender", evt.Sender, "error", err)
 		}
-		_ = json.NewDecoder(resp.Body).Decode(&er)
-		return "", fmt.Errorf("sync %s: %s", resp.Status, er.Error)
+		p.manager.RecordPollHealth("matrix", err)
+		return
 	}
-	var sr matrixSyncResponse
-	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-		return "", err
+	if decrypted == nil {
+		slog.Warn("matrix: decrypt returned nil event", "room", evt.RoomID)
+		return
 	}
-	for roomID, room := range sr.Rooms.Join {
-		for _, ev := range room.Timeline.Events {
-			if ev.Type != "m.room.message" || ev.Sender == p.cfg.UserID {
-				continue
-			}
-			if ev.RoomID == "" {
-				ev.RoomID = roomID
-			}
-			body := ""
-			if b, ok := ev.Content["body"].(string); ok {
-				body = b
-			}
-			text := strings.TrimSpace(body)
-			if text == "" {
-				continue
-			}
-			if _, err := p.manager.Inbound(ctx, InboundMessage{
-				Channel:   ChannelMatrix,
-				Sender:    ev.Sender,
-				Text:      text,
-				ThreadRef: ev.RoomID,
-			}); err != nil {
-				slog.Warn("matrix inbound", "room", ev.RoomID, "sender", ev.Sender, "error", err)
-			}
-		}
-	}
-	return sr.NextBatch, nil
-}
-
-func (p *MatrixPoller) loadCursor() {
-	p.cursor = loadCursorFile(p.dataDir, "matrix_since.txt")
-}
-
-func (p *MatrixPoller) saveCursor() {
-	if err := saveCursorFile(p.dataDir, "matrix_since.txt", p.cursor); err != nil {
-		slog.Warn("matrix cursor", "error", err)
+	if decrypted.Type == event.EventMessage {
+		p.handleMessage(ctx, decrypted)
 	}
 }
 
-func loadCursorFile(dir, name string) string {
-	path := dir + "/" + name
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return ""
+// requestKeys asks the sender (and our own devices) for the room key for a
+// session we couldn't decrypt.
+func (p *MatrixPoller) requestKeys(ctx context.Context, evt *event.Event, content *event.EncryptedEventContent) {
+	users := map[id.UserID][]id.DeviceID{
+		evt.Sender:             {"*"},
+		p.e2ee.Client().UserID: {"*"},
 	}
-	return strings.TrimSpace(string(b))
+	if err := p.e2ee.Mach().SendRoomKeyRequest(ctx, evt.RoomID, content.SenderKey, content.SessionID, "", users); err != nil {
+		slog.Warn("matrix key request failed", "room", evt.RoomID, "error", err)
+	}
 }
 
-func saveCursorFile(dir, name, value string) error {
-	return os.WriteFile(dir+"/"+name, []byte(value), 0o644)
+// handleMessage forwards a plaintext (or decrypted) message event to the
+// manager's inbound path.
+func (p *MatrixPoller) handleMessage(ctx context.Context, evt *event.Event) {
+	if evt.Sender == id.UserID(p.cfg.UserID) {
+		return
+	}
+	body := evt.Content.AsMessage()
+	text := ""
+	if body != nil {
+		text = strings.TrimSpace(body.Body)
+	}
+	if text == "" {
+		return
+	}
+	if _, err := p.manager.Inbound(ctx, InboundMessage{
+		Channel:   ChannelMatrix,
+		Sender:    evt.Sender.String(),
+		Text:      text,
+		ThreadRef: evt.RoomID.String(),
+	}); err != nil {
+		slog.Warn("matrix inbound", "room", evt.RoomID, "sender", evt.Sender, "error", err)
+	}
 }

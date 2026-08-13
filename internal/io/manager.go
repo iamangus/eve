@@ -45,6 +45,9 @@ type Manager struct {
 	// Matrix holds the active matrix config (empty when disabled) so main can
 	// start the sync poller.
 	Matrix MatrixConfig
+	// MatrixE2EE holds the mautrix client + crypto machine (nil when matrix
+	// is disabled or crypto failed to initialize).
+	MatrixE2EE *MatrixE2EE
 	// Cal is the calendar store (nil when the calendar channel is disabled).
 	Cal *CalStore
 
@@ -292,6 +295,11 @@ func (m *Manager) Inbound(ctx context.Context, msg InboundMessage) (runID string
 	m.Hub.Broadcast(Event{Type: EventMessage, ConvID: convID, Data: appended})
 	m.Reg.Touch(string(msg.Channel))
 	if sender != "owner" {
+		// Unknown / non-owner senders are persisted so Eve sees them, but no
+		// run is triggered. Log loudly: a missing identities.json entry must
+		// never look like the message vanished.
+		slog.Warn("inbound from non-owner identity; no run triggered",
+			"channel", msg.Channel, "sender", msg.Sender, "identity", sender)
 		return "", nil
 	}
 	history, _, herr := m.renderHistory(convID)
@@ -348,12 +356,14 @@ func (m *Manager) EnableEmail(cfg SMTPConfig) {
 }
 
 // EnableMatrix registers the matrix channel and its adapter. Called by main
-// when matrix config is present; a no-op otherwise.
-func (m *Manager) EnableMatrix(cfg MatrixConfig) {
+// when matrix config is present; a no-op otherwise. e2ee carries the mautrix
+// client and crypto machine so sending is encrypted in E2EE rooms.
+func (m *Manager) EnableMatrix(cfg MatrixConfig, e2ee *MatrixE2EE) {
 	if !cfg.Enabled() {
 		return
 	}
 	m.Matrix = cfg
+	m.MatrixE2EE = e2ee
 	m.Reg.Register(Channel{
 		ID:               "matrix",
 		Type:             ChannelMatrix,
@@ -366,7 +376,7 @@ func (m *Manager) EnableMatrix(cfg MatrixConfig) {
 		DefaultRecipient: cfg.UserID,
 		Preference:       30,
 	})
-	m.Router.RegisterAdapter(&matrixAdapter{cfg: cfg, reg: m.Reg, store: m.store, hub: m.Hub})
+	m.Router.RegisterAdapter(&matrixAdapter{cfg: cfg, reg: m.Reg, store: m.store, hub: m.Hub, e2ee: e2ee})
 }
 
 // EnableCalendar activates the CalDAV calendar channel. Called by main when

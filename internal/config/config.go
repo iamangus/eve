@@ -26,6 +26,7 @@ type Config struct {
 	MatrixHomeserver   string
 	MatrixAccessToken  string
 	MatrixUserID       string
+	MatrixPickleKey    string
 	CalDAVURL          string
 	CalDAVUsername     string
 	CalDAVPassword     string
@@ -64,6 +65,7 @@ func Load() (Config, error) {
 		MatrixHomeserver:  os.Getenv("MATRIX_HOMESERVER"),
 		MatrixAccessToken: os.Getenv("MATRIX_ACCESS_TOKEN"),
 		MatrixUserID:      os.Getenv("MATRIX_USER_ID"),
+		MatrixPickleKey:   os.Getenv("MATRIX_PICKLE_KEY"),
 		CalDAVURL:          os.Getenv("CALDAV_URL"),
 		CalDAVUsername:     os.Getenv("CALDAV_USERNAME"),
 		CalDAVPassword:     os.Getenv("CALDAV_PASSWORD"),

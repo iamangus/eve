@@ -92,6 +92,7 @@ All configuration is via environment variables (no YAML).
 | `MATRIX_HOMESERVER` | _unset_ | Matrix homeserver base URL, e.g. `https://matrix.example.com`. When set, the matrix channel is enabled: Eve's `send_message` and proactive notifications can be delivered to a room, and incoming `m.room.message` events are ingested into the primary conversation. |
 | `MATRIX_ACCESS_TOKEN` | _unset_ | Matrix client access token for the bot account. |
 | `MATRIX_USER_ID` | _unset_ | Matrix user ID of the bot (own messages are never re-ingested). Also the default recipient for matrix sends. |
+| `MATRIX_PICKLE_KEY` | _unset_ | Optional key protecting the matrix E2EE crypto store (`eve_matrix.json`). When unset it is derived from `MATRIX_ACCESS_TOKEN`, so the key stays stable across restarts without extra config. |
 | `CALDAV_URL` | _unset_ | CalDAV server base URL. When set, the calendar channel is enabled: Eve gets `get_calendar` / `create_event` / `update_event` / `delete_event` / `free_busy` MCP tools, and a poller fires proactive reminders for events starting within `CAL_REMINDER_LEAD`. Quiet hours are expressed as daily recurring events. |
 | `CALDAV_USERNAME` | _unset_ | CalDAV basic-auth username. |
 | `CALDAV_PASSWORD` | _unset_ | CalDAV basic-auth password. |
@@ -115,12 +116,17 @@ npm run build     # outputs frontend/dist (embedded via //go:embed)
 ### Backend
 
 ```bash
-go build -o eve ./cmd/server/
+go build -tags goolm -o eve ./cmd/server/
 AGENTFOUNDRY_API_KEY=... \
 ASSISTANT_AGENT_ID=... \
 AGENTFOUNDRY_URL=http://localhost:3000 \
 ./eve
 ```
+
+> The matrix E2EE channel requires the pure-Go Olm implementation, so local
+> builds must pass the `goolm` build tag (the Docker image does this
+> automatically). Without it the build falls back to cgo `libolm`, which the
+> CGO_ENABLED=0 image cannot link.
 
 ### Dev (live reload)
 
