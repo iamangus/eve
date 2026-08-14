@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -144,24 +143,34 @@ func (e *MatrixE2EE) EnsureCrossSigningSetup(ctx context.Context, surfaceURL fun
 		return fmt.Errorf("matrix: generate cross-signing keys: %w", err)
 	}
 
+	// The homeserver answers the first upload with a UIA 401 whose m.oauth
+	// params carry the account-management approval URL. mautrix only decodes
+	// that body when a callback is provided, so one is wired here: the first
+	// time an approval URL appears it is surfaced and the upload is retried
+	// until the owner approves (Synapse's temporary 10-minute window) or the
+	// deadline passes.
 	deadline := time.Now().Add(crossSigningSetupTimeout)
-	lastURL := ""
+	surfaced := ""
+	callback := func(ui *mautrix.RespUserInteractive) interface{} {
+		url := uiApprovalURL(ui)
+		if url == "" || url == surfaced {
+			return nil
+		}
+		surfaced = url
+		e.log.Warn().Str("url", url).Str("window", "10 minutes").Msg("matrix cross-signing reset requires approval")
+		surfaceURL(url)
+		return nil
+	}
 	for {
-		err := e.mach.PublishCrossSigningKeys(ctx, keys, nil)
+		err := e.mach.PublishCrossSigningKeys(ctx, keys, callback)
 		if err == nil {
 			break
 		}
-		url := crossSigningApprovalURL(err)
-		if url == "" {
+		if surfaced == "" {
 			return fmt.Errorf("matrix: publish cross-signing keys: %w", err)
 		}
-		if url != lastURL {
-			lastURL = url
-			e.log.Warn().Str("url", url).Str("window", "10 minutes").Msg("matrix cross-signing reset requires approval")
-			surfaceURL(url)
-		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("matrix: cross-signing reset not approved within %s (approve at %s)", crossSigningSetupTimeout, url)
+			return fmt.Errorf("matrix: cross-signing reset not approved within %s (approve at %s)", crossSigningSetupTimeout, surfaced)
 		}
 		select {
 		case <-ctx.Done():
@@ -182,17 +191,13 @@ func (e *MatrixE2EE) EnsureCrossSigningSetup(ctx context.Context, surfaceURL fun
 	return nil
 }
 
-// crossSigningApprovalURL extracts the account-management approval URL from a
-// 401 response. Under MAS/Synapse the response body carries the URL in
-// params.m.oauth.url (and the unstable org.matrix.cross_signing_reset form);
-// an empty result means the error is not the approval refusal.
-func crossSigningApprovalURL(err error) string {
-	var httpErr mautrix.HTTPError
-	if !errors.As(err, &httpErr) || !httpErr.IsStatus(http.StatusUnauthorized) {
-		return ""
-	}
-	var ui mautrix.RespUserInteractive
-	if jerr := json.Unmarshal([]byte(httpErr.ResponseBody), &ui); jerr != nil {
+// uiApprovalURL extracts the account-management approval URL from the UIA
+// response mautrix passes to the cross-signing callback. Under MAS/Synapse the
+// params carry the URL in m.oauth.url (and the unstable
+// org.matrix.cross_signing_reset form); an empty result means the response is
+// not the approval refusal.
+func uiApprovalURL(ui *mautrix.RespUserInteractive) string {
+	if ui == nil {
 		return ""
 	}
 	for _, stage := range []mautrix.AuthType{mautrix.AuthTypeOAuth, mautrix.AuthType("org.matrix.cross_signing_reset")} {

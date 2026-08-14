@@ -66,16 +66,6 @@ type PollHealth struct {
 	LastError string    `json:"last_error,omitempty"`
 }
 
-// PrimaryConversationID returns the ID of the earliest-created conversation
-// (the unified owner thread) for callers outside the io package, e.g. main
-// surfacing one-time operational notices.
-func (m *Manager) PrimaryConversationID() string {
-	if m.store == nil {
-		return ""
-	}
-	return m.store.PrimaryConversationID()
-}
-
 // RecordPollHealth updates the health snapshot for a poller. A nil error
 // clears any previous error; a non-nil error records it alongside the check
 // timestamp so the UI can show when a path last failed.
