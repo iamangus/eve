@@ -102,6 +102,36 @@ func main() {
 		}
 	}
 	ioMgr.EnableMatrix(matrixCfg, matrixE2EE)
+	if matrixE2EE != nil {
+		// One-time bootstrap: make Eve's bot the account's trusted
+		// cross-signing client. When the account has orphaned keys from the
+		// provisioning browser session, the homeserver returns an
+		// account-management approval URL that the owner must approve in a
+		// browser; surface it loudly and via the channels so it is never
+		// silent. This is a manual reset — no admin token, no permanent
+		// permission changes.
+		go func() {
+			if err := matrixE2EE.EnsureCrossSigningSetup(rootCtx, func(url string) {
+				slog.Warn("matrix cross-signing reset approval required", "url", url, "note", "open the URL, sign in as eve, and approve to make Eve the trusted client")
+				convID := ioMgr.PrimaryConversationID()
+				ioMgr.Hub.Broadcast(io.Event{
+					Type:   io.EventMessage,
+					ConvID: convID,
+					Data: map[string]any{
+						"id":      "matrix-cross-signing-approval",
+						"text":    "Matrix cross-signing reset needs your approval. Open this URL and sign in as eve: " + url,
+						"channel": "matrix",
+						"sender":  "eve",
+					},
+				})
+				if err := ioMgr.Router.Notify(rootCtx, convID, "Matrix cross-signing reset needs your approval. Open this URL and sign in as eve: "+url, io.PurposeNotification, "matrix"); err != nil {
+					slog.Warn("matrix cross-signing approval notify", "error", err)
+				}
+			}); err != nil {
+				slog.Warn("matrix cross-signing setup", "error", err)
+			}
+		}()
+	}
 	ioMgr.EnableCalendar(io.CalDAVConfig{
 		URL:          cfg.CalDAVURL,
 		Username:     cfg.CalDAVUsername,

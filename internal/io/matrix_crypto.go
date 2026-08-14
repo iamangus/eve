@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -98,6 +99,116 @@ func (e *MatrixE2EE) Close() error {
 		return e.store.Flush(context.Background())
 	}
 	return nil
+}
+
+// crossSigningSetupTimeout bounds how long EnsureCrossSigningSetup waits for
+// the account owner to approve the reset at the account-management URL.
+// Synapse grants a 10-minute replacement window, so 15 minutes is a generous
+// upper bound that still fails loudly instead of hanging forever.
+const crossSigningSetupTimeout = 15 * time.Minute
+
+// crossSigningRetryInterval is how often EnsureCrossSigningSetup retries the
+// key upload while waiting for the owner's approval.
+const crossSigningRetryInterval = 5 * time.Second
+
+// EnsureCrossSigningSetup makes Eve's bot the account's trusted cross-signing
+// client. It is idempotent: when the current device is already signed by the
+// account's self-signing key it returns immediately.
+//
+// When the account has cross-signing keys owned by another (orphaned) client
+// — the incognito browser session that provisioned the account — the
+// homeserver refuses the replacement with a 401 whose m.oauth params carry
+// the account-management approval URL (the ESS "reset cross-signing" flow).
+// surfaceURL is called with that URL so the account owner can approve the
+// reset in a browser; the method then retries until the upload succeeds
+// within Synapse's temporary replacement window or times out. No admin token
+// and no permanent permission change are involved — a one-time approval by
+// the account owner is all that is required.
+//
+// The caller runs this as a goroutine: it blocks for up to crossSigningSetupTimeout
+// when approval is pending. On success the bot's device is cross-signed by the
+// new self-signing key and Element no longer flags its messages.
+func (e *MatrixE2EE) EnsureCrossSigningSetup(ctx context.Context, surfaceURL func(string)) error {
+	hasKeys, verified, err := e.mach.GetOwnVerificationStatus(ctx)
+	if err != nil {
+		return fmt.Errorf("matrix: check cross-signing status: %w", err)
+	}
+	if verified {
+		e.log.Info().Bool("has_keys", hasKeys).Msg("cross-signing already set up and device verified")
+		return nil
+	}
+	e.log.Info().Bool("has_keys", hasKeys).Msg("cross-signing not verified; generating keys")
+
+	keys, err := e.mach.GenerateCrossSigningKeys()
+	if err != nil {
+		return fmt.Errorf("matrix: generate cross-signing keys: %w", err)
+	}
+
+	deadline := time.Now().Add(crossSigningSetupTimeout)
+	lastURL := ""
+	for {
+		err := e.mach.PublishCrossSigningKeys(ctx, keys, nil)
+		if err == nil {
+			break
+		}
+		url := crossSigningApprovalURL(err)
+		if url == "" {
+			return fmt.Errorf("matrix: publish cross-signing keys: %w", err)
+		}
+		if url != lastURL {
+			lastURL = url
+			e.log.Warn().Str("url", url).Str("window", "10 minutes").Msg("matrix cross-signing reset requires approval")
+			surfaceURL(url)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("matrix: cross-signing reset not approved within %s (approve at %s)", crossSigningSetupTimeout, url)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(crossSigningRetryInterval):
+		}
+	}
+
+	// The upload succeeded: sign the current device and the master key with
+	// the new self-signing key so the bot is trusted by the account.
+	if err := e.mach.SignOwnDevice(ctx, e.mach.OwnIdentity()); err != nil {
+		return fmt.Errorf("matrix: sign own device: %w", err)
+	}
+	if err := e.mach.SignOwnMasterKey(ctx); err != nil {
+		return fmt.Errorf("matrix: sign own master key: %w", err)
+	}
+	e.log.Info().Msg("cross-signing set up; Eve is now the trusted client")
+	return nil
+}
+
+// crossSigningApprovalURL extracts the account-management approval URL from a
+// 401 response. Under MAS/Synapse the response body carries the URL in
+// params.m.oauth.url (and the unstable org.matrix.cross_signing_reset form);
+// an empty result means the error is not the approval refusal.
+func crossSigningApprovalURL(err error) string {
+	var httpErr mautrix.HTTPError
+	if !errors.As(err, &httpErr) || !httpErr.IsStatus(http.StatusUnauthorized) {
+		return ""
+	}
+	var ui mautrix.RespUserInteractive
+	if jerr := json.Unmarshal([]byte(httpErr.ResponseBody), &ui); jerr != nil {
+		return ""
+	}
+	for _, stage := range []mautrix.AuthType{mautrix.AuthTypeOAuth, mautrix.AuthType("org.matrix.cross_signing_reset")} {
+		raw, ok := ui.Params[stage]
+		if !ok {
+			continue
+		}
+		params, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if u, ok := params["url"].(string); ok && u != "" {
+			return u
+		}
+	}
+	return ""
 }
 
 // matrixCryptoHelper adapts the OlmMachine to the mautrix CryptoHelper
