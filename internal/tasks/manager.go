@@ -21,20 +21,23 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-// Config configures the background-task manager. All io coupling (router,
-// presence, busy check) is injected as functions so tasks never imports io
-// (io imports tasks for the MCP tools).
+// Config configures the background-task manager. All io coupling (presence,
+// busy check) is injected as functions so tasks never imports io (io imports
+// tasks for the MCP tools).
 type Config struct {
 	PollInterval time.Duration
 	// DecisionAgent is the main assistant agent id, used to decide whether a
 	// task transition warrants a proactive message.
 	DecisionAgent string
-	// Cooldown is the minimum gap between decision runs for the same task.
+	// Cooldown is the minimum gap between failed decision runs for the same
+	// task so the engine does not hammer the assistant agent.
 	Cooldown time.Duration
 	// Proactive is the master switch for proactive messaging.
 	Proactive bool
-	// Router delivers a message through the send pipeline.
-	Router func(ctx context.Context, convID, content, purpose, channel string) error
+	// MCPServers is the full MCP surface (including send_message) attached to
+	// the decision run. Eve decides whether to contact the user by calling
+	// send_message herself; the system never delivers her reply text.
+	MCPServers []agentfoundry.MCPServer
 	// Presence returns a compact human-readable summary of the user's current
 	// presence across channels, for the decision agent.
 	Presence func() string
@@ -48,8 +51,8 @@ type Manager struct {
 	client *agentfoundry.Client
 	cfg    Config
 
-	// nextDecide throttles decision runs per task so the engine does not
-	// hammer the assistant agent while a message is being held back.
+	// nextDecide throttles decision runs per task so a failing run is not
+	// retried every poll tick.
 	nextDecide map[string]time.Time
 	mu         sync.Mutex
 }
@@ -63,8 +66,8 @@ func NewManager(st *Store, client *agentfoundry.Client, cfg Config) *Manager {
 	}
 }
 
-func (m *Manager) Get(id string) (Task, error)          { return m.store.Get(id) }
-func (m *Manager) List() []Task                          { return m.store.List() }
+func (m *Manager) Get(id string) (Task, error)             { return m.store.Get(id) }
+func (m *Manager) List() []Task                            { return m.store.List() }
 func (m *Manager) ListByConversation(convID string) []Task { return m.store.ListByConversation(convID) }
 
 // SpawnTask kicks off a background subtask: the given agent is run with a
@@ -227,7 +230,6 @@ func (m *Manager) resolveRun(ctx context.Context, t Task) (*agentfoundry.RunStat
 	return m.client.FindRunByTaskID(ctx, t.ID)
 }
 
-
 func (m *Manager) Run(ctx context.Context) {
 	ticker := time.NewTicker(m.cfg.PollInterval)
 	defer ticker.Stop()
@@ -271,8 +273,11 @@ func (m *Manager) poll(ctx context.Context) {
 }
 
 // decidePending surfaces task transitions: for each unreported terminal or
-// needs_input task it asks the decision agent whether to message now, then
-// delivers through the router. It never interrupts an in-flight conversation.
+// needs_input task it runs the decision agent (the main assistant) with the
+// full MCP surface attached so Eve can decide whether to contact the user.
+// No text from the run is delivered mechanically — Eve decides by calling
+// send_message herself, and if she does not, the user is not bothered. It
+// never interrupts an in-flight conversation.
 func (m *Manager) decidePending(ctx context.Context) {
 	if m.cfg.DecisionAgent == "" {
 		for _, t := range m.store.Unreported() {
@@ -290,53 +295,47 @@ func (m *Manager) decidePending(ctx context.Context) {
 		if m.cfg.IsBusy != nil && m.cfg.IsBusy(t.ConversationID) {
 			continue // never interrupt an active conversation
 		}
-		decision := m.decide(ctx, t)
+		err := m.decide(ctx, t)
 		m.mu.Lock()
-		m.nextDecide[t.ID] = time.Now().Add(m.cfg.Cooldown)
-		m.mu.Unlock()
-		if decision.Action == "wait" || decision.Text == "" {
-			continue // hold the message; retry after cooldown
+		if err != nil {
+			m.nextDecide[t.ID] = time.Now().Add(m.cfg.Cooldown)
+		} else {
+			delete(m.nextDecide, t.ID)
 		}
-		_ = m.store.MarkReported(t.ID)
-		if m.cfg.Router == nil {
+		m.mu.Unlock()
+		if err != nil {
+			slog.Warn("task decision", "task", t.ID, "error", err)
 			continue
 		}
-		purpose := "notification"
-		if t.Status == StatusNeedsInput {
-			purpose = "question"
-		}
-		if err := m.cfg.Router(ctx, t.ConversationID, decision.Text, purpose, ""); err != nil {
-			slog.Warn("task delivery", "task", t.ID, "error", err)
-		}
+		// Eve made her call (called send_message or chose not to); the
+		// transition is handled either way.
+		_ = m.store.MarkReported(t.ID)
 	}
 }
 
-// decide asks the decision agent (the main assistant) whether to message the
-// user about the task transition. Falls back to WAIT on any failure.
-func (m *Manager) decide(ctx context.Context, t Task) decision {
+// decide runs the decision agent (the main assistant) on a task transition
+// with the full MCP surface attached so Eve can decide whether to contact the
+// user via send_message. The run's reply text is never delivered anywhere.
+func (m *Manager) decide(ctx context.Context, t Task) error {
 	prompt := m.decisionPrompt(t)
 	runID, err := m.client.RunAgentWith(ctx, m.cfg.DecisionAgent, agentfoundry.RunOptions{
-		Message:        prompt,
-		ResponseSchema: decisionSchema(),
+		Message:    prompt,
+		MCPServers: m.cfg.MCPServers,
 	})
 	if err != nil {
-		slog.Warn("decision run", "task", t.ID, "error", err)
-		return decision{Action: "wait"}
+		return fmt.Errorf("decision run: %w", err)
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	text, err := m.client.AwaitRunText(cctx, runID, 25*time.Second)
-	if err != nil {
-		slog.Warn("decision await", "task", t.ID, "error", err)
-		return decision{Action: "wait"}
+	if _, err := m.client.AwaitRunText(cctx, runID, 25*time.Second); err != nil {
+		return fmt.Errorf("decision await: %w", err)
 	}
-	d := parseDecision(text)
-	return d
+	return nil
 }
 
 func (m *Manager) decisionPrompt(t Task) string {
 	var b strings.Builder
-	b.WriteString("A background task just changed state. Decide whether to message the user about it now or wait for a better moment.\n\n")
+	b.WriteString("A background task just changed state. Review it and decide whether the user needs to hear about it.\n\n")
 	fmt.Fprintf(&b, "Task: %s\n", t.AgentName)
 	fmt.Fprintf(&b, "Details: %s\n", t.Message)
 	switch t.Status {
@@ -350,9 +349,7 @@ func (m *Manager) decisionPrompt(t Task) string {
 	if p := m.cfg.Presence; p != nil {
 		fmt.Fprintf(&b, "\nUser presence:\n%s\n", p())
 	}
-	b.WriteString("\nIf this is worth the user's attention right now, choose message and write the text. If it can wait (e.g. low priority, or the moment is wrong), choose wait.\n")
-	b.WriteString("Reply with ONLY a JSON object:\n")
-	b.WriteString("{\"action\": \"message\", \"text\": \"<the message to send>\"} or {\"action\": \"wait\"}\n")
+	b.WriteString("\nIf this warrants the user's attention, use the send_message tool to deliver a message to the user. If it does not (you handled it yourself, it is low priority, or the moment is wrong), do nothing — no message is sent unless you call send_message.\n")
 	return b.String()
 }
 

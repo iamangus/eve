@@ -23,7 +23,10 @@ type Config struct {
 	RouterAgentID    string
 	AssistantAgentID string
 	ProactiveEnabled bool
-	EVEMCPURL        string
+	// EVEMCPChatURL is the chat MCP surface (task + calendar tools, no
+	// send_message) attached to user-triggered inbound runs. Eve's reply is
+	// delivered mechanically back to the origin channel.
+	EVEMCPChatURL string
 }
 
 // Manager is the IO layer of eve. It owns the channel registry, the event
@@ -112,10 +115,10 @@ func NewManager(st *store.Store, client *agentfoundry.Client, cfg Config) (*Mana
 		ProactiveEnabled: cfg.ProactiveEnabled,
 	})
 	mcpSrv := []agentfoundry.MCPServer{}
-	if cfg.EVEMCPURL != "" {
+	if cfg.EVEMCPChatURL != "" {
 		mcpSrv = append(mcpSrv, agentfoundry.MCPServer{
 			Name:      "eve",
-			URL:       cfg.EVEMCPURL,
+			URL:       cfg.EVEMCPChatURL,
 			Transport: "streamable-http",
 		})
 	}

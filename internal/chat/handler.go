@@ -32,11 +32,14 @@ type Handler struct {
 }
 
 func NewHandler(store *store.Store, client *agentfoundry.Client, cfg config.Config, ctxMgr *ctxmgr.Manager, ioMgr *io.Manager) *Handler {
+	// User-triggered runs get the chat MCP surface: task + calendar tools but
+	// no send_message. Replies are delivered mechanically to the origin
+	// channel; Eve never routes her own reply mid-conversation.
 	mcpSrv := []agentfoundry.MCPServer{}
-	if cfg.EVEMCPURL != "" {
+	if cfg.EVEMCPChatURL != "" {
 		mcpSrv = append(mcpSrv, agentfoundry.MCPServer{
 			Name:      "eve",
-			URL:       cfg.EVEMCPURL,
+			URL:       cfg.EVEMCPChatURL,
 			Transport: "streamable-http",
 		})
 	}

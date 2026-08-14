@@ -4,39 +4,59 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 
+	"github.com/iamangus/eve/internal/tasks"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
-	"github.com/iamangus/eve/internal/tasks"
 )
 
 // MCP is Eve's tool surface for agentfoundry. It is exposed as an ephemeral
-// MCP server attached to every assistant run, giving Eve the ability to
-// proactively message the user (send_message) and inspect what channels she
-// can reach (list_channels).
+// MCP server attached to assistant runs. Two surfaces exist:
+//
+//   - NewMCP (mounted at /mcp) is the full surface: task + calendar tools plus
+//     send_message and list_channels. It is attached to automation-triggered
+//     runs (task transitions, reminders) where Eve decides whether to contact
+//     the user by calling send_message.
+//   - NewChatMCP (mounted at /mcp/chat) is the user-triggered surface: task +
+//     calendar tools only, with no send_message. When the user messages Eve,
+//     her reply is delivered mechanically back to the origin channel — she
+//     never decides the delivery path mid-conversation.
 type MCP struct {
 	mgr *Manager
 	srv *server.StreamableHTTPServer
 }
 
+// NewMCP builds the full MCP surface including send_message/list_channels.
 func NewMCP(mgr *Manager) *MCP {
+	return newMCP(mgr, true)
+}
+
+// NewChatMCP builds the chat surface without send_message/list_channels.
+func NewChatMCP(mgr *Manager) *MCP {
+	return newMCP(mgr, false)
+}
+
+func newMCP(mgr *Manager, withSend bool) *MCP {
 	mcpServer := server.NewMCPServer("eve", "1.0.0", server.WithToolCapabilities(true))
 	m := &MCP{mgr: mgr, srv: server.NewStreamableHTTPServer(mcpServer)}
 
-	sendTool := mcp.NewTool("send_message",
-		mcp.WithDescription("Deliver a message to the user. Use this to proactively send the user a message (task results, notifications, reminders, questions) outside of the current conversation turn. The system routes the message to the best channel based on the user's presence and preferences."),
-		mcp.WithString("message", mcp.Description("The message content to deliver to the user."), mcp.Required()),
-		mcp.WithString("channel", mcp.Description("Optional explicit channel to deliver through (e.g. 'web', 'email', 'matrix'). Omit to let the router decide.")),
-		mcp.WithString("purpose", mcp.Description("Purpose: 'notification' (default), 'question', or 'reminder'.")),
-		mcp.WithString("conversation_id", mcp.Description("Optional conversation id. Defaults to the primary conversation.")),
-	)
-	mcpServer.AddTool(sendTool, m.handleSendMessage)
+	if withSend {
+		sendTool := mcp.NewTool("send_message",
+			mcp.WithDescription("Deliver a message to the user. Use this to proactively send the user a message (task results, notifications, reminders, questions) outside of the current conversation turn. The system routes the message to the best channel based on the user's presence and preferences. Whether to call this at all is your decision: if the context does not warrant contacting the user, simply do nothing."),
+			mcp.WithString("message", mcp.Description("The message content to deliver to the user."), mcp.Required()),
+			mcp.WithString("channel", mcp.Description("Optional explicit channel to deliver through (e.g. 'web', 'email', 'matrix'). Omit to let the router decide.")),
+			mcp.WithString("purpose", mcp.Description("Purpose: 'notification' (default), 'question', or 'reminder'.")),
+			mcp.WithString("conversation_id", mcp.Description("Optional conversation id. Defaults to the primary conversation.")),
+		)
+		mcpServer.AddTool(sendTool, m.handleSendMessage)
 
-	listTool := mcp.NewTool("list_channels",
-		mcp.WithDescription("List the communication channels available for sending the user messages, with their capabilities and whether the user is currently reachable on them."),
-	)
-	mcpServer.AddTool(listTool, m.handleListChannels)
+		listTool := mcp.NewTool("list_channels",
+			mcp.WithDescription("List the communication channels available for sending the user messages, with their capabilities and whether the user is currently reachable on them."),
+		)
+		mcpServer.AddTool(listTool, m.handleListChannels)
+	}
 
 	m.addTaskTools(mcpServer)
 	m.addCalendarTools(mcpServer)
@@ -202,9 +222,10 @@ func (m *MCP) handleSendMessage(ctx context.Context, req mcp.CallToolRequest) (*
 
 	// Fire-and-forget: return to Eve immediately; delivery proceeds in the
 	// background through the routing pipeline. The store append is serialized.
+	// Delivery failures are logged, never silent.
 	go func() {
 		if err := m.mgr.Router.Notify(context.Background(), convID, message, purpose, channel); err != nil {
-			return
+			slog.Warn("send_message delivery", "conv", convID, "error", err)
 		}
 	}()
 

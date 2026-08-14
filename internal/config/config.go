@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"time"
@@ -14,6 +15,7 @@ type Config struct {
 	AssistantAgentID   string
 	RouterAgentID      string
 	EVEMCPURL          string
+	EVEMCPChatURL      string
 	ProactiveEnabled   bool
 	WebPresenceTimeout time.Duration
 	DataDir            string
@@ -53,6 +55,7 @@ func Load() (Config, error) {
 		AssistantAgentID:   os.Getenv("ASSISTANT_AGENT_ID"),
 		RouterAgentID:      os.Getenv("ROUTER_AGENT_ID"),
 		EVEMCPURL:          envOr("EVEMCP_URL", "http://localhost:8090/mcp"),
+		EVEMCPChatURL:      envOr("EVEMCP_CHAT_URL", ""),
 		ProactiveEnabled:   boolEnv("PROACTIVE_ENABLED", true),
 		WebPresenceTimeout: durationEnv("WEB_PRESENCE_TIMEOUT", 60*time.Second),
 		DataDir:            envOr("DATA_DIR", "./data"),
@@ -62,10 +65,10 @@ func Load() (Config, error) {
 		SMTPUsername:       os.Getenv("SMTP_USERNAME"),
 		SMTPPassword:       os.Getenv("SMTP_PASSWORD"),
 		SMTPFrom:           os.Getenv("SMTP_FROM"),
-		MatrixHomeserver:  os.Getenv("MATRIX_HOMESERVER"),
-		MatrixAccessToken: os.Getenv("MATRIX_ACCESS_TOKEN"),
-		MatrixUserID:      os.Getenv("MATRIX_USER_ID"),
-		MatrixPickleKey:   os.Getenv("MATRIX_PICKLE_KEY"),
+		MatrixHomeserver:   os.Getenv("MATRIX_HOMESERVER"),
+		MatrixAccessToken:  os.Getenv("MATRIX_ACCESS_TOKEN"),
+		MatrixUserID:       os.Getenv("MATRIX_USER_ID"),
+		MatrixPickleKey:    os.Getenv("MATRIX_PICKLE_KEY"),
 		CalDAVURL:          os.Getenv("CALDAV_URL"),
 		CalDAVUsername:     os.Getenv("CALDAV_USERNAME"),
 		CalDAVPassword:     os.Getenv("CALDAV_PASSWORD"),
@@ -81,6 +84,9 @@ func Load() (Config, error) {
 		ContextChunkTokens:         intEnv("CONTEXT_CHUNK_TOKENS", 20000),
 		ContextMemoryLimit:         intEnv("CONTEXT_MEMORY_LIMIT", 200),
 		ContextCurateInterval:      durationEnv("CONTEXT_CURATE_INTERVAL", 24*time.Hour),
+	}
+	if cfg.EVEMCPChatURL == "" {
+		cfg.EVEMCPChatURL = deriveChatURL(cfg.EVEMCPURL)
 	}
 	if cfg.AgentFoundryKey == "" {
 		return Config{}, fmt.Errorf("AGENTFOUNDRY_API_KEY is required")
@@ -132,4 +138,18 @@ func floatEnv(key string, def float64) float64 {
 		}
 	}
 	return def
+}
+
+// deriveChatURL derives the chat MCP surface URL from the full MCP URL by
+// swapping the path to /mcp/chat (same host, same transport).
+func deriveChatURL(mcpURL string) string {
+	if mcpURL == "" {
+		return ""
+	}
+	u, err := url.Parse(mcpURL)
+	if err != nil {
+		return mcpURL
+	}
+	u.Path = "/mcp/chat"
+	return u.String()
 }

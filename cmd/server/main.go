@@ -64,7 +64,7 @@ func main() {
 		RouterAgentID:    cfg.RouterAgentID,
 		AssistantAgentID: cfg.AssistantAgentID,
 		ProactiveEnabled: cfg.ProactiveEnabled,
-		EVEMCPURL:        cfg.EVEMCPURL,
+		EVEMCPChatURL:    cfg.EVEMCPChatURL,
 	})
 	if err != nil {
 		slog.Error("io manager", "error", err)
@@ -103,11 +103,11 @@ func main() {
 	}
 	ioMgr.EnableMatrix(matrixCfg, matrixE2EE)
 	ioMgr.EnableCalendar(io.CalDAVConfig{
-		URL:           cfg.CalDAVURL,
-		Username:      cfg.CalDAVUsername,
-		Password:      cfg.CalDAVPassword,
-		CalendarPath:  cfg.CalDAVCalendarPath,
-		ReminderLead:  cfg.CalReminderLead,
+		URL:          cfg.CalDAVURL,
+		Username:     cfg.CalDAVUsername,
+		Password:     cfg.CalDAVPassword,
+		CalendarPath: cfg.CalDAVCalendarPath,
+		ReminderLead: cfg.CalReminderLead,
 	})
 	ioMgr.SetContext(ctxMgr)
 
@@ -118,12 +118,22 @@ func main() {
 		slog.Error("task store", "dir", cfg.DataDir, "error", err)
 		os.Exit(1)
 	}
+	// Automation-triggered runs (task transitions) get the full MCP surface
+	// including send_message so Eve decides whether to contact the user.
+	var fullMCPServers []agentfoundry.MCPServer
+	if cfg.EVEMCPURL != "" {
+		fullMCPServers = append(fullMCPServers, agentfoundry.MCPServer{
+			Name:      "eve",
+			URL:       cfg.EVEMCPURL,
+			Transport: "streamable-http",
+		})
+	}
 	taskMgr := tasks.NewManager(taskStore, af, tasks.Config{
 		PollInterval:  2 * time.Second,
 		DecisionAgent: cfg.AssistantAgentID,
 		Cooldown:      30 * time.Second,
 		Proactive:     cfg.ProactiveEnabled,
-		Router:        ioMgr.Router.Notify,
+		MCPServers:    fullMCPServers,
 		Presence:      ioMgr.PresenceSummary,
 		IsBusy: func(convID string) bool {
 			runID, err := st.ActiveRunForConversation(convID)
@@ -194,6 +204,8 @@ func main() {
 
 	mcpSrv := io.NewMCP(ioMgr)
 	mux.Handle("/mcp", mcpSrv)
+	chatMCP := io.NewChatMCP(ioMgr)
+	mux.Handle("/mcp/chat", chatMCP)
 
 	distFS, err := fs.Sub(frontend.Dist, "dist")
 	if err != nil {
