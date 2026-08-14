@@ -45,6 +45,7 @@ func (p *MatrixPoller) Run(ctx context.Context) {
 		return
 	}
 	p.setupHandlers(syncer)
+	p.seedStateStore(ctx)
 
 	slog.Info("matrix sync started", "user", client.UserID, "device", client.DeviceID)
 	const backoff = 5 * time.Second
@@ -71,11 +72,42 @@ func (p *MatrixPoller) Run(ctx context.Context) {
 // message handlers. Order matters: the machine must see to-device and state
 // events before we try to decrypt timeline events.
 func (p *MatrixPoller) setupHandlers(syncer mautrix.ExtensibleSyncer) {
+	client := p.e2ee.Client()
 	mach := p.e2ee.Mach()
 	syncer.OnSync(mach.ProcessSyncResponse)
+	// StateStoreSyncHandler feeds m.room.encryption and membership state
+	// events into the state store. Without it IsEncrypted() stays false and
+	// SendMessageEvent sends plaintext into encrypted rooms.
+	syncer.OnEvent(client.StateStoreSyncHandler)
 	syncer.OnEventType(event.StateMember, mach.HandleMemberEvent)
 	syncer.OnEventType(event.EventEncrypted, p.handleEncrypted)
 	syncer.OnEventType(event.EventMessage, p.handleMessage)
+}
+
+// seedStateStore populates the state store with the current encryption
+// state and membership of every joined room. On a fresh start the initial
+// sync delivers full room state, but once a sync token is persisted the
+// m.room.encryption event is not redelivered on subsequent incremental
+// syncs — without seeding, the client would keep sending plaintext.
+func (p *MatrixPoller) seedStateStore(ctx context.Context) {
+	client := p.e2ee.Client()
+	joined, err := client.JoinedRooms(ctx)
+	if err != nil {
+		slog.Warn("matrix: seed state store: joined rooms", "error", err)
+		p.manager.RecordPollHealth("matrix", err)
+		return
+	}
+	for _, roomID := range joined.JoinedRooms {
+		var enc event.EncryptionEventContent
+		if err := client.StateEvent(ctx, roomID, event.StateEncryption, "", &enc); err != nil {
+			// 404 means the room is not encrypted; that's expected for
+			// plaintext rooms and not an error worth surfacing.
+			continue
+		}
+		if _, err := client.JoinedMembers(ctx, roomID); err != nil {
+			slog.Warn("matrix: seed state store: joined members", "room", roomID, "error", err)
+		}
+	}
 }
 
 // handleEncrypted decrypts a timeline m.room.encrypted event and forwards
