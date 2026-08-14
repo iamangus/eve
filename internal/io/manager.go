@@ -338,7 +338,7 @@ func (m *Manager) Inbound(ctx context.Context, msg InboundMessage) (runID string
 		}
 		convID = c.ID
 	}
-	appended, err := m.store.AppendUserMessageReturn(convID, msg.Text, string(msg.Channel), sender)
+	appended, err := m.store.AppendUserMessageReturn(convID, msg.Text, string(msg.Channel), sender, msg.ThreadRef, msg.Sender)
 	if err != nil {
 		return "", err
 	}

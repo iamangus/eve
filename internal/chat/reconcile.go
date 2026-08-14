@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/iamangus/eve/internal/io"
 )
 
 func (h *Handler) Reconcile(ctx context.Context) {
@@ -63,12 +65,27 @@ func (h *Handler) reconcileRun(ctx context.Context, convID, runID string) error 
 	switch rs.Status {
 	case "completed":
 		if rs.Response != "" {
-			channel, cerr := h.store.LastUserChannel(convID)
+			channel, threadRef, replyTo, cerr := h.store.LastUserReply(convID)
 			if cerr != nil {
 				channel = "web"
 			}
-			if err := h.store.AppendAssistantMessage(convID, runID, rs.Response, channel, "eve"); err != nil {
-				return err
+			if channel == "web" {
+				// Web replies were already streamed to the open SSE proxy;
+				// persist so the transcript is complete on reload.
+				if err := h.store.AppendAssistantMessage(convID, runID, rs.Response, "web", "eve"); err != nil {
+					return err
+				}
+			} else {
+				// Mechanical async reply: deliver back through the router to
+				// the origin channel. The adapter persists + broadcasts, so we
+				// skip AppendAssistantMessage here. On routing failure fall
+				// back to persisting so the response is never lost.
+				if err := h.ioMgr.Router.Reply(ctx, convID, rs.Response, io.ChannelType(channel), threadRef, replyTo); err != nil {
+					slog.Warn("route reply", "conv", convID, "channel", channel, "error", err)
+					if aerr := h.store.AppendAssistantMessage(convID, runID, rs.Response, channel, "eve"); aerr != nil {
+						return aerr
+					}
+				}
 			}
 		}
 		return h.store.ClearActiveRun(convID)

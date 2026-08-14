@@ -41,6 +41,7 @@ type SendRequest struct {
 	Purpose        string
 	Origin         ChannelType
 	OriginThread   string
+	Recipient      string // override of the destination's default recipient (e.g. the sender's email address)
 	Participants   []string
 	ForceChannel   string // explicit channel override (e.g. Eve answered a direct question on web)
 }

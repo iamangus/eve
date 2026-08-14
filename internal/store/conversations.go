@@ -133,7 +133,9 @@ func (s *Store) AppendUserMessage(convID, content, channel, sender string) error
 
 // AppendUserMessageReturn appends a user message and returns the stored
 // message so callers (channel adapters) can broadcast its full shape.
-func (s *Store) AppendUserMessageReturn(convID, content, channel, sender string) (*Message, error) {
+// threadRef and replyTo capture where a response must be mechanically
+// delivered (e.g. a Matrix room ID or the sender's email address).
+func (s *Store) AppendUserMessageReturn(convID, content, channel, sender, threadRef, replyTo string) (*Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.convs[convID]
@@ -147,6 +149,8 @@ func (s *Store) AppendUserMessageReturn(convID, content, channel, sender string)
 		Content:   content,
 		Channel:   channel,
 		Sender:    sender,
+		ThreadRef: threadRef,
+		ReplyTo:   replyTo,
 		CreatedAt: now,
 	}
 	r.Messages = append(r.Messages, m)
@@ -156,6 +160,30 @@ func (s *Store) AppendUserMessageReturn(convID, content, channel, sender string)
 		return nil, err
 	}
 	return &m, nil
+}
+
+// LastUserReply returns the channel, thread ref, and reply target of the most
+// recent user message in the conversation. This is what a completed run uses
+// to mechanically deliver its response back to the origin channel. Defaults
+// to the web channel when the conversation is empty or has no user messages.
+func (s *Store) LastUserReply(convID string) (channel, threadRef, replyTo string, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, ok := s.convs[convID]
+	if !ok {
+		return "", "", "", ErrNotFound
+	}
+	channel = "web"
+	for i := len(r.Messages) - 1; i >= 0; i-- {
+		if r.Messages[i].Role == "user" {
+			m := r.Messages[i]
+			if m.Channel != "" {
+				channel = m.Channel
+			}
+			return channel, m.ThreadRef, m.ReplyTo, nil
+		}
+	}
+	return channel, "", "", nil
 }
 
 func (s *Store) AppendAssistantMessage(convID, runID, content, channel, sender string) error {
@@ -234,27 +262,6 @@ func (s *Store) ConversationHistory(convID string) ([]Message, error) {
 		return []Message{}, nil
 	}
 	return append([]Message(nil), r.Messages...), nil
-}
-
-// LastUserChannel returns the channel of the most recent user message, or
-// "web" when there is none. Used to tag run responses with the conversation's
-// origin channel instead of hardcoding "web".
-func (s *Store) LastUserChannel(convID string) (string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	r, ok := s.convs[convID]
-	if !ok {
-		return "", ErrNotFound
-	}
-	for i := len(r.Messages) - 1; i >= 0; i-- {
-		if r.Messages[i].Role == "user" {
-			if ch := r.Messages[i].Channel; ch != "" {
-				return ch, nil
-			}
-			return "web", nil
-		}
-	}
-	return "web", nil
 }
 
 func (s *Store) SetActiveRun(convID, runID string) error {

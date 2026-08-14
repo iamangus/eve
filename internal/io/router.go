@@ -112,6 +112,33 @@ func (r *Router) Notify(ctx context.Context, convID, content, purpose, forceChan
 	return r.Deliver(ctx, req, dest)
 }
 
+// Reply is the mechanical reply path: deliver Eve's answer back to the
+// channel the user's message came in on. Unlike Notify it has no proactive or
+// busy gate — a reply is expected, not an interruption. originThread and
+// recipient pin the destination (matrix room / sender address) when the
+// origin channel needs them; the adapter falls back to the channel's default
+// recipient otherwise.
+func (r *Router) Reply(ctx context.Context, convID, content string, origin ChannelType, originThread, recipient string) error {
+	participants, err := r.store.ConversationParticipants(convID)
+	if err != nil {
+		participants = []string{"owner"}
+	}
+	req := SendRequest{
+		ConversationID: convID,
+		Content:        content,
+		Purpose:        PurposeReply,
+		Origin:         origin,
+		OriginThread:   originThread,
+		Recipient:      recipient,
+		Participants:   participants,
+	}
+	dest, err := r.Decide(ctx, req)
+	if err != nil {
+		return err
+	}
+	return r.Deliver(ctx, req, dest)
+}
+
 // Decide determines the destination endpoint for a message. Rules, in order:
 //  1. Multi-party conversation (any non-owner participant): pinned to the
 //     origin thread so the other person receives the reply.
@@ -161,6 +188,9 @@ func (r *Router) Deliver(ctx context.Context, req SendRequest, dest EndpointSnap
 		Text:           adaptContent(req.Content, dest),
 		ThreadRef:      req.OriginThread,
 		ConversationID: req.ConversationID,
+	}
+	if req.Recipient != "" {
+		msg.Recipient = req.Recipient
 	}
 	return adapter.Send(ctx, msg)
 }

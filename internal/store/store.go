@@ -20,6 +20,8 @@ type Message struct {
 	RunID     string    `json:"run_id,omitempty"`
 	Channel   string    `json:"channel,omitempty"`
 	Sender    string    `json:"sender,omitempty"`
+	ThreadRef string    `json:"thread_ref,omitempty"`
+	ReplyTo   string    `json:"reply_to,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
