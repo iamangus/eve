@@ -200,6 +200,12 @@ func (r *Router) hasNonOwner(participants []string) bool {
 		if p == "" || p == "other" {
 			return true
 		}
+		// "owner" is the persisted default for conversations created before
+		// the owner identity became editable. It remains an owner alias after
+		// that identity is renamed.
+		if p == "owner" {
+			continue
+		}
 		if !r.ident.IsOwner(p) {
 			return true
 		}

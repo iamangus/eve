@@ -236,7 +236,9 @@ func (c *Client) StreamRunEventsChan(ctx context.Context, runID string) (<-chan 
 		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 		var eventType, dataLines string
 		flush := func() {
-			if eventType != "" && dataLines != "" {
+			// A completed automation run may have no final text after a tool
+			// call. Its empty-data done event is still the completion signal.
+			if eventType != "" {
 				ch <- SSEEvent{Type: eventType, Data: dataLines}
 			}
 			eventType = ""
