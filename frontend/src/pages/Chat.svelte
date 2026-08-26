@@ -308,6 +308,11 @@
     return names[ch] || ch
   }
 
+  function messageTime(t) {
+    if (!t) return ''
+    return new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  }
+
   function scrollDown() {
     if (!messageListEl) return
     messageListEl.scrollTop = messageListEl.scrollHeight
@@ -337,14 +342,17 @@
   {:else if currentConv}
     <div class="chat-layout">
       <div class="chat-head">
-        <span class="chat-head-name">{currentConv.title}</span>
-        <span class="chat-head-badge">{messages.length} messages</span>
+        <div>
+          <span class="chat-kicker">CONVERSATION</span>
+          <span class="chat-head-name">{currentConv.title}</span>
+        </div>
+        <span class="chat-head-badge">{messages.length} {messages.length === 1 ? 'message' : 'messages'}</span>
         {#if summarizedBoundary() > 0}
           <span class="chat-head-badge summary-badge">summarized</span>
         {/if}
         {#if tasks.length > 0}
           <button class="tasks-toggle" onclick={() => { tasksOpen = !tasksOpen }}>
-            tasks ({tasks.length})
+            View {tasks.length} active {tasks.length === 1 ? 'task' : 'tasks'}
           </button>
         {/if}
       </div>
@@ -354,9 +362,9 @@
           {#each tasks as t (t.id)}
             <div class="task-item">
               <div class="task-line">
-                <span class="task-status task-{t.status}">{t.status}</span>
+                <span class="task-status task-{t.status}">{t.status.replaceAll('_', ' ')}</span>
                 <span class="task-name">{t.agent_name}</span>
-                <button class="task-x" onclick={() => cancelTask(t.id)} aria-label="Cancel">✕</button>
+                <button class="task-x" onclick={() => cancelTask(t.id)}>Cancel task</button>
               </div>
               <div class="task-msg">{t.message}</div>
               {#if t.status === 'needs_input' && t.question}
@@ -380,6 +388,11 @@
             <div class="summ-divider">↑ earlier conversation summarized</div>
           {/if}
           <div class="msg-row" class:msg-right={msg.role === 'user'} class:msg-left={msg.role !== 'user'}>
+            <div class="msg-meta">
+              <span>{msg.role === 'user' ? 'YOU' : 'EVE'}</span>
+              {#if msg.created_at}<time datetime={msg.created_at}>{messageTime(msg.created_at)}</time>{/if}
+              {#if msg.channel && msg.channel !== 'web'}<span>{channelLabel(msg.channel)}</span>{/if}
+            </div>
             <div class="bubble" class:bubble-user={msg.role === 'user'} class:bubble-bot={msg.role !== 'user'}>
               {#if msg.role === 'user'}
                 {msg.content}
@@ -387,14 +400,12 @@
                 {@html renderMarkdown(msg.content)}
               {/if}
             </div>
-            {#if msg.channel && msg.channel !== 'web'}
-              <span class="chan-badge" class:chan-badge-right={msg.role === 'user'}>{channelLabel(msg.channel)}</span>
-            {/if}
           </div>
         {/each}
 
         {#if stream.raw || stream.status}
           <div class="msg-row msg-left">
+            <div class="msg-meta"><span>EVE</span><span>LIVE</span></div>
             <div class="bubble bubble-bot">
               {#if stream.html}
                 {@html stream.html}
@@ -423,10 +434,10 @@
             bind:value={newMessage}
             onkeydown={handleKeydown}
             rows="1"
-            placeholder="Message…"
+            placeholder="Write a message to Eve"
             oninput={(e) => { e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px'; }}
           ></textarea>
-          <button onclick={sendMessage} class="send-btn" aria-label="Send" disabled={sending || !currentConv}>
+          <button onclick={sendMessage} class="send-btn" aria-label="Send message" disabled={sending || !currentConv}>
             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" d="M6 12 3.269 3.125A59.769 59.769 0 0 1 21.485 12 59.768 59.768 0 0 1 3.27 20.875L5.999 12Zm0 0h7.5" />
             </svg>
@@ -445,93 +456,68 @@
 <style>
   .chat { display: flex; flex-direction: column; height: 100%; overflow: hidden; flex: 1; }
   .chat-layout { display: flex; flex-direction: column; height: 100%; }
-
   .chat-head {
-    padding: 14px 24px; border-bottom: 1px solid var(--border);
-    display: flex; align-items: center; gap: 12px;
+    padding: 18px var(--page-pad); border-bottom: var(--rule);
+    display: flex; align-items: center; gap: 18px; max-width: 100%;
     background: var(--bg-base); flex-shrink: 0;
   }
-  .chat-head-name { font-size: 0.95rem; font-weight: 600; color: var(--text-base); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chat-head > div { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 14px; }
+  .chat-kicker { font-family: var(--mono); color: var(--text-faint); font-size: 0.65rem; letter-spacing: 0.1em; }
+  .chat-head-name { font-size: 1rem; font-weight: 600; color: var(--text-base); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chat-head-badge {
-    font-size: 0.7rem; font-weight: 500;
-    background: var(--purple-dim); color: oklch(75% 0.2 292.0);
-    border: 1px solid oklch(59.1% 0.249 292.7 / 0.3);
-    padding: 2px 8px; border-radius: 20px;
+    font: 0.68rem var(--mono); color: var(--text-muted); white-space: nowrap;
   }
-  .summary-badge { color: oklch(80% 0.18 145); border-color: oklch(65% 0.18 145 / 0.3); }
-
+  .summary-badge { border-left: var(--rule); padding-left: 14px; }
   .chat-body {
-    flex: 1; overflow-y: auto; padding: 28px 24px;
-    display: flex; flex-direction: column; gap: 4px;
+    flex: 1; overflow-y: auto; padding: 12px var(--page-pad) 40px;
+    display: flex; flex-direction: column; max-width: calc(var(--content-max) + 2 * var(--page-pad));
   }
-
-  .msg-row { display: flex; max-width: 78%; margin-bottom: 6px; }
-  .msg-left { align-self: flex-start; }
-  .msg-right { align-self: flex-end; justify-content: flex-end; }
+  .msg-row { display: grid; grid-template-columns: 92px minmax(0, var(--measure)); border-bottom: var(--rule); padding: 24px 0; width: 100%; }
+  .msg-left, .msg-right { align-self: stretch; }
+  .msg-meta { display: flex; flex-direction: column; gap: 3px; padding-top: 2px; font: 0.65rem/1.35 var(--mono); letter-spacing: 0.08em; color: var(--text-faint); }
+  .msg-meta span:first-child { color: var(--text-muted); font-weight: 700; }
   .bubble {
-    padding: 12px 16px; border-radius: 14px; font-size: 0.9rem; line-height: 1.6;
+    padding: 0; border-radius: 0; font-size: 0.94rem; line-height: 1.65;
     word-wrap: break-word; overflow-wrap: anywhere;
   }
-  .bubble-user {
-    background: var(--purple-solid); color: #fff; border-bottom-right-radius: 4px;
-  }
-  .bubble-bot {
-    background: var(--bg-card); border: 1px solid var(--border); border-bottom-left-radius: 4px;
-  }
-  .chan-badge {
-    align-self: flex-start; margin-left: 8px; font-size: 0.62rem; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.06em;
-    color: var(--text-muted); background: var(--bg-card);
-    border: 1px solid var(--border); border-radius: 8px; padding: 2px 7px;
-  }
-  .chan-badge-right {
-    align-self: flex-end; margin-left: 0; margin-right: 8px;
-  }
-
+  .bubble-user { color: var(--text-base); }
+  .bubble-bot { color: oklch(87% 0.01 65); }
   .time-gap {
-    align-self: center; font-size: 0.68rem; color: var(--text-muted);
-    background: var(--bg-card); border: 1px solid var(--border);
-    padding: 1px 10px; border-radius: 10px; margin: 8px 0 4px;
+    font: 0.65rem var(--mono); color: var(--text-faint); padding: 12px 0 0 92px;
   }
   .summ-divider {
-    align-self: stretch; text-align: center; font-size: 0.68rem; color: var(--text-muted);
-    border-top: 1px dashed var(--border); margin: 14px 0 10px; padding-top: 8px;
-    text-transform: uppercase; letter-spacing: 0.08em;
+    font: 0.64rem var(--mono); color: var(--text-muted); border-bottom: 1px dashed var(--border-strong);
+    padding: 18px 0 8px 92px; text-transform: uppercase; letter-spacing: 0.08em;
   }
-
   .chat-foot {
-    padding: 16px 24px; border-top: 1px solid var(--border);
-    background: var(--bg-base); flex-shrink: 0;
+    padding: 14px var(--page-pad) 18px; border-top: var(--rule); background: var(--bg-deep); flex-shrink: 0;
   }
   .chat-notice {
-    font-size: 0.75rem; color: oklch(75% 0.12 45);
-    background: oklch(50% 0.12 45 / 0.12);
-    border: 1px solid oklch(60% 0.14 45 / 0.35);
-    border-radius: 8px; padding: 6px 12px; margin-bottom: 10px;
+    max-width: calc(var(--measure) + 92px); font: 0.72rem var(--mono); color: var(--text-base);
+    border-left: 2px solid var(--text-base); padding: 6px 12px; margin-bottom: 10px;
   }
   .input-wrap {
-    display: flex; gap: 10px; align-items: flex-end;
-    background: var(--bg-card); border: 1px solid var(--border);
-    border-radius: 12px; padding: 10px 10px 10px 16px;
+    display: flex; gap: 10px; align-items: flex-end; max-width: calc(var(--measure) + 92px);
+    background: var(--bg-raised); border: 1px solid var(--border-strong);
+    border-radius: 2px; padding: 9px 9px 9px 15px;
     transition: border-color 0.15s, box-shadow 0.15s;
   }
   .input-wrap:focus-within {
-    border-color: oklch(59.1% 0.249 292.7 / 0.6);
-    box-shadow: 0 0 0 3px oklch(59.1% 0.249 292.7 / 0.1);
+    border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent);
   }
   .input-wrap textarea {
     flex: 1; resize: none; background: transparent; border: none; outline: none;
-    color: var(--text-base); font-family: inherit; font-size: 0.9rem;
+    color: var(--text-base); font-family: inherit; font-size: 0.92rem;
     line-height: 1.6; max-height: 140px; overflow-y: auto;
   }
   .input-wrap textarea::placeholder { color: var(--text-muted); }
   .send-btn {
-    flex-shrink: 0; width: 36px; height: 36px; border-radius: 8px;
-    background: var(--purple-solid); border: none; cursor: pointer;
+    flex-shrink: 0; width: 38px; height: 38px; border-radius: 1px;
+    background: var(--accent); border: none; cursor: pointer;
     display: flex; align-items: center; justify-content: center;
-    transition: opacity 0.15s, transform 0.1s; color: #fff;
+    transition: background 0.15s, transform 0.1s; color: var(--bg-deep);
   }
-  .send-btn:hover { opacity: 0.85; }
+  .send-btn:hover { background: var(--accent-strong); }
   .send-btn:active { transform: scale(0.93); }
   .send-btn:disabled { opacity: 0.5; pointer-events: none; }
   .send-btn svg { width: 16px; height: 16px; }
@@ -551,55 +537,57 @@
 
   .scroll-anchor { overflow-anchor: auto; height: 1px; }
 
-  .empty-state {
-    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
-    color: var(--text-muted);
-  }
+  .empty-state { flex: 1; padding: 64px var(--page-pad); color: var(--text-muted); }
   .empty-title { font-size: 1.05rem; font-weight: 600; color: var(--text-base); margin: 14px 0 4px; }
   .empty-sub { font-size: 0.85rem; margin: 0; }
 
   .tasks-toggle {
-    font-size: 0.7rem; font-weight: 600; cursor: pointer;
-    background: var(--bg-card); color: oklch(75% 0.2 292.0);
-    border: 1px solid oklch(59.1% 0.249 292.7 / 0.3);
-    padding: 3px 10px; border-radius: 20px; flex-shrink: 0;
+    font: 0.68rem var(--mono); cursor: pointer; background: transparent; color: var(--accent);
+    border: 0; border-bottom: 1px solid currentColor; padding: 2px 0; flex-shrink: 0;
   }
-  .tasks-toggle:hover { background: var(--purple-dim); }
+  .tasks-toggle:hover { color: var(--text-base); }
 
   .tasks-panel {
     flex-shrink: 0; max-height: 40%; overflow-y: auto;
     border-bottom: 1px solid var(--border);
-    background: var(--bg-base); padding: 10px 24px;
-    display: flex; flex-direction: column; gap: 8px;
+    background: var(--bg-base); padding: 0 var(--page-pad);
+    display: flex; flex-direction: column;
   }
   .task-item {
-    background: var(--bg-card); border: 1px solid var(--border);
-    border-radius: 10px; padding: 8px 12px;
+    border-bottom: var(--rule); padding: 12px 0; max-width: calc(var(--measure) + 92px);
   }
   .task-line { display: flex; align-items: center; gap: 8px; }
   .task-status {
     font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
-    padding: 1px 7px; border-radius: 8px;
+    color: var(--text-muted);
   }
-  .task-running { background: oklch(55% 0.2 250 / 0.15); color: oklch(75% 0.2 250); }
-  .task-needs_input { background: oklch(55% 0.18 80 / 0.15); color: oklch(75% 0.18 80); }
+  .task-needs_input { color: var(--text-base); }
   .task-name { font-size: 0.82rem; font-weight: 600; color: var(--text-base); flex: 1; }
   .task-x {
     border: none; background: transparent; color: var(--text-muted);
-    cursor: pointer; font-size: 0.8rem; padding: 2px 4px; border-radius: 6px;
+    cursor: pointer; font: 0.68rem var(--mono); padding: 2px 0; border-bottom: 1px solid transparent;
   }
-  .task-x:hover { color: oklch(70% 0.2 25); }
+  .task-x:hover { color: var(--accent); border-bottom-color: currentColor; }
   .task-msg { font-size: 0.78rem; color: var(--text-muted); margin: 2px 0 0; }
-  .task-q { font-size: 0.8rem; color: oklch(80% 0.18 80); margin: 6px 0 0; }
+  .task-q { font-size: 0.8rem; color: var(--text-base); margin: 6px 0 0; }
   .task-reply { display: flex; gap: 6px; margin-top: 6px; }
   .task-reply input {
-    flex: 1; background: var(--bg-base); border: 1px solid var(--border);
-    border-radius: 8px; padding: 5px 10px; color: var(--text-base);
+    flex: 1; background: var(--bg-deep); border: 1px solid var(--border-strong);
+    border-radius: 1px; padding: 5px 10px; color: var(--text-base);
     font-size: 0.8rem; outline: none;
   }
-  .task-reply input:focus { border-color: oklch(59.1% 0.249 292.7 / 0.6); }
+  .task-reply input:focus { border-color: var(--accent); }
   .task-reply button {
-    border: none; background: var(--purple-solid); color: #fff;
-    border-radius: 8px; padding: 5px 12px; font-size: 0.78rem; cursor: pointer;
+    border: none; background: var(--accent); color: var(--bg-deep);
+    border-radius: 1px; padding: 5px 12px; font-size: 0.78rem; cursor: pointer;
+  }
+  @media (max-width: 640px) {
+    .chat-head { align-items: flex-start; flex-wrap: wrap; }
+    .chat-head > div { width: 100%; flex-basis: 100%; display: block; }
+    .chat-kicker { display: block; margin-bottom: 3px; }
+    .msg-row { grid-template-columns: 1fr; gap: 8px; padding: 20px 0; }
+    .msg-meta { flex-direction: row; gap: 10px; }
+    .time-gap, .summ-divider { padding-left: 0; }
+    .summary-badge { padding-left: 10px; }
   }
 </style>

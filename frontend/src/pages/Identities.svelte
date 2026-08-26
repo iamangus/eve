@@ -88,15 +88,11 @@
       error = e.message
     }
   }
-
-  function fmtAddress(c) {
-    return `${c.type} · ${c.address}`
-  }
 </script>
 
 <div class="id-page">
   <div class="id-head">
-    <h2 class="id-title">Identities</h2>
+    <div><div class="id-kicker">SYSTEM / ADDRESS BOOK</div><h2 class="id-title">Identities</h2></div>
     <button class="id-btn id-btn-primary" onclick={openNew}>Add identity</button>
   </div>
 
@@ -121,7 +117,7 @@
               <span class="id-muted">no channels</span>
             {:else}
               {#each id.channels as c}
-                <span class="id-chan">{fmtAddress(c)}</span>
+                <span class="id-chan"><b>{c.type}</b><span>{c.address}</span></span>
               {/each}
             {/if}
           </div>
@@ -139,7 +135,7 @@
 
 {#if editorOpen}
   <div class="id-overlay" role="presentation" onclick={closeEditor}>
-    <div class="id-modal" role="dialog" onclick={(e) => e.stopPropagation()}>
+    <div class="id-modal" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
       <h3 class="id-modal-title">{editingName ? `Edit ${editingName}` : 'New identity'}</h3>
       <label class="id-field">
         <span>Name</span>
@@ -182,47 +178,47 @@
 {/if}
 
 <style>
-  .id-page { padding: 24px; overflow-y: auto; height: 100%; max-width: 960px; margin: 0 auto; }
-  .id-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .id-page { padding: 38px var(--page-pad) 64px; overflow-y: auto; height: 100%; width: 100%; }
+  .id-head { display: flex; align-items: end; justify-content: space-between; padding-bottom: 24px; max-width: var(--content-max); }
+  .id-kicker { color: var(--text-faint); font: 0.65rem var(--mono); letter-spacing: 0.1em; }
   .id-title {
-    font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em;
-    color: var(--text-muted); margin: 0;
+    font-size: 1.65rem; font-weight: 500; letter-spacing: -0.02em; color: var(--text-base); margin: 3px 0 0;
   }
-  .id-empty { color: var(--text-muted); font-size: 0.85rem; padding: 8px 0; }
-  .id-error { color: oklch(70% 0.2 20); }
-  .id-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+  .id-empty { color: var(--text-muted); font-size: 0.85rem; padding: 24px 0; border-top: var(--rule); max-width: var(--content-max); }
+  .id-error { color: var(--text-base); }
+  .id-list { max-width: var(--content-max); border-top: 1px solid var(--border-strong); }
   .id-card {
-    background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
-    padding: 14px; font-size: 0.83rem; display: flex; flex-direction: column; gap: 8px;
+    border-bottom: var(--rule); padding: 18px 0; font-size: 0.83rem;
+    display: grid; grid-template-columns: 180px minmax(0, 1fr) auto; gap: 24px; align-items: start;
   }
-  .id-card-head { display: flex; align-items: center; gap: 8px; }
-  .id-name { font-weight: 700; color: var(--text-base); font-size: 0.9rem; }
+  .id-card-head { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+  .id-name { font-weight: 650; color: var(--text-base); font-size: 0.94rem; }
   .id-owner-badge {
-    font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.08em;
-    color: oklch(80% 0.18 292.0); background: oklch(30% 0.06 292.7);
-    border: 1px solid oklch(59.1% 0.249 292.7 / 0.35); border-radius: 10px; padding: 1px 8px;
+    font: 0.63rem var(--mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted);
   }
-  .id-chans { display: flex; flex-wrap: wrap; gap: 4px; }
+  .id-chans { display: flex; flex-direction: column; gap: 5px; }
   .id-chan {
-    font-size: 0.72rem; border-radius: 6px; padding: 1px 7px;
-    background: oklch(28% 0.03 0); color: var(--text-base); border: 1px solid var(--border);
+    display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 10px; font: 0.72rem var(--mono); color: var(--text-base);
   }
+  .id-chan b { color: var(--text-muted); font-weight: 400; text-transform: uppercase; }
+  .id-chan span { overflow-wrap: anywhere; }
   .id-muted { color: var(--text-muted); font-size: 0.75rem; }
-  .id-actions { display: flex; gap: 6px; margin-top: 2px; }
+  .id-actions { display: flex; gap: 6px; }
   .id-btn {
-    background: var(--bg-card); color: var(--text-base); border: 1px solid var(--border);
-    border-radius: 8px; padding: 5px 12px; font-size: 0.78rem; cursor: pointer;
+    background: transparent; color: var(--accent); border: 1px solid var(--border-strong);
+    border-radius: 1px; padding: 6px 12px; font-size: 0.78rem; cursor: pointer;
   }
-  .id-btn:hover { border-color: var(--accent, oklch(70% 0.2 250)); }
-  .id-btn-primary { background: oklch(45% 0.2 292.7); border-color: oklch(45% 0.2 292.7); color: white; }
-  .id-btn-danger { color: oklch(70% 0.2 20); border-color: oklch(70% 0.2 20 / 0.4); }
+  .id-btn:hover { border-color: var(--accent); background: var(--accent-dim); }
+  .id-btn-primary { background: var(--accent); border-color: var(--accent); color: var(--bg-deep); }
+  .id-btn-primary:hover { background: var(--accent-strong); }
+  .id-btn-danger { color: var(--text-muted); }
   .id-btn-icon { padding: 0 8px; font-size: 0.9rem; line-height: 1; }
   .id-overlay {
-    position: fixed; inset: 0; background: rgb(0 0 0 / 0.55); display: flex;
+    position: fixed; inset: 0; background: oklch(7% 0.01 55 / 0.78); display: flex;
     align-items: center; justify-content: center; z-index: 40;
   }
   .id-modal {
-    background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;
+    background: var(--bg-raised); border: 1px solid var(--border-strong); border-radius: 2px;
     padding: 20px; width: min(480px, 92vw); max-height: 86vh; overflow-y: auto;
     display: flex; flex-direction: column; gap: 10px;
   }
@@ -230,7 +226,7 @@
   .id-field { display: flex; flex-direction: column; gap: 4px; font-size: 0.8rem; color: var(--text-muted); }
   .id-field input[type='text'], .id-chan-row input[type='text'] {
     background: var(--bg-base, #141414); color: var(--text-base);
-    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; font-size: 0.85rem;
+    border: 1px solid var(--border-strong); border-radius: 1px; padding: 7px 10px; font-size: 0.85rem;
   }
   .id-field input:disabled { opacity: 0.5; }
   .id-check { flex-direction: row; align-items: center; gap: 8px; }
@@ -238,8 +234,13 @@
   .id-chan-row { display: flex; gap: 6px; align-items: center; }
   .id-chan-row select {
     background: var(--bg-base, #141414); color: var(--text-base);
-    border: 1px solid var(--border); border-radius: 8px; padding: 7px 8px; font-size: 0.85rem;
+    border: 1px solid var(--border-strong); border-radius: 1px; padding: 7px 8px; font-size: 0.85rem;
   }
   .id-chan-row input { flex: 1; }
   .id-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+  @media (max-width: 680px) {
+    .id-card { grid-template-columns: 1fr; gap: 14px; }
+    .id-card-head { flex-direction: row; align-items: baseline; }
+    .id-actions { justify-content: flex-start; }
+  }
 </style>

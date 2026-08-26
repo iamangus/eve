@@ -62,7 +62,13 @@
 </script>
 
 <div class="ch-page">
-  <h2 class="ch-title">Channels</h2>
+  <header class="ch-header">
+    <div>
+      <div class="ch-kicker">SYSTEM / DELIVERY</div>
+      <h2 class="ch-title">Channels</h2>
+    </div>
+    <div class="ch-summary">{channels().length} registered channels · refresh interval 5 seconds</div>
+  </header>
   {#if loading}
     <div class="ch-empty">Loading channels…</div>
   {:else if error}
@@ -70,14 +76,19 @@
   {:else if channels().length === 0}
     <div class="ch-empty">No channels registered.</div>
   {:else}
-    <div class="ch-grid">
+    <div class="ch-matrix" role="table" aria-label="Registered channels">
+      <div class="ch-matrix-head" role="row">
+        <span>Channel</span><span>Capabilities</span><span>Presence</span><span>Preference</span><span>Poller</span>
+      </div>
       {#each channels() as c}
-        <div class="ch-card">
-          <div class="ch-head">
+        {@const hs = healthState(c.id)}
+        <div class="ch-card" role="row">
+          <div class="ch-head" data-label="Channel">
             <span class="ch-name">{c.name}</span>
             <span class="ch-type">{c.type}</span>
+            {#if c.default_recipient}<span class="ch-addr">{c.default_recipient}</span>{/if}
           </div>
-          <div class="ch-badges">
+          <div class="ch-badges" data-label="Capabilities">
             {#if c.input}
               <span class="cap">in</span>
             {/if}
@@ -94,42 +105,22 @@
               <span class="cap cap-warn">unreachable</span>
             {/if}
           </div>
-          <div class="ch-row">
-            <span>Presence</span>
-            <b class="{presentNow(c) ? 'ok-text' : 'muted-text'}">
-              {presentNow(c) ? 'present' : 'not present'}
-            </b>
+          <div class="ch-presence" data-label="Presence">
+            <b>{presentNow(c) ? 'PRESENT' : 'NOT PRESENT'}</b>
+            <span>Last activity: {fmtTime(c.presence?.last_activity)}</span>
           </div>
-          <div class="ch-row">
-            <span>Last activity</span>
-            <b>{fmtTime(c.presence?.last_activity)}</b>
-          </div>
-          <div class="ch-row">
-            <span>Preference</span>
-            <b>{c.preference}</b>
-          </div>
-          {#if c.default_recipient}
-            <div class="ch-row">
-              <span>Default recipient</span>
-              <b class="ch-addr">{c.default_recipient}</b>
-            </div>
-          {/if}
-          {#if c.type !== 'web'}
-            {@const hs = healthState(c.id)}
+          <div class="ch-pref" data-label="Preference">{c.preference}</div>
+          <div class="ch-health" data-label="Poller">
+            {#if c.type !== 'web'}
             {#if hs === 'error'}
-              <div class="ch-health ch-health-error" title="{health()[c.id].last_error}">
-                last check {fmtTime(health()[c.id].last_check)} · error
-              </div>
+              <b title="{health()[c.id].last_error}">ERROR</b><span>Checked {fmtTime(health()[c.id].last_check)}</span>
             {:else if hs === 'ok'}
-              <div class="ch-health ch-health-ok">
-                poller healthy · checked {fmtTime(health()[c.id].last_check)}
-              </div>
+              <b>HEALTHY</b><span>Checked {fmtTime(health()[c.id].last_check)}</span>
             {:else}
-              <div class="ch-health">
-                poller not reporting
-              </div>
+              <b>NOT REPORTING</b>
             {/if}
-          {/if}
+            {:else}<span>Not applicable</span>{/if}
+          </div>
         </div>
       {/each}
     </div>
@@ -137,36 +128,35 @@
 </div>
 
 <style>
-  .ch-page { padding: 24px; overflow-y: auto; height: 100%; max-width: 960px; margin: 0 auto; }
-  .ch-title {
-    font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em;
-    color: var(--text-muted); margin: 0 0 16px;
+  .ch-page { padding: 38px var(--page-pad) 64px; overflow-y: auto; height: 100%; width: 100%; }
+  .ch-header { max-width: var(--content-max); display: flex; justify-content: space-between; align-items: end; padding-bottom: 24px; }
+  .ch-kicker, .ch-summary, .ch-matrix-head { font-family: var(--mono); }
+  .ch-kicker { color: var(--text-faint); font-size: 0.65rem; letter-spacing: 0.1em; }
+  .ch-title { font-size: 1.65rem; font-weight: 500; letter-spacing: -0.02em; color: var(--text-base); margin: 3px 0 0; }
+  .ch-summary { color: var(--text-muted); font-size: 0.68rem; }
+  .ch-empty { color: var(--text-muted); font-size: 0.88rem; padding: 24px 0; border-top: var(--rule); max-width: var(--content-max); }
+  .ch-error { color: var(--text-base); border-top-color: var(--text-base); }
+  .ch-matrix { max-width: var(--content-max); border-top: 1px solid var(--border-strong); }
+  .ch-matrix-head, .ch-card { display: grid; grid-template-columns: 1.35fr 1.3fr 1.25fr 0.7fr 1.25fr; column-gap: 20px; }
+  .ch-matrix-head { padding: 9px 0; color: var(--text-faint); font-size: 0.63rem; letter-spacing: 0.08em; text-transform: uppercase; border-bottom: var(--rule); }
+  .ch-card { padding: 18px 0; border-bottom: var(--rule); font-size: 0.82rem; align-items: start; }
+  .ch-head, .ch-presence, .ch-health { display: flex; flex-direction: column; min-width: 0; }
+  .ch-name { font-weight: 650; color: var(--text-base); font-size: 0.92rem; }
+  .ch-type, .ch-addr, .ch-presence span, .ch-health span, .ch-pref { font: 0.68rem/1.5 var(--mono); color: var(--text-muted); }
+  .ch-type { text-transform: uppercase; letter-spacing: 0.08em; }
+  .ch-addr { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 4px; }
+  .ch-badges { display: flex; flex-wrap: wrap; gap: 4px; }
+  .cap { font: 0.63rem var(--mono); padding: 2px 6px; color: var(--text-muted); border: var(--rule); text-transform: uppercase; }
+  .cap-warn, .ch-presence b, .ch-health b { color: var(--text-base); }
+  .ch-presence b, .ch-health b { font: 650 0.67rem var(--mono); letter-spacing: 0.04em; }
+  .ch-pref { text-transform: uppercase; }
+  [data-label]::before { display: none; }
+  @media (max-width: 760px) {
+    .ch-header { display: block; }
+    .ch-summary { margin-top: 12px; }
+    .ch-matrix-head { display: none; }
+    .ch-card { display: grid; grid-template-columns: 1fr 1fr; gap: 18px 22px; }
+    [data-label]::before { display: block; content: attr(data-label); font: 0.6rem var(--mono); letter-spacing: 0.08em; color: var(--text-faint); text-transform: uppercase; margin-bottom: 5px; }
   }
-  .ch-empty { color: var(--text-muted); font-size: 0.85rem; padding: 8px 0; }
-  .ch-error { color: oklch(70% 0.2 20); }
-  .ch-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
-  .ch-card {
-    background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
-    padding: 14px; font-size: 0.83rem; display: flex; flex-direction: column; gap: 6px;
-  }
-  .ch-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px; }
-  .ch-name { font-weight: 700; color: var(--text-base); font-size: 0.9rem; }
-  .ch-type {
-    font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted);
-    border: 1px solid var(--border); border-radius: 10px; padding: 1px 8px;
-  }
-  .ch-badges { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
-  .cap {
-    font-size: 0.66rem; border-radius: 6px; padding: 1px 7px;
-    background: oklch(30% 0.06 292.7); color: oklch(80% 0.18 292.0); border: 1px solid oklch(59.1% 0.249 292.7 / 0.35);
-  }
-  .cap-warn { background: oklch(30% 0.08 25); color: oklch(80% 0.18 25); border-color: oklch(59.1% 0.249 25 / 0.35); }
-  .ch-row { display: flex; justify-content: space-between; gap: 8px; color: var(--text-muted); }
-  .ch-row b { color: var(--text-base); font-weight: 600; text-align: right; }
-  .ok-text { color: oklch(65% 0.18 145); }
-  .muted-text { color: var(--text-muted); font-weight: 500; }
-  .ch-addr { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
-  .ch-health { margin-top: 4px; font-size: 0.72rem; color: var(--text-muted); }
-  .ch-health-ok { color: oklch(65% 0.18 145); }
-  .ch-health-error { color: oklch(70% 0.2 20); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  @media (max-width: 440px) { .ch-card { grid-template-columns: 1fr; } }
 </style>
