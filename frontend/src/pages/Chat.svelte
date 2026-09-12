@@ -175,8 +175,6 @@
   async function sendMessage() {
     if (sending || !newMessage.trim() || !currentConv) return
     const content = newMessage
-    newMessage = ''
-    if (inputEl) inputEl.style.height = 'auto'
     sending = true
     notice = ''
     messages = [...messages, { role: 'user', content }]
@@ -184,6 +182,8 @@
 
     try {
       const result = await api.post('/api/conversations/' + currentConv.id + '/messages', { content })
+      newMessage = ''
+      if (inputEl) inputEl.style.height = 'auto'
       startStream(result.run_id)
     } catch (e) {
       sending = false
