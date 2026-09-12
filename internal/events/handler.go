@@ -134,7 +134,7 @@ func (h *Handler) deliver(ctx context.Context, event *Event) error {
 	if err != nil {
 		return err
 	}
-	_, err = h.client.SendPersistentRunInput(ctx, runID, string(message), event.ID)
+	_, err = h.client.SendPersistentRunInputWithMetadata(ctx, runID, string(message), event.ID, map[string]string{"source": event.Source})
 	return err
 }
 

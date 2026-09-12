@@ -51,8 +51,9 @@ type persistentRunRequest struct {
 }
 
 type runInputRequest struct {
-	Message string `json:"message"`
-	InputID string `json:"input_id,omitempty"`
+	Message  string            `json:"message"`
+	InputID  string            `json:"input_id,omitempty"`
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 type RunStatus struct {
@@ -132,7 +133,13 @@ func (c *Client) CreatePersistentRun(ctx context.Context, agentID string, opts P
 // SendPersistentRunInput appends an input to a persistent run. inputID is an
 // idempotency key for durable callers; it may be empty for direct UI input.
 func (c *Client) SendPersistentRunInput(ctx context.Context, runID, message, inputID string) (string, error) {
-	data, err := json.Marshal(runInputRequest{Message: message, InputID: inputID})
+	return c.SendPersistentRunInputWithMetadata(ctx, runID, message, inputID, nil)
+}
+
+// SendPersistentRunInputWithMetadata includes optional context about a message
+// that may be injected after an agent has already started work.
+func (c *Client) SendPersistentRunInputWithMetadata(ctx context.Context, runID, message, inputID string, metadata map[string]string) (string, error) {
+	data, err := json.Marshal(runInputRequest{Message: message, InputID: inputID, Metadata: metadata})
 	if err != nil {
 		return "", fmt.Errorf("marshal run input: %w", err)
 	}
