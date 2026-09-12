@@ -84,7 +84,7 @@ func (m *MCP) handleTriggerFrontend(_ context.Context, req mcp.CallToolRequest) 
 	if err := m.mgr.frontendTrigger(content, conversationID); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	return mcp.NewToolResultText("frontend trigger queued"), nil
+	return mcp.NewToolResultText("Frontend trigger accepted. Do not call this tool again for this event; return a final completion response now."), nil
 }
 
 // addTaskTools registers the background-task tools. They are no-ops (error)
