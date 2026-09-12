@@ -176,7 +176,10 @@
     if (sending || !newMessage.trim() || !currentConv) return
     const content = newMessage
     newMessage = ''
-    if (inputEl) inputEl.style.height = 'auto'
+    if (inputEl) {
+      inputEl.value = ''
+      inputEl.style.height = 'auto'
+    }
     sending = true
     notice = ''
     messages = [...messages, { role: 'user', content }]
