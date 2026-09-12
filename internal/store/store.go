@@ -26,13 +26,13 @@ type Message struct {
 }
 
 type Conversation struct {
-	ID            string    `json:"id"`
-	Title         string    `json:"title"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
-	ActiveRunID   string    `json:"active_run_id,omitempty"`
-	SummarizedUpTo int64    `json:"summarized_up_to,omitempty"`
-	Messages      []Message `json:"messages,omitempty"`
+	ID             string    `json:"id"`
+	Title          string    `json:"title"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	ActiveRunID    string    `json:"active_run_id,omitempty"`
+	SummarizedUpTo int64     `json:"summarized_up_to,omitempty"`
+	Messages       []Message `json:"messages,omitempty"`
 }
 
 type ConversationSummary struct {
@@ -60,11 +60,12 @@ type conversationRecord struct {
 // configured data directory as conversations.json, compartments.json, and
 // memories.json, written atomically (tmp file + rename).
 type Store struct {
-	mu           sync.RWMutex
-	dir          string
-	convs        map[string]*conversationRecord
-	compartments map[string][]Compartment
-	memories     []Memory
+	mu             sync.RWMutex
+	dir            string
+	convs          map[string]*conversationRecord
+	compartments   map[string][]Compartment
+	memories       []Memory
+	persistentRuns map[string]string
 }
 
 func New(dir string) (*Store, error) {
@@ -72,9 +73,10 @@ func New(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		dir:          dir,
-		convs:        make(map[string]*conversationRecord),
-		compartments: make(map[string][]Compartment),
+		dir:            dir,
+		convs:          make(map[string]*conversationRecord),
+		compartments:   make(map[string][]Compartment),
+		persistentRuns: make(map[string]string),
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -108,6 +110,13 @@ func (s *Store) load() error {
 		return err
 	}
 	s.memories = mems
+	var persistentRuns map[string]string
+	if err := s.loadJSON("persistent_runs.json", &persistentRuns); err != nil {
+		return err
+	}
+	if persistentRuns != nil {
+		s.persistentRuns = persistentRuns
+	}
 	return nil
 }
 
@@ -139,4 +148,21 @@ func (s *Store) saveJSON(name string, v any) error {
 
 func (s *Store) saveConversations() error {
 	return s.saveJSON("conversations.json", s.convs)
+}
+
+func (s *Store) PersistentRun(scope string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.persistentRuns[scope]
+}
+
+func (s *Store) SetPersistentRun(scope, runID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if runID == "" {
+		delete(s.persistentRuns, scope)
+	} else {
+		s.persistentRuns[scope] = runID
+	}
+	return s.saveJSON("persistent_runs.json", s.persistentRuns)
 }

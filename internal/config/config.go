@@ -13,6 +13,7 @@ type Config struct {
 	AgentFoundryURL    string
 	AgentFoundryKey    string
 	AssistantAgentID   string
+	BackendAgentID     string
 	RouterAgentID      string
 	EVEMCPURL          string
 	EVEMCPChatURL      string
@@ -35,8 +36,9 @@ type Config struct {
 	CalDAVCalendarPath string
 	CalReminderLead    time.Duration
 
-	SMSToken   string
-	VoiceToken string
+	SMSToken            string
+	VoiceToken          string
+	OpenDevWebhookToken string
 
 	HistorianAgentID           string
 	ContextBudgetTokens        int
@@ -49,33 +51,35 @@ type Config struct {
 
 func Load() (Config, error) {
 	cfg := Config{
-		Listen:             envOr("LISTEN", ":8090"),
-		AgentFoundryURL:    envOr("AGENTFOUNDRY_URL", "http://localhost:3000"),
-		AgentFoundryKey:    os.Getenv("AGENTFOUNDRY_API_KEY"),
-		AssistantAgentID:   os.Getenv("ASSISTANT_AGENT_ID"),
-		RouterAgentID:      os.Getenv("ROUTER_AGENT_ID"),
-		EVEMCPURL:          envOr("EVEMCP_URL", "http://localhost:8090/mcp"),
-		EVEMCPChatURL:      envOr("EVEMCP_CHAT_URL", ""),
-		ProactiveEnabled:   boolEnv("PROACTIVE_ENABLED", true),
-		WebPresenceTimeout: durationEnv("WEB_PRESENCE_TIMEOUT", 60*time.Second),
-		DataDir:            envOr("DATA_DIR", "./data"),
-		EmailPollInterval:  durationEnv("EMAIL_POLL_INTERVAL", 60*time.Second),
-		SMTPHost:           os.Getenv("SMTP_HOST"),
-		SMTPPort:           intEnv("SMTP_PORT", 587),
-		SMTPUsername:       os.Getenv("SMTP_USERNAME"),
-		SMTPPassword:       os.Getenv("SMTP_PASSWORD"),
-		SMTPFrom:           os.Getenv("SMTP_FROM"),
-		MatrixHomeserver:   os.Getenv("MATRIX_HOMESERVER"),
-		MatrixAccessToken:  os.Getenv("MATRIX_ACCESS_TOKEN"),
-		MatrixUserID:       os.Getenv("MATRIX_USER_ID"),
-		MatrixPickleKey:    os.Getenv("MATRIX_PICKLE_KEY"),
-		CalDAVURL:          os.Getenv("CALDAV_URL"),
-		CalDAVUsername:     os.Getenv("CALDAV_USERNAME"),
-		CalDAVPassword:     os.Getenv("CALDAV_PASSWORD"),
-		CalDAVCalendarPath: os.Getenv("CALDAV_CALENDAR_PATH"),
-		CalReminderLead:    durationEnv("CAL_REMINDER_LEAD", 15*time.Minute),
-		SMSToken:           os.Getenv("SMS_WEBHOOK_TOKEN"),
-		VoiceToken:         os.Getenv("VOICE_WEBHOOK_TOKEN"),
+		Listen:              envOr("LISTEN", ":8090"),
+		AgentFoundryURL:     envOr("AGENTFOUNDRY_URL", "http://localhost:3000"),
+		AgentFoundryKey:     os.Getenv("AGENTFOUNDRY_API_KEY"),
+		AssistantAgentID:    os.Getenv("ASSISTANT_AGENT_ID"),
+		BackendAgentID:      envOr("BACKEND_AGENT_ID", os.Getenv("ASSISTANT_AGENT_ID")),
+		RouterAgentID:       os.Getenv("ROUTER_AGENT_ID"),
+		EVEMCPURL:           envOr("EVEMCP_URL", "http://localhost:8090/mcp"),
+		EVEMCPChatURL:       envOr("EVEMCP_CHAT_URL", ""),
+		ProactiveEnabled:    boolEnv("PROACTIVE_ENABLED", true),
+		WebPresenceTimeout:  durationEnv("WEB_PRESENCE_TIMEOUT", 60*time.Second),
+		DataDir:             envOr("DATA_DIR", "./data"),
+		EmailPollInterval:   durationEnv("EMAIL_POLL_INTERVAL", 60*time.Second),
+		SMTPHost:            os.Getenv("SMTP_HOST"),
+		SMTPPort:            intEnv("SMTP_PORT", 587),
+		SMTPUsername:        os.Getenv("SMTP_USERNAME"),
+		SMTPPassword:        os.Getenv("SMTP_PASSWORD"),
+		SMTPFrom:            os.Getenv("SMTP_FROM"),
+		MatrixHomeserver:    os.Getenv("MATRIX_HOMESERVER"),
+		MatrixAccessToken:   os.Getenv("MATRIX_ACCESS_TOKEN"),
+		MatrixUserID:        os.Getenv("MATRIX_USER_ID"),
+		MatrixPickleKey:     os.Getenv("MATRIX_PICKLE_KEY"),
+		CalDAVURL:           os.Getenv("CALDAV_URL"),
+		CalDAVUsername:      os.Getenv("CALDAV_USERNAME"),
+		CalDAVPassword:      os.Getenv("CALDAV_PASSWORD"),
+		CalDAVCalendarPath:  os.Getenv("CALDAV_CALENDAR_PATH"),
+		CalReminderLead:     durationEnv("CAL_REMINDER_LEAD", 15*time.Minute),
+		SMSToken:            os.Getenv("SMS_WEBHOOK_TOKEN"),
+		VoiceToken:          os.Getenv("VOICE_WEBHOOK_TOKEN"),
+		OpenDevWebhookToken: os.Getenv("OPENDEV_WEBHOOK_TOKEN"),
 
 		HistorianAgentID:           os.Getenv("HISTORIAN_AGENT_ID"),
 		ContextBudgetTokens:        intEnv("CONTEXT_BUDGET_TOKENS", 64000),

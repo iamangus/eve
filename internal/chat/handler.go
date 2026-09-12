@@ -148,16 +148,6 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 
 	h.ioMgr.Reg.Touch("web")
 
-	prior, err := h.store.ConversationHistory(convID)
-	if err != nil {
-		slog.Error("load history", "conv", convID, "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return
-	}
-	if prior == nil {
-		prior = []store.Message{}
-	}
-
 	userCount, err := h.store.UserMessageCount(convID)
 	if err != nil {
 		slog.Error("count user messages", "conv", convID, "error", err)
@@ -179,22 +169,19 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		_ = h.store.SetTitle(convID, defaultTitle)
 	}
 
-	history, _, renderErr := h.ctxMgr.RenderHistory(convID)
-	if renderErr != nil {
-		slog.Warn("render history", "conv", convID, "error", renderErr)
-		history = make([]agentfoundry.Message, 0, len(prior))
-		for _, m := range prior {
-			history = append(history, agentfoundry.Message{Role: m.Role, Content: m.Content})
+	persistentRunID := h.store.PersistentRun("frontend:" + convID)
+	if persistentRunID == "" {
+		persistentRunID, err = h.client.CreatePersistentRun(r.Context(), h.agentID, agentfoundry.PersistentRunOptions{MCPServers: h.mcpSrv})
+		if err == nil {
+			err = h.store.SetPersistentRun("frontend:"+convID, persistentRunID)
 		}
 	}
-
-	history = prependTaskBoard(h.tasks, history)
-
-	runID, err := h.client.RunAgentWith(r.Context(), h.agentID, agentfoundry.RunOptions{
-		Message:    req.Content,
-		History:    history,
-		MCPServers: h.mcpSrv,
-	})
+	if err != nil {
+		slog.Error("create frontend persistent run", "conv", convID, "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "agent run failed"})
+		return
+	}
+	runID, err := h.client.SendPersistentRunInput(r.Context(), persistentRunID, req.Content, "")
 	if err != nil {
 		slog.Error("agentfoundry run", "conv", convID, "error", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "agent run failed"})

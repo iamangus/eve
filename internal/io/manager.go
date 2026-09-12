@@ -44,7 +44,8 @@ type Manager struct {
 	agent  string
 	// Tasks is the background-task manager, attached by main so the MCP task
 	// tools and the task board can reach it.
-	Tasks *tasks.Manager
+	Tasks           *tasks.Manager
+	frontendTrigger func(content, conversationID string) error
 	// Matrix holds the active matrix config (empty when disabled) so main can
 	// start the sync poller.
 	Matrix MatrixConfig
@@ -56,6 +57,11 @@ type Manager struct {
 
 	healthMu sync.Mutex
 	health   map[string]PollHealth
+}
+
+// SetFrontendTrigger attaches the hidden Backend Eve -> Frontend Eve bridge.
+func (m *Manager) SetFrontendTrigger(trigger func(content, conversationID string) error) {
+	m.frontendTrigger = trigger
 }
 
 // PollHealth records the latest outcome of a background poller loop (email,

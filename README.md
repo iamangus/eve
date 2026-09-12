@@ -1,28 +1,33 @@
 # eve
 
 Chat interface and conversation owner for a single fixed agent that lives in
-[agentfoundry](../agentfoundry). This service owns conversation history locally
-(in-memory) and triggers agent runs in agentfoundry via its stateless run API.
-agentfoundry remains responsible for the agent definition, tools/MCP servers,
-LLM inference, and run dispatch (Temporal).
+[agentfoundry](../agentfoundry). This service owns visible conversation history
+locally and uses AgentFoundry persistent runs for agent state. AgentFoundry
+remains responsible for the agent definition, tools/MCP servers, LLM inference,
+and run dispatch (Temporal).
 
 ## Architecture
 
 ```
 Browser ──HTTP──> eve BFF ──HTTP + Bearer API key──> agentfoundry
-  (Svelte 5)     (Go, net/http, in-memory)    POST /api/v1/agents/{ASSISTANT_AGENT_ID}/run
-                                           GET  /api/v1/runs/{run_id}/events (SSE)
+  (Svelte 5)     (Go, net/http, JSON state)   POST /api/v1/agents/{ASSISTANT_AGENT_ID}/runs
+                                             POST /api/v1/runs/{run_id}/inputs
+                                             GET  /api/v1/runs/{run_id}/events (SSE)
 ```
 
-- Conversations and messages are kept in memory.
-- On send, the BFF reconstructs `History` (role+content) from stored messages
-  and calls agentfoundry's **stateless** run path (`POST /api/v1/agents/{id}/run`
-  with `history`, no `session_id`). agentfoundry never persists our history.
+- Each web conversation has a tracked frontend persistent run. A visible user
+  message is saved locally and submitted as an input to that run; Eve does not
+  reconstruct or submit local history on each turn.
+- Backend automation has its own tracked backend persistent run. OpenDev
+  webhook events are held in a leased, durable queue and submitted there as
+  hidden inputs, never as visible conversation messages. A `frontend` event is
+  likewise hidden but targets the specified conversation's frontend run.
 - The BFF proxies agentfoundry's SSE run-events stream verbatim to the browser;
   on the `done` event it persists the final assistant text in memory and clears
   the conversation's `active_run_id`. On `error` it clears `active_run_id`.
 - On startup the BFF reconciles any conversations with an in-flight
-  `active_run_id` by polling agentfoundry's `GET /api/v1/runs/{id}`.
+  `active_run_id` by polling agentfoundry's `GET /api/v1/runs/{id}`. Expired
+  queue leases are eligible for delivery again after restart.
 
 ## Leveraging agentfoundry for derived tasks
 
@@ -83,7 +88,8 @@ All configuration is via environment variables (no YAML).
 | `CONTEXT_CHUNK_TOKENS` | `20000` | Max input size (tokens) of one historian run. |
 | `CONTEXT_MEMORY_LIMIT` | `200` | Cap on the durable memory pool (oldest low-importance entries are curated away). |
 | `CONTEXT_CURATE_INTERVAL` | `24h` | How often the memory pool is curated (Go duration). |
-| `DATA_DIR` | `./data` | Directory for JSON persistence of email accounts, triggers, conversations, compartments, and memories |
+| `DATA_DIR` | `./data` | Directory for JSON persistence of email accounts, triggers, conversations, persistent-run IDs, compartments, memories, and internal events |
+| `OPENDEV_WEBHOOK_TOKEN` | _unset_ | Enables authenticated `POST /api/inbound/opendev` (Bearer token or `?token=`). Payload is `{"id":"event-id","category":"backend"|"frontend","payload":{...}}`; it is durably queued and never added to UI conversation history. Frontend events require `payload.conversation_id`. |
 | `EMAIL_POLL_INTERVAL` | `60s` | How often eve polls configured IMAP inboxes (Go duration, e.g. `30s`) |
 | `SMTP_HOST` | _unset_ | SMTP server for outbound email. When set, the email channel is enabled: Eve's `send_message` and proactive notifications can be delivered by email. Owner emails routed into the primary conversation (full duplex) still require SMTP config. |
 | `SMTP_PORT` | `587` | SMTP port (STARTTLS; use `465` for implicit TLS). |

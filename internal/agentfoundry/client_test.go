@@ -2,6 +2,7 @@ package agentfoundry
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -25,5 +26,44 @@ func TestAwaitRunTextAcceptsEmptyDoneEvent(t *testing.T) {
 	}
 	if got != "" {
 		t.Fatalf("AwaitRunText returned %q, want empty response", got)
+	}
+}
+
+func TestPersistentRunRequests(t *testing.T) {
+	var createSeen, inputSeen bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/agents/eve/runs":
+			createSeen = r.Method == http.MethodPost && r.Header.Get("Authorization") == "Bearer secret"
+			_ = json.NewEncoder(w).Encode(map[string]string{"run_id": "persistent-1"})
+		case "/api/v1/runs/persistent-1/inputs":
+			var body struct {
+				Message string `json:"message"`
+				InputID string `json:"input_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			inputSeen = r.Method == http.MethodPost && body.Message == "hello" && body.InputID == "event-1"
+			_ = json.NewEncoder(w).Encode(map[string]string{"run_id": "execution-1"})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := client.CreatePersistentRun(context.Background(), "eve", PersistentRunOptions{})
+	if err != nil || runID != "persistent-1" {
+		t.Fatalf("CreatePersistentRun = %q, %v", runID, err)
+	}
+	executionID, err := client.SendPersistentRunInput(context.Background(), runID, "hello", "event-1")
+	if err != nil || executionID != "execution-1" {
+		t.Fatalf("SendPersistentRunInput = %q, %v", executionID, err)
+	}
+	if !createSeen || !inputSeen {
+		t.Fatalf("persistent requests not sent as expected: create=%t input=%t", createSeen, inputSeen)
 	}
 }

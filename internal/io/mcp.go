@@ -56,12 +56,35 @@ func newMCP(mgr *Manager, withSend bool) *MCP {
 			mcp.WithDescription("List the communication channels available for sending the user messages, with their capabilities and whether the user is currently reachable on them."),
 		)
 		mcpServer.AddTool(listTool, m.handleListChannels)
+
+		triggerTool := mcp.NewTool("trigger_frontend_eve",
+			mcp.WithDescription("Queue hidden information for Frontend Eve. Frontend Eve decides whether it should become a user-visible message. Do not use send_message directly for backend operational events."),
+			mcp.WithString("content", mcp.Description("Concise event summary and recommended action."), mcp.Required()),
+			mcp.WithString("conversation_id", mcp.Description("Optional target conversation; defaults to Eve's primary conversation.")),
+		)
+		mcpServer.AddTool(triggerTool, m.handleTriggerFrontend)
 	}
 
 	m.addTaskTools(mcpServer)
 	m.addCalendarTools(mcpServer)
 
 	return m
+}
+
+func (m *MCP) handleTriggerFrontend(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if m.mgr.frontendTrigger == nil {
+		return mcp.NewToolResultError("frontend trigger queue is not available"), nil
+	}
+	args := req.GetArguments()
+	content, _ := args["content"].(string)
+	conversationID, _ := args["conversation_id"].(string)
+	if content == "" {
+		return mcp.NewToolResultError("content is required"), nil
+	}
+	if err := m.mgr.frontendTrigger(content, conversationID); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText("frontend trigger queued"), nil
 }
 
 // addTaskTools registers the background-task tools. They are no-ops (error)

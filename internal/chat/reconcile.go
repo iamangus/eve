@@ -63,7 +63,10 @@ func (h *Handler) reconcileRun(ctx context.Context, convID, runID string) error 
 	}
 	delete(h.failedRuns, runID)
 	switch rs.Status {
-	case "completed":
+	case "completed", "waiting":
+		// Persistent AgentFoundry runs return to waiting after each completed
+		// turn. For the visible frontend, that turn is complete even though the
+		// underlying run remains available for future input.
 		if rs.Response != "" {
 			channel, threadRef, replyTo, cerr := h.store.LastUserReply(convID)
 			if cerr != nil {

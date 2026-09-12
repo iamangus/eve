@@ -46,6 +46,15 @@ type runResponse struct {
 	RunID string `json:"run_id"`
 }
 
+type persistentRunRequest struct {
+	MCPServers []MCPServer `json:"mcp_servers,omitempty"`
+}
+
+type runInputRequest struct {
+	Message string `json:"message"`
+	InputID string `json:"input_id,omitempty"`
+}
+
 type RunStatus struct {
 	Status   string `json:"status"`
 	Response string `json:"response"`
@@ -83,6 +92,74 @@ type RunOptions struct {
 	MCPServers     []MCPServer
 	ResponseSchema *ResponseSchema
 	TaskID         string
+}
+
+type PersistentRunOptions struct {
+	MCPServers []MCPServer
+}
+
+func (c *Client) CreatePersistentRun(ctx context.Context, agentID string, opts PersistentRunOptions) (string, error) {
+	data, err := json.Marshal(persistentRunRequest{MCPServers: opts.MCPServers})
+	if err != nil {
+		return "", fmt.Errorf("marshal persistent run request: %w", err)
+	}
+	u := c.baseURL.JoinPath("/api/v1/agents/" + url.PathEscape(agentID) + "/runs")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.withAuth(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("agentfoundry create persistent run: %s: %s", resp.Status, string(b))
+	}
+	var out runResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("decode persistent run response: %w", err)
+	}
+	if out.RunID == "" {
+		return "", fmt.Errorf("persistent run response has no run_id")
+	}
+	return out.RunID, nil
+}
+
+// SendPersistentRunInput appends an input to a persistent run. inputID is an
+// idempotency key for durable callers; it may be empty for direct UI input.
+func (c *Client) SendPersistentRunInput(ctx context.Context, runID, message, inputID string) (string, error) {
+	data, err := json.Marshal(runInputRequest{Message: message, InputID: inputID})
+	if err != nil {
+		return "", fmt.Errorf("marshal run input: %w", err)
+	}
+	u := c.baseURL.JoinPath("/api/v1/runs/" + url.PathEscape(runID) + "/inputs")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.withAuth(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("agentfoundry run input: %s: %s", resp.Status, string(b))
+	}
+	var out runResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("decode run input response: %w", err)
+	}
+	if out.RunID == "" {
+		out.RunID = runID
+	}
+	return out.RunID, nil
 }
 
 func (c *Client) RunAgentWith(ctx context.Context, agentID string, opts RunOptions) (string, error) {

@@ -19,6 +19,7 @@ import (
 	"github.com/iamangus/eve/internal/config"
 	ctxmgr "github.com/iamangus/eve/internal/context"
 	"github.com/iamangus/eve/internal/email"
+	"github.com/iamangus/eve/internal/events"
 	"github.com/iamangus/eve/internal/io"
 	"github.com/iamangus/eve/internal/store"
 	"github.com/iamangus/eve/internal/tasks"
@@ -159,6 +160,14 @@ func main() {
 	ioMgr.Tasks = taskMgr
 	chatH.SetTasks(taskMgr)
 
+	eventQueue, err := events.NewQueue(cfg.DataDir)
+	if err != nil {
+		slog.Error("internal event queue", "dir", cfg.DataDir, "error", err)
+		os.Exit(1)
+	}
+	eventH := events.NewHandler(eventQueue, st, af, cfg.BackendAgentID, cfg.AssistantAgentID, cfg.OpenDevWebhookToken, fullMCPServers, fullMCPServers)
+	ioMgr.SetFrontendTrigger(eventH.EnqueueFrontend)
+
 	emailStore, err := store.NewEmailStore(cfg.DataDir)
 	if err != nil {
 		slog.Error("email store", "dir", cfg.DataDir, "error", err)
@@ -174,6 +183,7 @@ func main() {
 	taskMgr.Reconcile(rootCtx)
 	go taskMgr.Run(rootCtx)
 	go ioMgr.RunPresenceLoop(rootCtx)
+	go eventH.Run(rootCtx)
 
 	poller := email.NewPoller(emailStore, func(ctx context.Context, acct store.Account, msg store.EmailMessage) {
 		sender := msg.From
@@ -217,6 +227,7 @@ func main() {
 		SMSToken:   cfg.SMSToken,
 		VoiceToken: cfg.VoiceToken,
 	})
+	eventH.RegisterRoutes(mux)
 
 	mcpSrv := io.NewMCP(ioMgr)
 	mux.Handle("/mcp", mcpSrv)
