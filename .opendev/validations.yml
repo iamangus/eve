@@ -1,0 +1,5 @@
+validations:
+  frontend-build:
+    directory: frontend
+    command: npm run build
+    timeout_seconds: 300
