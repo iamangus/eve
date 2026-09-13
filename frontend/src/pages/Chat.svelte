@@ -15,6 +15,7 @@
   let messageListEl = $state(null)
   let inputEl = $state(null)
   let nearBottom = true
+  let scrollIntentVersion = 0
 
   let stream = $state({ runId: '', status: '', raw: '', html: '' })
   let eventSource = null
@@ -193,16 +194,16 @@
       sending = false
       console.error('Failed to send message', e)
       messages = [...messages, { role: 'assistant', content: '⚠️ Failed to send message. (' + e.message + ')' }]
-      scrollDown()
+      requestAnimationFrame(() => scrollDown())
     }
   }
 
   function startStream(runId) {
     eventSource?.close()
     eventSource = null
+    const forceInitialScroll = nearBottom
     stream = { runId, status: 'Thinking', raw: '', html: '' }
-    nearBottom = true
-    scrollDown(true)
+    requestAnimationFrame(() => scrollDown(forceInitialScroll))
 
     const es = new EventSource('/runs/' + runId + '/events')
     eventSource = es
@@ -211,11 +212,12 @@
       stream.status = ''
       stream.raw += e.data
       stream.html = renderMarkdown(stream.raw)
-      scrollDown()
+      requestAnimationFrame(() => scrollDown())
     })
 
     es.addEventListener('status', (e) => {
       stream.status = e.data
+      requestAnimationFrame(() => scrollDown())
     })
 
     es.addEventListener('done', (e) => {
@@ -226,7 +228,7 @@
       }
       stream = { runId: '', status: '', raw: '', html: '' }
       sending = false
-      scrollDown()
+      requestAnimationFrame(() => scrollDown())
       refreshConversationMeta()
     })
 
@@ -236,7 +238,7 @@
       eventSource = null
       stream = { runId: '', status: '', raw: '', html: '' }
       messages = [...messages, { role: 'assistant', content: e.data }]
-      scrollDown()
+      requestAnimationFrame(() => scrollDown())
       sending = false
       refreshConversationMeta()
     })
@@ -249,7 +251,7 @@
       stream = { runId: '', status: '', raw: '', html: '' }
       if (partial && partial.trim()) {
         messages = [...messages, { role: 'assistant', content: partial }]
-        scrollDown()
+        requestAnimationFrame(() => scrollDown())
       }
       sending = false
       healConversation()
