@@ -67,3 +67,20 @@ func TestPersistentRunRequests(t *testing.T) {
 		t.Fatalf("persistent requests not sent as expected: create=%t input=%t", createSeen, inputSeen)
 	}
 }
+
+func TestSendPersistentRunInputReturnsNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"run not found"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.SendPersistentRunInput(context.Background(), "missing", "hello", "input-1")
+	if !IsNotFound(err) {
+		t.Fatalf("expected not-found error, got %v", err)
+	}
+}

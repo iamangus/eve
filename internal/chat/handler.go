@@ -182,6 +182,17 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	runID, err := h.client.SendPersistentRunInput(r.Context(), persistentRunID, req.Content, "")
+	if agentfoundry.IsNotFound(err) {
+		// AgentFoundry restarted without the in-memory run record. Replace the
+		// stale persistent run rather than rejecting the user's message.
+		persistentRunID, err = h.client.CreatePersistentRun(r.Context(), h.agentID, agentfoundry.PersistentRunOptions{MCPServers: h.mcpSrv})
+		if err == nil {
+			err = h.store.SetPersistentRun("frontend:"+convID, persistentRunID)
+		}
+		if err == nil {
+			runID, err = h.client.SendPersistentRunInput(r.Context(), persistentRunID, req.Content, "")
+		}
+	}
 	if err != nil {
 		slog.Error("agentfoundry run", "conv", convID, "error", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "agent run failed"})

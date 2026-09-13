@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,6 +67,23 @@ type Client struct {
 	baseURL    *url.URL
 	httpClient *http.Client
 	apiKey     string
+}
+
+// HTTPError retains an AgentFoundry response status for callers that can
+// safely recover from a specific API condition.
+type HTTPError struct {
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("agentfoundry: %s: %s", e.Status, e.Body)
+}
+
+func IsNotFound(err error) bool {
+	var apiErr *HTTPError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }
 
 func NewClient(baseURL, apiKey string) (*Client, error) {
@@ -157,7 +175,7 @@ func (c *Client) SendPersistentRunInputWithMetadata(ctx context.Context, runID, 
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("agentfoundry run input: %s: %s", resp.Status, string(b))
+		return "", &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(b)}
 	}
 	var out runResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
