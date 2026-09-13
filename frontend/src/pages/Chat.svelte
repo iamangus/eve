@@ -201,9 +201,12 @@
   function startStream(runId) {
     eventSource?.close()
     eventSource = null
-    const forceInitialScroll = nearBottom
+    const intent = ++scrollIntentVersion
+    const forceInitialScroll = true
     stream = { runId, status: 'Thinking', raw: '', html: '' }
-    requestAnimationFrame(() => scrollDown(forceInitialScroll))
+    requestAnimationFrame(() => {
+      if (intent === scrollIntentVersion) scrollDown(true)
+    })
 
     const es = new EventSource('/runs/' + runId + '/events')
     eventSource = es
@@ -324,6 +327,7 @@
   function updateNearBottom() {
     if (!messageListEl) return
     nearBottom = messageListEl.scrollHeight - messageListEl.scrollTop - messageListEl.clientHeight <= 80
+    if (!nearBottom) scrollIntentVersion++
   }
 
   function scrollDown(force = false) {
