@@ -3,9 +3,11 @@ package chat
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/iamangus/eve/internal/agentfoundry"
 	"github.com/iamangus/eve/internal/config"
@@ -181,7 +183,10 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "agent run failed"})
 		return
 	}
-	runID, err := h.client.SendPersistentRunInput(r.Context(), persistentRunID, req.Content, "")
+	// Retain the same id across a stale-run recovery retry so the input stays
+	// idempotent if AgentFoundry accepted it before returning an error.
+	inputID := fmt.Sprintf("chat-%d", time.Now().UnixNano())
+	runID, err := h.client.SendPersistentRunInput(r.Context(), persistentRunID, req.Content, inputID)
 	if agentfoundry.IsNotFound(err) {
 		// AgentFoundry restarted without the in-memory run record. Replace the
 		// stale persistent run rather than rejecting the user's message.
@@ -190,7 +195,7 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 			err = h.store.SetPersistentRun("frontend:"+convID, persistentRunID)
 		}
 		if err == nil {
-			runID, err = h.client.SendPersistentRunInput(r.Context(), persistentRunID, req.Content, "")
+			runID, err = h.client.SendPersistentRunInput(r.Context(), persistentRunID, req.Content, inputID)
 		}
 	}
 	if err != nil {
