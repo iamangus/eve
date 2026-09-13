@@ -14,6 +14,7 @@
   let notice = $state('')
   let messageListEl = $state(null)
   let inputEl = $state(null)
+  let nearBottom = true
 
   let stream = $state({ runId: '', status: '', raw: '', html: '' })
   let eventSource = null
@@ -166,7 +167,7 @@
     currentConv = full
     messages = full.messages || []
     pushUrl('/?conv=' + full.id)
-    requestAnimationFrame(() => scrollDown())
+    requestAnimationFrame(() => scrollDown(true))
     if (full.active_run_id) {
       startStream(full.active_run_id)
     }
@@ -183,7 +184,7 @@
     sending = true
     notice = ''
     messages = [...messages, { role: 'user', content }]
-    requestAnimationFrame(() => scrollDown())
+    requestAnimationFrame(() => scrollDown(true))
 
     try {
       const result = await api.post('/api/conversations/' + currentConv.id + '/messages', { content })
@@ -200,6 +201,8 @@
     eventSource?.close()
     eventSource = null
     stream = { runId, status: 'Thinking', raw: '', html: '' }
+    nearBottom = true
+    scrollDown(true)
 
     const es = new EventSource('/runs/' + runId + '/events')
     eventSource = es
@@ -316,9 +319,15 @@
     return new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   }
 
-  function scrollDown() {
+  function updateNearBottom() {
     if (!messageListEl) return
+    nearBottom = messageListEl.scrollHeight - messageListEl.scrollTop - messageListEl.clientHeight <= 80
+  }
+
+  function scrollDown(force = false) {
+    if (!messageListEl || (!force && !nearBottom)) return
     messageListEl.scrollTop = messageListEl.scrollHeight
+    nearBottom = true
   }
 
   function pushUrl(href) {
@@ -382,7 +391,7 @@
         </div>
       {/if}
 
-      <div class="chat-body" bind:this={messageListEl}>
+      <div class="chat-body" bind:this={messageListEl} onscroll={updateNearBottom}>
         {#each messages as msg, i (msg.id ?? i)}
           {#if i > 0 && gapBetween(messages[i - 1], msg)}
             <div class="time-gap">{gapBetween(messages[i - 1], msg)}</div>
