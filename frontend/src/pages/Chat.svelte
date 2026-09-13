@@ -202,7 +202,6 @@
     eventSource?.close()
     eventSource = null
     const intent = ++scrollIntentVersion
-    const forceInitialScroll = true
     stream = { runId, status: 'Thinking', raw: '', html: '' }
     requestAnimationFrame(() => {
       if (intent === scrollIntentVersion) scrollDown(true)
