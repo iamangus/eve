@@ -112,6 +112,8 @@ The web UI has a **Channels** tab (`GET /api/channels`) showing every registered
 
 ## Build and Run
 
+OpenDev CI runs on draft pull requests.
+
 ### Frontend
 
 ```bash
