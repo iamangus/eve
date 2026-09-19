@@ -172,3 +172,37 @@ test('isCurrentHeal rejects stale heal, epoch, and send generations', () => {
   assert.equal(isCurrentHeal({ heal: 1, currentHeal: 1, epoch: 2, currentEpoch: 2, send: 2, currentSend: 3, convId: 'c1', currentConvId: 'c1' }), false)
   assert.equal(isCurrentHeal({ heal: 1, currentHeal: 1, epoch: 2, currentEpoch: 2, send: 3, currentSend: 3, convId: 'c1', currentConvId: 'c2' }), false)
 })
+
+test('identical id-less messages merged within one batch keep separate keys', () => {
+  const batch = mergeMessages([], [
+    { role: 'user', content: 'same text' },
+    { role: 'user', content: 'same text' },
+  ])
+  assert.equal(batch.length, 2)
+  assert.equal(uniqueKeys(batch), 2)
+  const batchKeys = keys(batch)
+
+  // Id-less deliveries are never reconciled against prior id-less rows:
+  // snapshot keys are indexing-only, so a repeated delivery can neither
+  // collapse the two rows into one nor overwrite either visible entry.
+  const refreshed = mergeMessages(batch, [
+    { role: 'user', content: 'same text' },
+    { role: 'user', content: 'same text' },
+  ])
+  assert.equal(refreshed.length, 4)
+  assert.deepEqual(keys(refreshed).slice(0, 2), batchKeys)
+  assert.equal(uniqueKeys(refreshed), 4)
+})
+
+test('late server message with an earlier timestamp is inserted chronologically', () => {
+  const current = mergeMessages([], [
+    { id: 51, created_at: '2026-03-02T00:00:00Z', role: 'assistant', content: 'later' },
+    { id: 52, created_at: '2026-03-03T00:00:00Z', role: 'user', content: 'latest' },
+  ])
+  const merged = mergeMessages(current, [
+    { id: 50, created_at: '2026-03-01T00:00:00Z', role: 'user', content: 'healed earlier' },
+  ])
+  assert.deepEqual(merged.map((message) => message.id), [50, 51, 52])
+  assert.equal(merged.length, 3)
+  assert.equal(uniqueKeys(merged), 3)
+})
