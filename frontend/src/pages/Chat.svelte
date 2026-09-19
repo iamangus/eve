@@ -3,6 +3,7 @@
   import { api } from '../lib/api.js'
   import { marked } from 'marked'
   import DOMPurify from 'dompurify'
+  import { mergeMessages, isCurrentHeal } from '../lib/chatMessageState.js'
 
   marked.setOptions({ gfm: true, breaks: true })
 
@@ -23,6 +24,25 @@
   let tasks = $state([])
   let taskReplies = $state({})
   let tasksOpen = $state(false)
+
+  // Generations guard every asynchronous callback against stale application:
+  // selectionSeq advances whenever a conversation is (re)selected,
+  // conversationEpoch advances whenever the active conversation resets,
+  // sendSeq advances per send, healSeq per heal, metaSeq per meta refresh,
+  // and activeRun names the run the visible stream belongs to.
+  let selectionSeq = 0
+  let conversationEpoch = 0
+  let sendSeq = 0
+  let healSeq = 0
+  let metaSeq = 0
+  let activeRun = ''
+
+  // appendMessage merges one entry into the visible list through the
+  // reconciliation helper so prior entries keep their identity and can never
+  // be dropped or visually replaced by a keyed-list reuse.
+  function appendMessage(message) {
+    messages = mergeMessages(messages, [message])
+  }
 
   onMount(() => {
     loadPrimary()
@@ -59,9 +79,15 @@
       if (ev.type !== 'message' || !ev.conv_id || !currentConv) return
       if (ev.conv_id !== currentConv.id) return
       const msg = ev.data
-      if (!msg || !msg.id) return
-      if (messages.some((m) => m.id === msg.id)) return
-      messages = [...messages, msg]
+      if (msg === null || msg === undefined) return
+      // A delayed proactive event from an older run must not land after a
+      // newer run has taken over the conversation; skip it when the hub
+      // identifies its run and that run is no longer active. The server also
+      // broadcasts the same entry on a meta refresh, so reconciliation (not a
+      // local array check) handles deduplication.
+      const evRun = ev.run_id || ev.runId || ''
+      if (evRun && activeRun && evRun !== activeRun) return
+      appendMessage(msg)
       requestAnimationFrame(() => scrollDown())
     })
     es.onerror = () => {
@@ -113,8 +139,13 @@
   }
 
   async function loadPrimary() {
+    // Claim the selection for the initial load; a navigation that starts a
+    // newer selection in the meantime must win, so every continuation is
+    // re-checked against the live generation.
+    const loadSelection = ++selectionSeq
     try {
       const convs = await api.get('/api/conversations')
+      if (loadSelection !== selectionSeq) return
 
       const url = new URL(window.location.href)
       const convId = url.searchParams.get('conv')
@@ -129,7 +160,8 @@
         conv = await api.post('/api/conversations', {})
         pushUrl('/?conv=' + conv.id)
       }
-      await selectConversation(conv)
+      if (loadSelection !== selectionSeq) return
+      await selectConversation(conv, loadSelection)
     } catch (e) {
       console.error('Failed to load conversation', e)
     } finally {
@@ -144,36 +176,77 @@
     }
   }
 
+  // beginSelection claims the newest selection generation and invalidates
+  // every outstanding conversation-scoped asynchronous operation (pending
+  // sends, heals, and metadata refreshes) so none of them can apply after the
+  // new selection has started.
+  function beginSelection() {
+    selectionSeq += 1
+    conversationEpoch += 1
+    sendSeq += 1
+    healSeq += 1
+    metaSeq += 1
+  }
+
   async function selectConversationById(id) {
+    beginSelection()
+    const selection = selectionSeq
     try {
       const full = await api.get('/api/conversations/' + id)
-      applyConversation(full)
+      if (selection === selectionSeq) applyConversation(full)
     } catch (e) {
       console.error('Failed to load conversation', e)
     }
   }
 
-  async function selectConversation(conv) {
+  async function selectConversation(conv, expectedSelection = null) {
+    // When expectedSelection is provided (initial load), the caller has
+    // already claimed the generation; only continue while it is still the
+    // newest one so a later navigation cannot be superseded.
+    if (expectedSelection === null) {
+      beginSelection()
+    } else if (expectedSelection !== selectionSeq) {
+      return
+    }
+    const selection = selectionSeq
     try {
       const full = await api.get('/api/conversations/' + conv.id)
-      applyConversation(full)
+      if (selection === selectionSeq) applyConversation(full)
     } catch (e) {
       console.error('Failed to load conversation', e)
     }
   }
 
   function applyConversation(full) {
+    // Reset all conversation-scoped async state: close any live stream, drop
+    // stale generations, and rebuild the visible list from the authoritative
+    // server snapshot.
+    conversationEpoch += 1
+    sendSeq += 1
+    healSeq += 1
+    metaSeq += 1
+    eventSource?.close()
+    eventSource = null
+    activeRun = ''
     currentConv = full
-    messages = full.messages || []
+    messages = mergeMessages([], full.messages || [])
+    sending = false
+    stream = { runId: '', status: '', raw: '', html: '' }
     pushUrl('/?conv=' + full.id)
     requestAnimationFrame(() => scrollDown())
     if (full.active_run_id) {
-      startStream(full.active_run_id)
+      startStream(full.active_run_id, full.id)
     }
   }
 
   async function sendMessage() {
     if (sending || !newMessage.trim() || !currentConv) return
+    const convId = currentConv.id
+    // The send is scoped to this conversation's selection epoch and its own
+    // send generation; any selection, newer send, or conversation reset makes
+    // the in-flight POST stale so it can never start or mutate a newer run.
+    const send = ++sendSeq
+    const sendEpoch = conversationEpoch
     const content = newMessage
     newMessage = ''
     if (inputEl) {
@@ -182,29 +255,50 @@
     }
     sending = true
     notice = ''
-    messages = [...messages, { role: 'user', content }]
+    appendMessage({ role: 'user', content })
     requestAnimationFrame(() => scrollDown())
 
     try {
-      const result = await api.post('/api/conversations/' + currentConv.id + '/messages', { content })
-      startStream(result.run_id)
+      const result = await api.post('/api/conversations/' + convId + '/messages', { content })
+      if (send === sendSeq && sendEpoch === conversationEpoch && currentConv?.id === convId) {
+        startStream(result.run_id, convId, send)
+      }
     } catch (e) {
+      if (send !== sendSeq || sendEpoch !== conversationEpoch || currentConv?.id !== convId) return
       sending = false
       console.error('Failed to send message', e)
-      messages = [...messages, { role: 'assistant', content: '⚠️ Failed to send message. (' + e.message + ')' }]
+      appendMessage({ role: 'assistant', content: '⚠️ Failed to send message. (' + e.message + ')' })
       scrollDown()
     }
   }
 
-  function startStream(runId) {
+  function startStream(runId, convId = currentConv?.id, sendGeneration = sendSeq) {
+    if (!runId || !convId) return
+    // A stream may only start while its send generation is still current and
+    // the visible conversation still matches; stale sends and streams left
+    // over from a previous selection are rejected outright.
+    if (sendGeneration !== sendSeq || currentConv?.id !== convId) return
     eventSource?.close()
-    eventSource = null
-    stream = { runId, status: 'Thinking', raw: '', html: '' }
+    activeRun = runId
 
     const es = new EventSource('/runs/' + runId + '/events')
     eventSource = es
+    stream = { runId, status: 'Thinking', raw: '', html: '' }
+
+    // current() is the single ownership check for every stream callback: the
+    // run must still be the active one, this EventSource instance must still
+    // be the attached one, and the visible conversation must still match.
+    const current = () => activeRun === runId && eventSource === es && currentConv?.id === convId
+    const clear = () => {
+      if (!current()) return false
+      eventSource = null
+      activeRun = ''
+      stream = { runId: '', status: '', raw: '', html: '' }
+      return true
+    }
 
     es.addEventListener('token', (e) => {
+      if (!current()) return
       stream.status = ''
       stream.raw += e.data
       stream.html = renderMarkdown(stream.raw)
@@ -212,79 +306,107 @@
     })
 
     es.addEventListener('status', (e) => {
-      stream.status = e.data
+      if (current()) stream.status = e.data
     })
 
     es.addEventListener('done', (e) => {
+      if (!current()) return
       es.close()
-      eventSource = null
-      if (e.data) {
-        messages = [...messages, { role: 'assistant', content: e.data }]
-      }
-      stream = { runId: '', status: '', raw: '', html: '' }
+      if (e.data) appendMessage({ role: 'assistant', content: e.data })
+      clear()
       sending = false
       scrollDown()
-      refreshConversationMeta()
+      refreshConversationMeta(convId)
     })
 
     es.addEventListener('error', (e) => {
-      if (!e.data) return
+      if (!e.data || !current()) return
       es.close()
-      eventSource = null
-      stream = { runId: '', status: '', raw: '', html: '' }
-      messages = [...messages, { role: 'assistant', content: e.data }]
-      scrollDown()
+      if (e.data) appendMessage({ role: 'assistant', content: e.data })
+      clear()
       sending = false
-      refreshConversationMeta()
+      scrollDown()
+      refreshConversationMeta(convId)
     })
 
     es.onerror = () => {
-      if (es.readyState === EventSource.CLOSED) return
+      if (es.readyState === EventSource.CLOSED || !current()) return
       es.close()
-      eventSource = null
       const partial = stream.raw
-      stream = { runId: '', status: '', raw: '', html: '' }
-      if (partial && partial.trim()) {
-        messages = [...messages, { role: 'assistant', content: partial }]
+      if (clear() && partial && partial.trim()) {
+        appendMessage({ role: 'assistant', content: partial })
         scrollDown()
       }
       sending = false
-      healConversation()
+      healConversation(convId, runId)
     }
   }
 
-  async function healConversation() {
-    const convId = currentConv?.id
+  async function healConversation(convId = currentConv?.id, runId = '') {
     if (!convId) return
+    // The heal is scoped to its own generation plus the conversation's
+    // selection epoch, send generation, and conversation id. Any newer
+    // selection, run, or send invalidates it — including a newer run that
+    // has already completed by the time this heal response returns — so a
+    // stale heal can never overwrite newer conversation state.
+    const heal = ++healSeq
+    const healEpoch = conversationEpoch
+    const healSend = sendSeq
     const deadline = Date.now() + 20000
+    const currentHeal = () => isCurrentHeal({
+      heal,
+      currentHeal: healSeq,
+      epoch: healEpoch,
+      currentEpoch: conversationEpoch,
+      send: healSend,
+      currentSend: sendSeq,
+      convId,
+      currentConvId: currentConv?.id,
+    }) && (activeRun === '' || activeRun === runId)
     while (Date.now() < deadline) {
       await sleep(500)
+      if (!currentHeal()) return
       let full
       try {
         full = await api.get('/api/conversations/' + convId)
       } catch {
         continue
       }
+      if (!currentHeal()) return
       currentConv = full
       if (full.active_run_id) continue
-      if (full.messages && full.messages.length > 0) {
-        messages = full.messages
-        requestAnimationFrame(() => scrollDown())
-      }
+      // Merge rather than replace: locally visible optimistic/streamed
+      // entries survive and the persisted snapshot deduplicates by identity.
+      messages = mergeMessages(messages, full.messages || [])
+      requestAnimationFrame(() => scrollDown())
       return
     }
-    notice = 'The connection to the agent was lost. The response may still be processing — try refreshing.'
+    if (currentHeal()) {
+      notice = 'The connection to the agent was lost. The response may still be processing — try refreshing.'
+    }
   }
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
-  async function refreshConversationMeta() {
-    if (!currentConv) return
+  async function refreshConversationMeta(convId = currentConv?.id) {
+    if (!convId) return
+    // Metadata refreshes are conversation- and generation-scoped: a refresh
+    // started before a newer selection, run, or send can never overwrite the
+    // newer state when its response finally arrives.
+    const meta = ++metaSeq
+    const selection = selectionSeq
+    const epoch = conversationEpoch
+    const send = sendSeq
     try {
-      const full = await api.get('/api/conversations/' + currentConv.id)
-      currentConv = full
+      const full = await api.get('/api/conversations/' + convId)
+      if (meta !== metaSeq || selection !== selectionSeq || epoch !== conversationEpoch ||
+          send !== sendSeq || currentConv?.id !== convId) {
+        return
+      }
+      currentConv = { ...currentConv, ...full }
+      messages = mergeMessages(messages, full.messages || [])
     } catch {}
   }
 
@@ -383,7 +505,7 @@
       {/if}
 
       <div class="chat-body" bind:this={messageListEl}>
-        {#each messages as msg, i (msg.id ?? i)}
+        {#each messages as msg, i (msg._clientId)}
           {#if i > 0 && gapBetween(messages[i - 1], msg)}
             <div class="time-gap">{gapBetween(messages[i - 1], msg)}</div>
           {/if}
