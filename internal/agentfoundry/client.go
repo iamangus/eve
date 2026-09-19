@@ -86,6 +86,18 @@ func IsNotFound(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }
 
+// IsStaleRun reports whether AgentFoundry rejected a run reference because the
+// run no longer exists or is no longer active, for example after a server
+// restart or when the run failed. Callers should recreate the run.
+func IsStaleRun(err error) bool {
+	var apiErr *HTTPError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.StatusCode == http.StatusNotFound ||
+		(apiErr.StatusCode == http.StatusConflict && strings.Contains(apiErr.Body, "run is not active"))
+}
+
 func NewClient(baseURL, apiKey string) (*Client, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {

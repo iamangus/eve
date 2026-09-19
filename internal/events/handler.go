@@ -135,7 +135,7 @@ func (h *Handler) deliver(ctx context.Context, event *Event) error {
 		return err
 	}
 	_, err = h.client.SendPersistentRunInputWithMetadata(ctx, runID, string(message), event.ID, map[string]string{"source": event.Source})
-	if agentfoundry.IsNotFound(err) {
+	if agentfoundry.IsStaleRun(err) {
 		runID, err = h.client.CreatePersistentRun(ctx, agentID, agentfoundry.PersistentRunOptions{MCPServers: mcpServers})
 		if err == nil {
 			err = h.store.SetPersistentRun(scope, runID)

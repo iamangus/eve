@@ -84,3 +84,13 @@ func TestSendPersistentRunInputReturnsNotFound(t *testing.T) {
 		t.Fatalf("expected not-found error, got %v", err)
 	}
 }
+
+func TestIsStaleRunCoversConflict(t *testing.T) {
+	conflict := &HTTPError{StatusCode: http.StatusConflict, Status: "409 Conflict", Body: "{\"error\":\"run is not active\",\"status\":\"failed\"}"}
+	if !IsStaleRun(conflict) {
+		t.Fatal("409 run-is-not-active should be treated as a stale run")
+	}
+	if IsStaleRun(&HTTPError{StatusCode: http.StatusConflict, Body: "different conflict"}) {
+		t.Fatal("unrelated 409 should not be treated as stale")
+	}
+}
