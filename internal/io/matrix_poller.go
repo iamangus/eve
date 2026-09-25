@@ -204,6 +204,7 @@ func (p *MatrixPoller) handleMessage(ctx context.Context, evt *event.Event) {
 		Sender:    evt.Sender.String(),
 		Text:      text,
 		ThreadRef: evt.RoomID.String(),
+		SourceID:  evt.ID.String(),
 	}); err != nil {
 		slog.Warn("matrix inbound", "room", evt.RoomID, "sender", evt.Sender, "error", err)
 	}

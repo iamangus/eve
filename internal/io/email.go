@@ -2,13 +2,14 @@ package io
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"net/smtp"
 	"strings"
 
 	"github.com/iamangus/eve/internal/store"
-
 )
 
 // SMTPConfig configures outbound email delivery. Empty host disables the
@@ -38,6 +39,9 @@ type emailAdapter struct {
 func (a *emailAdapter) Type() ChannelType { return ChannelEmail }
 
 func (a *emailAdapter) Send(ctx context.Context, msg OutboundMessage) error {
+	if a.store.HasAssistantForTurn(msg.ConversationID, msg.TurnID) {
+		return nil
+	}
 	to := msg.Recipient
 	if to == "" {
 		return fmt.Errorf("email: no recipient")
@@ -50,14 +54,17 @@ func (a *emailAdapter) Send(ctx context.Context, msg OutboundMessage) error {
 			return fmt.Errorf("email: unresolved recipient %q", msg.Recipient)
 		}
 	}
-	if err := a.cfg.Send(ctx, to, msg.Text); err != nil {
+	if err := a.cfg.Send(ctx, to, msg.Text, msg.TurnID); err != nil {
 		return err
 	}
 	// Record the delivery in the conversation so the web UI shows it as a
 	// message Eve sent via email, tagged with the email channel.
-	m, err := a.store.AppendAssistantMessageReturn(msg.ConversationID, "", msg.Text, "email", "eve")
+	m, created, err := a.store.AppendAssistantForTurn(msg.ConversationID, "", msg.TurnID, msg.Text, "email", "eve")
 	if err != nil {
 		return err
+	}
+	if !created {
+		return nil
 	}
 	a.hub.Broadcast(Event{
 		Type:   EventMessage,
@@ -69,19 +76,21 @@ func (a *emailAdapter) Send(ctx context.Context, msg OutboundMessage) error {
 
 // Send delivers a plain-text email to one recipient through the configured
 // SMTP server.
-func (c SMTPConfig) Send(ctx context.Context, to, body string) error {
+func (c SMTPConfig) Send(ctx context.Context, to, body string, turnIDs ...string) error {
 	addr := fmt.Sprintf("%s:%d", c.Host, c.Port)
 	var auth smtp.Auth
 	if c.Username != "" || c.Password != "" {
 		auth = smtp.PlainAuth("", c.Username, c.Password, c.Host)
 	}
-	msg := strings.Join([]string{
+	headers := []string{
 		"From: " + c.From,
 		"To: " + to,
 		"Subject: Eve",
-		"",
-		body,
-	}, "\r\n")
+	}
+	if len(turnIDs) > 0 && turnIDs[0] != "" {
+		headers = append(headers, "Message-ID: "+stableMessageID(turnIDs[0], to, c.From))
+	}
+	msg := strings.Join(append(headers, "", body), "\r\n")
 	var conn *smtp.Client
 	var err error
 	if c.Port == 465 {
@@ -127,4 +136,13 @@ func (c SMTPConfig) Send(ctx context.Context, to, body string) error {
 		return fmt.Errorf("email: quit: %w", err)
 	}
 	return nil
+}
+
+func stableMessageID(turnID, to, from string) string {
+	sum := sha256.Sum256([]byte(turnID + "\x00" + to))
+	domain := "eve.local"
+	if _, addressDomain, ok := strings.Cut(from, "@"); ok {
+		domain = strings.TrimSuffix(strings.TrimSpace(addressDomain), ">")
+	}
+	return "<eve-" + hex.EncodeToString(sum[:16]) + "@" + domain + ">"
 }

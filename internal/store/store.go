@@ -12,12 +12,16 @@ import (
 )
 
 var ErrNotFound = errors.New("conversation not found")
+var ErrSourceConflict = errors.New("source ID already belongs to a different message")
+var ErrDeleteInProgress = errors.New("conversation deletion already in progress")
 
 type Message struct {
 	ID        int64     `json:"id"`
 	Role      string    `json:"role"`
 	Content   string    `json:"content"`
 	RunID     string    `json:"run_id,omitempty"`
+	TurnID    string    `json:"turn_id,omitempty"`
+	SourceID  string    `json:"source_id,omitempty"`
 	Channel   string    `json:"channel,omitempty"`
 	Sender    string    `json:"sender,omitempty"`
 	ThreadRef string    `json:"thread_ref,omitempty"`
@@ -26,13 +30,17 @@ type Message struct {
 }
 
 type Conversation struct {
-	ID             string    `json:"id"`
-	Title          string    `json:"title"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
-	ActiveRunID    string    `json:"active_run_id,omitempty"`
-	SummarizedUpTo int64     `json:"summarized_up_to,omitempty"`
-	Messages       []Message `json:"messages,omitempty"`
+	ID                string    `json:"id"`
+	Title             string    `json:"title"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	ActiveRunID       string    `json:"active_run_id,omitempty"`
+	ActiveMessageID   int64     `json:"active_message_id,omitempty"`
+	ActiveSubmitted   bool      `json:"active_submitted,omitempty"`
+	DeliveryFailures  int       `json:"delivery_failures,omitempty"`
+	PendingMessageIDs []int64   `json:"pending_message_ids,omitempty"`
+	SummarizedUpTo    int64     `json:"summarized_up_to,omitempty"`
+	Messages          []Message `json:"messages,omitempty"`
 }
 
 type ConversationSummary struct {
@@ -44,15 +52,21 @@ type ConversationSummary struct {
 }
 
 type conversationRecord struct {
-	Title          string    `json:"title"`
-	Created        time.Time `json:"created"`
-	Updated        time.Time `json:"updated"`
-	ActiveRunID    string    `json:"active_run_id,omitempty"`
-	Messages       []Message `json:"messages"`
-	NextMsgID      int64     `json:"next_msg_id"`
-	Participants   []string  `json:"participants,omitempty"`
-	HistorianRunAt time.Time `json:"historian_run_at,omitempty"`
-	HistorianError string    `json:"historian_error,omitempty"`
+	Title              string           `json:"title"`
+	Created            time.Time        `json:"created"`
+	Updated            time.Time        `json:"updated"`
+	ActiveRunID        string           `json:"active_run_id,omitempty"`
+	ActiveMessageID    int64            `json:"active_message_id,omitempty"`
+	ActiveSubmitted    bool             `json:"active_submitted,omitempty"`
+	DeliveryFailures   int              `json:"delivery_failures,omitempty"`
+	NextDeliveryAt     time.Time        `json:"next_delivery_at,omitempty"`
+	ActiveRunMessages  map[string]int64 `json:"active_run_messages,omitempty"`
+	PendingOwnerInputs []int64          `json:"pending_owner_inputs,omitempty"`
+	Messages           []Message        `json:"messages"`
+	NextMsgID          int64            `json:"next_msg_id"`
+	Participants       []string         `json:"participants,omitempty"`
+	HistorianRunAt     time.Time        `json:"historian_run_at,omitempty"`
+	HistorianError     string           `json:"historian_error,omitempty"`
 }
 
 // Store is a JSON-file-backed conversation store. It survives process
@@ -66,6 +80,7 @@ type Store struct {
 	compartments   map[string][]Compartment
 	memories       []Memory
 	persistentRuns map[string]string
+	deleting       map[string]bool
 }
 
 func New(dir string) (*Store, error) {
@@ -77,6 +92,7 @@ func New(dir string) (*Store, error) {
 		convs:          make(map[string]*conversationRecord),
 		compartments:   make(map[string][]Compartment),
 		persistentRuns: make(map[string]string),
+		deleting:       make(map[string]bool),
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -150,6 +166,28 @@ func (s *Store) saveConversations() error {
 	return s.saveJSON("conversations.json", s.convs)
 }
 
+func cloneConversationRecord(r *conversationRecord) conversationRecord {
+	copy := *r
+	copy.Messages = append([]Message(nil), r.Messages...)
+	copy.PendingOwnerInputs = append([]int64(nil), r.PendingOwnerInputs...)
+	copy.Participants = append([]string(nil), r.Participants...)
+	if r.ActiveRunMessages != nil {
+		copy.ActiveRunMessages = make(map[string]int64, len(r.ActiveRunMessages))
+		for runID, messageID := range r.ActiveRunMessages {
+			copy.ActiveRunMessages[runID] = messageID
+		}
+	}
+	return copy
+}
+
+func (s *Store) saveConversationLocked(id string, before conversationRecord) error {
+	if err := s.saveConversations(); err != nil {
+		*s.convs[id] = before
+		return err
+	}
+	return nil
+}
+
 func (s *Store) PersistentRun(scope string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -159,10 +197,19 @@ func (s *Store) PersistentRun(scope string) string {
 func (s *Store) SetPersistentRun(scope, runID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous, existed := s.persistentRuns[scope]
 	if runID == "" {
 		delete(s.persistentRuns, scope)
 	} else {
 		s.persistentRuns[scope] = runID
 	}
-	return s.saveJSON("persistent_runs.json", s.persistentRuns)
+	if err := s.saveJSON("persistent_runs.json", s.persistentRuns); err != nil {
+		if existed {
+			s.persistentRuns[scope] = previous
+		} else {
+			delete(s.persistentRuns, scope)
+		}
+		return err
+	}
+	return nil
 }

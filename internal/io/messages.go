@@ -5,10 +5,12 @@ package io
 // transcript. ThreadRef carries the medium's threading identifier (email
 // Message-ID, matrix room id, etc.) so replies can be threaded correctly.
 type InboundMessage struct {
-	Channel   ChannelType `json:"channel"`
-	Sender    string      `json:"sender"` // identity name or raw address
-	Text      string      `json:"text"`
-	ThreadRef string      `json:"thread_ref,omitempty"`
+	Channel      ChannelType `json:"channel"`
+	Sender       string      `json:"sender"`
+	Text         string      `json:"text"`
+	ThreadRef    string      `json:"thread_ref,omitempty"`
+	SourceID     string      `json:"source_id,omitempty"`
+	TrustedOwner bool        `json:"-"`
 }
 
 // OutboundMessage is the canonical form of a message being delivered through
@@ -20,6 +22,7 @@ type OutboundMessage struct {
 	Text           string      `json:"text"`
 	ThreadRef      string      `json:"thread_ref,omitempty"`
 	ConversationID string      `json:"conversation_id,omitempty"`
+	TurnID         string      `json:"turn_id,omitempty"`
 }
 
 // Purpose classifies why a message is being sent. The routing agent uses it
@@ -37,6 +40,7 @@ const (
 // non-owner participant mechanically pins the destination to the origin.
 type SendRequest struct {
 	ConversationID string
+	TurnID         string
 	Content        string
 	Purpose        string
 	Origin         ChannelType

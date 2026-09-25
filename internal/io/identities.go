@@ -71,20 +71,38 @@ func LoadResolver(dir string) (*Resolver, error) {
 		if id.Name == "" {
 			continue
 		}
+		if id.Name == "other" {
+			return nil, errors.New("reserved identity name: other")
+		}
+		if _, exists := r.byName[id.Name]; exists {
+			return nil, fmt.Errorf("duplicate identity name: %s", id.Name)
+		}
 		r.byName[id.Name] = id
-		if id.Owner && r.owner == nil {
+		if id.Owner {
+			if r.owner != nil {
+				return nil, errors.New("multiple owner identities configured")
+			}
 			r.owner = id
 		}
 		for _, c := range id.Channels {
 			if c.Address == "" {
 				continue
 			}
-			r.byKey[key(c.Type, c.Address)] = id.Name
+			k := key(c.Type, c.Address)
+			if existing, exists := r.byKey[k]; exists {
+				return nil, fmt.Errorf("channel address %s is shared by %s and %s", k, existing, id.Name)
+			}
+			r.byKey[k] = id.Name
 		}
 	}
 	if r.owner == nil {
-		r.owner = &Identity{Name: "owner", Owner: true}
-		r.byName["owner"] = r.owner
+		if existing := r.byName["owner"]; existing != nil {
+			existing.Owner = true
+			r.owner = existing
+		} else {
+			r.owner = &Identity{Name: "owner", Owner: true}
+			r.byName["owner"] = r.owner
+		}
 	}
 	return r, nil
 }
@@ -93,21 +111,13 @@ func key(t ChannelType, address string) string {
 	return string(t) + "/" + address
 }
 
-// Resolve returns the identity for a given {channel, address}. The address is
-// first matched against the provenance map; if no channel/address key matches,
-// it is tried as an identity name directly (adapters that pass the owner's
-// name, e.g. webhook defaults). Unknown senders resolve to the generic
-// "other" identity.
 func (r *Resolver) Resolve(t ChannelType, address string) *Identity {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if name, ok := r.byKey[key(t, address)]; ok {
 		if id, ok := r.byName[name]; ok {
-			return id
+			return cloneIdentity(id)
 		}
-	}
-	if id, ok := r.byName[address]; ok {
-		return id
 	}
 	o := r.other
 	return &o
@@ -117,7 +127,7 @@ func (r *Resolver) Resolve(t ChannelType, address string) *Identity {
 func (r *Resolver) ResolveName(name string) *Identity {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.byName[name]
+	return cloneIdentity(r.byName[name])
 }
 
 // Owner returns the owner identity.
@@ -128,7 +138,7 @@ func (r *Resolver) Owner() *Identity {
 		o := r.other
 		return &o
 	}
-	return r.owner
+	return cloneIdentity(r.owner)
 }
 
 // IsOwner reports whether the given identity name is the owner.
@@ -142,10 +152,19 @@ func (r *Resolver) List() []Identity {
 	defer r.mu.RUnlock()
 	out := make([]Identity, 0, len(r.byName))
 	for _, id := range r.byName {
-		out = append(out, *id)
+		out = append(out, *cloneIdentity(id))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+func cloneIdentity(id *Identity) *Identity {
+	if id == nil {
+		return nil
+	}
+	copy := *id
+	copy.Channels = append([]IdentityChannel(nil), id.Channels...)
+	return &copy
 }
 
 // Upsert creates or replaces an identity and persists the change. Identity
@@ -162,14 +181,27 @@ func (r *Resolver) Upsert(in Identity) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if existing := r.byName[in.Name]; existing != nil && existing.Owner && !in.Owner {
+		return errors.New("cannot demote the owner without a replacement")
+	}
 
 	channels := make([]IdentityChannel, 0, len(in.Channels))
+	seen := make(map[string]bool)
 	for _, c := range in.Channels {
 		if c.Address == "" {
 			continue
 		}
+		k := key(c.Type, c.Address)
+		if seen[k] {
+			return fmt.Errorf("duplicate channel address: %s", k)
+		}
+		seen[k] = true
+		if owner, exists := r.byKey[k]; exists && owner != in.Name {
+			return fmt.Errorf("channel address %s belongs to %s", k, owner)
+		}
 		channels = append(channels, c)
 	}
+	previous := r.snapshotLocked()
 
 	if existing, ok := r.byName[in.Name]; ok {
 		// Remove stale provenance keys before applying the new channel set.
@@ -190,7 +222,11 @@ func (r *Resolver) Upsert(in Identity) error {
 		for _, c := range channels {
 			r.byKey[key(c.Type, c.Address)] = in.Name
 		}
-		return r.saveLocked()
+		if err := r.saveLocked(); err != nil {
+			r.restoreLocked(previous)
+			return err
+		}
+		return nil
 	}
 
 	// New identity.
@@ -204,7 +240,11 @@ func (r *Resolver) Upsert(in Identity) error {
 	for _, c := range channels {
 		r.byKey[key(c.Type, c.Address)] = id.Name
 	}
-	return r.saveLocked()
+	if err := r.saveLocked(); err != nil {
+		r.restoreLocked(previous)
+		return err
+	}
+	return nil
 }
 
 // Delete removes an identity and persists the change. The owner identity and
@@ -222,11 +262,44 @@ func (r *Resolver) Delete(name string) error {
 	if id.Owner {
 		return errors.New("cannot delete the owner identity")
 	}
+	previous := r.snapshotLocked()
 	for _, c := range id.Channels {
 		delete(r.byKey, key(c.Type, c.Address))
 	}
 	delete(r.byName, name)
-	return r.saveLocked()
+	if err := r.saveLocked(); err != nil {
+		r.restoreLocked(previous)
+		return err
+	}
+	return nil
+}
+
+type resolverSnapshot struct {
+	byKey     map[string]string
+	byName    map[string]*Identity
+	ownerName string
+}
+
+func (r *Resolver) snapshotLocked() resolverSnapshot {
+	s := resolverSnapshot{byKey: make(map[string]string, len(r.byKey)), byName: make(map[string]*Identity, len(r.byName))}
+	for k, v := range r.byKey {
+		s.byKey[k] = v
+	}
+	for name, id := range r.byName {
+		copy := *id
+		copy.Channels = append([]IdentityChannel(nil), id.Channels...)
+		s.byName[name] = &copy
+	}
+	if r.owner != nil {
+		s.ownerName = r.owner.Name
+	}
+	return s
+}
+
+func (r *Resolver) restoreLocked(s resolverSnapshot) {
+	r.byKey = s.byKey
+	r.byName = s.byName
+	r.owner = s.byName[s.ownerName]
 }
 
 // demoteOwnerLocked clears the owner flag on the current owner. Caller must

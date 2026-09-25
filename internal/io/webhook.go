@@ -7,7 +7,7 @@ import "net/http"
 // router, which routes replies/notifications to whichever output channel is
 // reachable (the owner cannot receive Eve's answer on a speakerless device).
 type WebhookConfig struct {
-	SMSToken  string
+	SMSToken   string
 	VoiceToken string
 }
 
@@ -55,9 +55,10 @@ func (m *Manager) webhookInbound(ch ChannelType, token string) http.HandlerFunc 
 			return
 		}
 		var body struct {
-			Sender    string `json:"sender"`
-			Text      string `json:"text"`
+			Sender     string `json:"sender"`
+			Text       string `json:"text"`
 			Transcript string `json:"transcript"` // voice STT payload
+			SourceID   string `json:"source_id"`
 		}
 		if err := decodeJSON(r, &body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
@@ -71,13 +72,16 @@ func (m *Manager) webhookInbound(ch ChannelType, token string) http.HandlerFunc 
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text or transcript is required"})
 			return
 		}
-		if body.Sender == "" {
+		trustedOwner := body.Sender == ""
+		if trustedOwner {
 			body.Sender = m.Ident.Owner().Name
 		}
 		if _, err := m.Inbound(r.Context(), InboundMessage{
-			Channel: ch,
-			Sender:  body.Sender,
-			Text:    text,
+			Channel:      ch,
+			Sender:       body.Sender,
+			Text:         text,
+			SourceID:     body.SourceID,
+			TrustedOwner: trustedOwner,
 		}); err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return

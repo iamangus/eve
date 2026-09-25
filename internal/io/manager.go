@@ -123,7 +123,7 @@ func NewManager(st *store.Store, client *agentfoundry.Client, cfg Config) (*Mana
 	mcpSrv := []agentfoundry.MCPServer{}
 	if cfg.EVEMCPChatURL != "" {
 		mcpSrv = append(mcpSrv, agentfoundry.MCPServer{
-			Name:      "eve",
+			Name:      "eve-chat",
 			URL:       cfg.EVEMCPChatURL,
 			Transport: "streamable-http",
 		})
@@ -324,17 +324,11 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// Inbound routes a message that arrived through a channel adapter into a
-// conversation and (when it is the owner speaking) triggers Eve's run. The
-// web handler calls this for its own incoming messages; channel adapters
-// (email, matrix, …) call it too so every mouth funnels through one path.
-//
-// Owner messages land in the primary conversation and start a run. Third
-// party messages are appended to the owner conversation as user messages so
-// Eve sees them, but no run is auto-triggered here — the calling adapter is
-// responsible for what happens next (trigger handling etc.).
 func (m *Manager) Inbound(ctx context.Context, msg InboundMessage) (runID string, err error) {
 	ident := m.Ident.Resolve(msg.Channel, msg.Sender)
+	if msg.TrustedOwner {
+		ident = m.Ident.Owner()
+	}
 	sender := "owner"
 	if ident != nil {
 		sender = ident.Name
@@ -347,13 +341,28 @@ func (m *Manager) Inbound(ctx context.Context, msg InboundMessage) (runID string
 		}
 		convID = c.ID
 	}
-	appended, err := m.store.AppendUserMessageReturn(convID, msg.Text, string(msg.Channel), sender, msg.ThreadRef, msg.Sender)
+	owner := m.Ident.IsOwner(sender)
+	var appended *store.Message
+	if owner {
+		var created bool
+		appended, created, err = m.store.AppendQueuedOwnerMessageWithSource(convID, msg.Text, string(msg.Channel), sender, msg.ThreadRef, msg.Sender, msg.SourceID)
+		if err == nil && !created {
+			runID, drainErr := m.DrainPending(ctx, convID)
+			if drainErr != nil {
+				slog.Warn("retry existing queued owner message", "conv", convID, "message", appended.ID, "error", drainErr)
+				return "", nil
+			}
+			return runID, nil
+		}
+	} else {
+		appended, err = m.store.AppendUserMessageReturn(convID, msg.Text, string(msg.Channel), sender, msg.ThreadRef, msg.Sender)
+	}
 	if err != nil {
 		return "", err
 	}
 	m.Hub.Broadcast(Event{Type: EventMessage, ConvID: convID, Data: appended})
 	m.Reg.Touch(string(msg.Channel))
-	if !m.Ident.IsOwner(sender) {
+	if !owner {
 		// Unknown / non-owner senders are persisted so Eve sees them, but no
 		// run is triggered. Log loudly: a missing identities.json entry must
 		// never look like the message vanished.
@@ -361,24 +370,136 @@ func (m *Manager) Inbound(ctx context.Context, msg InboundMessage) (runID string
 			"channel", msg.Channel, "sender", msg.Sender, "identity", sender)
 		return "", nil
 	}
-	history, _, herr := m.renderHistory(convID)
-	if herr != nil {
-		slog.Warn("render history", "conv", convID, "error", herr)
-		history = nil
-	}
-	history = m.withTaskBoard(history)
-	runID, err = m.client.RunAgentWith(ctx, m.assistantAgentID(), agentfoundry.RunOptions{
-		Message:    msg.Text,
-		History:    history,
-		MCPServers: m.mcpSrv,
-	})
+	runID, err = m.DrainPending(ctx, convID)
 	if err != nil {
-		return "", err
-	}
-	if err := m.store.SetActiveRun(convID, runID); err != nil {
-		slog.Warn("set active run", "conv", convID, "run", runID, "error", err)
+		slog.Warn("owner message queued for retry", "conv", convID, "message", appended.ID, "error", err)
+		return "", nil
 	}
 	return runID, nil
+}
+
+func (m *Manager) DrainPending(ctx context.Context, convID string) (string, error) {
+	msg, err := m.store.PendingOwnerMessage(convID)
+	if err != nil || msg == nil {
+		return "", err
+	}
+	scope := "frontend-v2:" + convID
+	runID := m.store.PersistentRun(scope)
+	if runID == "" {
+		history, err := m.BootstrapHistory(convID, msg.ID)
+		if err != nil {
+			return "", err
+		}
+		runID, err = m.client.CreatePersistentRun(ctx, m.assistantAgentID(), agentfoundry.PersistentRunOptions{MCPServers: m.mcpSrv, ClientKey: scope, History: history})
+		if err != nil {
+			return "", err
+		}
+		if err := m.store.SetPersistentRun(scope, runID); err != nil {
+			return "", err
+		}
+	}
+	claimed, err := m.store.ClaimPendingOwnerMessage(convID, runID, msg.ID)
+	if err != nil || !claimed {
+		return "", err
+	}
+	if err := m.submitOwnerInput(ctx, convID, runID, msg); err != nil {
+		return runID, err
+	}
+	return runID, nil
+}
+
+func (m *Manager) BootstrapHistory(convID string, beforeID int64) ([]agentfoundry.Message, error) {
+	history, _, err := m.renderHistoryBefore(convID, beforeID)
+	if err != nil {
+		return nil, err
+	}
+	return boundedHistory(m.withTaskBoard(history)), nil
+}
+
+func boundedHistory(history []agentfoundry.Message) []agentfoundry.Message {
+	const maxMessages = 120
+	const maxBytes = 256 * 1024
+	start, size := len(history), 0
+	for start > 0 && len(history)-start < maxMessages {
+		next := len(fmt.Sprint(history[start-1].Content))
+		if size+next > maxBytes && start < len(history) {
+			break
+		}
+		size += next
+		start--
+	}
+	selected := append([]agentfoundry.Message(nil), history[start:]...)
+	if len(selected) > 0 && len(fmt.Sprint(selected[0].Content)) > maxBytes {
+		text := fmt.Sprint(selected[0].Content)
+		selected[0].Content = "[Earlier content truncated.]\n" + strings.ToValidUTF8(text[len(text)-maxBytes/2:], "")
+	}
+	if start == 0 {
+		return selected
+	}
+	return append([]agentfoundry.Message{{Role: "user", Content: "[Earlier conversation context omitted to fit the run's initial history.]"}}, selected...)
+}
+
+func (m *Manager) RetryActiveInput(ctx context.Context, convID, runID string) error {
+	msg, err := m.store.ActiveOwnerMessage(convID, runID)
+	if err != nil {
+		return err
+	}
+	return m.submitOwnerInput(ctx, convID, runID, msg)
+}
+
+func (m *Manager) submitOwnerInput(ctx context.Context, convID, runID string, msg *store.Message) error {
+	inputID := fmt.Sprintf("chat-%s-%d", convID, msg.ID)
+	_, err := m.client.SendPersistentRunInput(ctx, runID, msg.Content, inputID)
+	if err == nil {
+		return m.store.MarkActiveSubmitted(convID, runID, msg.ID)
+	}
+	if !agentfoundry.IsStaleRun(err) {
+		return err
+	}
+	scope := "frontend-v2:" + convID
+	history, historyErr := m.BootstrapHistory(convID, msg.ID)
+	if historyErr != nil {
+		return historyErr
+	}
+	replacement, createErr := m.client.CreatePersistentRun(ctx, m.assistantAgentID(), agentfoundry.PersistentRunOptions{MCPServers: m.mcpSrv, ClientKey: scope, History: history})
+	if createErr != nil {
+		return createErr
+	}
+	if err := m.store.ReplaceActiveOwnerRun(convID, runID, replacement, msg.ID); err != nil {
+		return err
+	}
+	if err := m.store.SetPersistentRun(scope, replacement); err != nil {
+		return err
+	}
+	_, err = m.client.SendPersistentRunInput(ctx, replacement, msg.Content, inputID)
+	if err != nil {
+		return err
+	}
+	return m.store.MarkActiveSubmitted(convID, replacement, msg.ID)
+}
+
+func (m *Manager) MigrateLegacyRuns(ctx context.Context) {
+	for _, conv := range m.store.ListConversations() {
+		old := m.store.PersistentRun("frontend:" + conv.ID)
+		if old == "" || conv.ActiveRunID == old {
+			continue
+		}
+		status, err := m.client.GetRun(ctx, old)
+		if err != nil {
+			slog.Warn("inspect legacy conversation run", "conv", conv.ID, "run", old, "error", err)
+			continue
+		}
+		if status.Status == "running" {
+			continue
+		}
+		if err := m.client.CancelRun(ctx, old); err != nil && !agentfoundry.IsNotFound(err) && !agentfoundry.IsStaleRun(err) {
+			slog.Warn("cancel legacy conversation run", "conv", conv.ID, "run", old, "error", err)
+			continue
+		}
+		if err := m.store.SetPersistentRun("frontend:"+conv.ID, ""); err != nil {
+			slog.Warn("clear legacy conversation run", "conv", conv.ID, "error", err)
+		}
+	}
 }
 
 // InboundReply is the assistant-side counterpart of Inbound: it records a
@@ -463,8 +584,11 @@ func (m *Manager) assistantAgentID() string {
 	return m.agent
 }
 
-func (m *Manager) renderHistory(convID string) ([]agentfoundry.Message, ctxmgr.RenderStats, error) {
+func (m *Manager) renderHistoryBefore(convID string, beforeID int64) ([]agentfoundry.Message, ctxmgr.RenderStats, error) {
 	if m.ctxMgr != nil {
+		if beforeID > 0 {
+			return m.ctxMgr.RenderHistoryBefore(convID, beforeID)
+		}
 		return m.ctxMgr.RenderHistory(convID)
 	}
 	prior, err := m.store.ConversationHistory(convID)
@@ -473,6 +597,9 @@ func (m *Manager) renderHistory(convID string) ([]agentfoundry.Message, ctxmgr.R
 	}
 	history := make([]agentfoundry.Message, 0, len(prior))
 	for _, msg := range prior {
+		if beforeID > 0 && msg.ID >= beforeID {
+			continue
+		}
 		history = append(history, agentfoundry.Message{Role: msg.Role, Content: msg.Content})
 	}
 	return history, ctxmgr.RenderStats{}, nil

@@ -3,14 +3,11 @@ package chat
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/iamangus/eve/internal/agentfoundry"
-	"github.com/iamangus/eve/internal/config"
 	ctxmgr "github.com/iamangus/eve/internal/context"
 	"github.com/iamangus/eve/internal/io"
 	"github.com/iamangus/eve/internal/store"
@@ -18,13 +15,11 @@ import (
 )
 
 type Handler struct {
-	store   *store.Store
-	client  *agentfoundry.Client
-	ctxMgr  *ctxmgr.Manager
-	ioMgr   *io.Manager
-	agentID string
-	mcpSrv  []agentfoundry.MCPServer
-	tasks   *tasks.Manager
+	store  *store.Store
+	client *agentfoundry.Client
+	ctxMgr *ctxmgr.Manager
+	ioMgr  *io.Manager
+	tasks  *tasks.Manager
 
 	// failedRuns tracks consecutive GetRun failures per run ID so the
 	// Reconcile loop can retry transient agentfoundry errors instead of
@@ -33,25 +28,12 @@ type Handler struct {
 	failedRuns map[string]int
 }
 
-func NewHandler(store *store.Store, client *agentfoundry.Client, cfg config.Config, ctxMgr *ctxmgr.Manager, ioMgr *io.Manager) *Handler {
-	// User-triggered runs get the chat MCP surface: task + calendar tools but
-	// no send_message. Replies are delivered mechanically to the origin
-	// channel; Eve never routes her own reply mid-conversation.
-	mcpSrv := []agentfoundry.MCPServer{}
-	if cfg.EVEMCPChatURL != "" {
-		mcpSrv = append(mcpSrv, agentfoundry.MCPServer{
-			Name:      "eve",
-			URL:       cfg.EVEMCPChatURL,
-			Transport: "streamable-http",
-		})
-	}
+func NewHandler(store *store.Store, client *agentfoundry.Client, ctxMgr *ctxmgr.Manager, ioMgr *io.Manager) *Handler {
 	return &Handler{
 		store:      store,
 		client:     client,
 		ctxMgr:     ctxMgr,
 		ioMgr:      ioMgr,
-		agentID:    cfg.AssistantAgentID,
-		mcpSrv:     mcpSrv,
 		failedRuns: make(map[string]int),
 	}
 }
@@ -103,6 +85,10 @@ func (h *Handler) getConversation(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}
+	if errors.Is(err, store.ErrDeleteInProgress) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "conversation is being deleted"})
+		return
+	}
 	if err != nil {
 		slog.Error("get conversation", "id", id, "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -116,6 +102,42 @@ func (h *Handler) getConversation(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteConversation(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	activeRunIDs, err := h.store.BeginConversationDelete(id)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, store.ErrDeleteInProgress) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		}
+		return
+	}
+	if err == nil {
+		defer h.store.EndConversationDelete(id)
+	}
+	scopes := []string{"frontend-v2:" + id, "frontend-events:" + id, "frontend:" + id}
+	runIDs := make(map[string]struct{})
+	for _, runID := range activeRunIDs {
+		runIDs[runID] = struct{}{}
+	}
+	for _, scope := range scopes {
+		if runID := h.store.PersistentRun(scope); runID != "" {
+			runIDs[runID] = struct{}{}
+		}
+	}
+	for runID := range runIDs {
+		if err := h.client.CancelRun(r.Context(), runID); err != nil && !agentfoundry.IsStaleRun(err) {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to stop conversation run"})
+			return
+		}
+	}
+	for _, scope := range scopes {
+		if h.store.PersistentRun(scope) != "" {
+			if err := h.store.SetPersistentRun(scope, ""); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to clear conversation run"})
+				return
+			}
+		}
+	}
 	if err := h.store.DeleteConversation(id); errors.Is(err, store.ErrNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
@@ -128,11 +150,14 @@ func (h *Handler) deleteConversation(w http.ResponseWriter, r *http.Request) {
 }
 
 type sendMessageRequest struct {
-	Content string `json:"content"`
+	Content  string `json:"content"`
+	ClientID string `json:"client_id,omitempty"`
 }
 
 type sendMessageResponse struct {
-	RunID string `json:"run_id"`
+	RunID     string `json:"run_id,omitempty"`
+	MessageID int64  `json:"message_id"`
+	Queued    bool   `json:"queued"`
 }
 
 func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
@@ -147,17 +172,34 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content is required"})
 		return
 	}
+	if len(req.ClientID) > 256 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "client_id is too long"})
+		return
+	}
 
 	h.ioMgr.Reg.Touch("web")
 
 	userCount, err := h.store.UserMessageCount(convID)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
 		slog.Error("count user messages", "conv", convID, "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
 
-	if err := h.store.AppendUserMessage(convID, req.Content, "web", "owner"); err != nil {
+	appended, _, err := h.store.AppendQueuedOwnerMessageWithSource(convID, req.Content, "web", "owner", "", "", req.ClientID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		if errors.Is(err, store.ErrSourceConflict) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
 		slog.Error("append user message", "conv", convID, "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
@@ -171,44 +213,12 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		_ = h.store.SetTitle(convID, defaultTitle)
 	}
 
-	persistentRunID := h.store.PersistentRun("frontend:" + convID)
-	if persistentRunID == "" {
-		persistentRunID, err = h.client.CreatePersistentRun(r.Context(), h.agentID, agentfoundry.PersistentRunOptions{MCPServers: h.mcpSrv})
-		if err == nil {
-			err = h.store.SetPersistentRun("frontend:"+convID, persistentRunID)
-		}
-	}
+	runID, err := h.ioMgr.DrainPending(r.Context(), convID)
 	if err != nil {
-		slog.Error("create frontend persistent run", "conv", convID, "error", err)
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "agent run failed"})
-		return
+		slog.Warn("queued web input for retry", "conv", convID, "message", appended.ID, "error", err)
+		runID = ""
 	}
-	// Retain the same id across a stale-run recovery retry so the input stays
-	// idempotent if AgentFoundry accepted it before returning an error.
-	inputID := fmt.Sprintf("chat-%d", time.Now().UnixNano())
-	runID, err := h.client.SendPersistentRunInput(r.Context(), persistentRunID, req.Content, inputID)
-	if agentfoundry.IsNotFound(err) {
-		// AgentFoundry restarted without the in-memory run record. Replace the
-		// stale persistent run rather than rejecting the user's message.
-		persistentRunID, err = h.client.CreatePersistentRun(r.Context(), h.agentID, agentfoundry.PersistentRunOptions{MCPServers: h.mcpSrv})
-		if err == nil {
-			err = h.store.SetPersistentRun("frontend:"+convID, persistentRunID)
-		}
-		if err == nil {
-			runID, err = h.client.SendPersistentRunInput(r.Context(), persistentRunID, req.Content, inputID)
-		}
-	}
-	if err != nil {
-		slog.Error("agentfoundry run", "conv", convID, "error", err)
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "agent run failed"})
-		return
-	}
-
-	if err := h.store.SetActiveRun(convID, runID); err != nil {
-		slog.Error("set active run", "conv", convID, "run", runID, "error", err)
-	}
-
-	writeJSON(w, http.StatusAccepted, sendMessageResponse{RunID: runID})
+	writeJSON(w, http.StatusAccepted, sendMessageResponse{RunID: runID, MessageID: appended.ID, Queued: runID == ""})
 }
 
 func (h *Handler) runEvents(w http.ResponseWriter, r *http.Request) {
@@ -227,26 +237,6 @@ func (h *Handler) runEvents(w http.ResponseWriter, r *http.Request) {
 	// single writer to messages + active_run_id), avoiding a race where both the
 	// SSE done path and a reconcile poll would persist the same assistant msg.
 	proxySSE(w, body, func(ev SSEEvent) {})
-}
-
-// prependTaskBoard injects the current background-task state into the run so
-// Eve always knows what is running, what needs input, and what just finished.
-func prependTaskBoard(tm *tasks.Manager, history []agentfoundry.Message) []agentfoundry.Message {
-	if tm == nil {
-		return history
-	}
-	board := tm.ContextBlock()
-	if board == "" {
-		return history
-	}
-	ctxMsg := agentfoundry.Message{
-		Role:    "user",
-		Content: board,
-	}
-	out := make([]agentfoundry.Message, 0, len(history)+1)
-	out = append(out, ctxMsg)
-	out = append(out, history...)
-	return out
 }
 
 func (h *Handler) listTasks(w http.ResponseWriter, r *http.Request) {

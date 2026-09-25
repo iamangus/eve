@@ -34,7 +34,12 @@ func TestPersistentRunRequests(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/agents/eve/runs":
-			createSeen = r.Method == http.MethodPost && r.Header.Get("Authorization") == "Bearer secret"
+			var body struct {
+				ClientKey string    `json:"client_key"`
+				History   []Message `json:"history"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			createSeen = r.Method == http.MethodPost && r.Header.Get("Authorization") == "Bearer secret" && body.ClientKey == "frontend:conversation" && len(body.History) == 1
 			_ = json.NewEncoder(w).Encode(map[string]string{"run_id": "persistent-1"})
 		case "/api/v1/runs/persistent-1/inputs":
 			var body struct {
@@ -55,7 +60,7 @@ func TestPersistentRunRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runID, err := client.CreatePersistentRun(context.Background(), "eve", PersistentRunOptions{})
+	runID, err := client.CreatePersistentRun(context.Background(), "eve", PersistentRunOptions{ClientKey: "frontend:conversation", History: []Message{{Role: "assistant", Content: "prior"}}})
 	if err != nil || runID != "persistent-1" {
 		t.Fatalf("CreatePersistentRun = %q, %v", runID, err)
 	}

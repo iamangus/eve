@@ -17,14 +17,42 @@ Browser ──HTTP──> eve BFF ──HTTP + Bearer API key──> agentfoundr
 
 - Each web conversation has a tracked frontend persistent run. A visible user
   message is saved locally and submitted as an input to that run; Eve does not
-  reconstruct or submit local history on each turn.
+  reconstruct or submit local history on each turn. The conversation scope is
+  a stable idempotency key when creating the run.
+- Owner messages from web, email, Matrix, SMS, and voice share the same
+  persistent conversation run. Each turn is queued durably in the conversation
+  store and submitted in message order with its message-derived input ID. A
+  replacement run is bootstrapped from earlier conversation context. The reply
+  destination belongs to the message that started the turn.
+  Matrix retries use the same transaction ID, and email retries carry a stable
+  Message-ID. SMTP delivery remains at-least-once across an ambiguous server
+  acknowledgement; receivers decide whether to collapse repeated Message-IDs.
+  A failed channel delivery keeps its turn active for reconciliation with
+  persisted exponential backoff instead of recording an undelivered reply as
+  complete; later turns wait in the queue.
+- Channel senders are matched by their configured `{type,address}` in
+  `DATA_DIR/identities.json`; a display name on an unrelated channel does not
+  establish owner identity. Authenticated SMS and voice webhooks with no
+  `sender` use the owner device default. Explicit webhook senders must match
+  a configured channel address to trigger an owner turn.
+- During upgrade, an old `frontend:<conversation>` run is canceled once idle.
+  New owner turns use `frontend-v2:<conversation>` and the restricted
+  `eve-chat` MCP server; automation uses separate runs and the full `eve`
+  MCP server.
 - Backend automation has its own tracked backend persistent run. OpenDev
   webhook events are held in a leased, durable queue and submitted there as
   hidden inputs, never as visible conversation messages. A `frontend` event is
-  likewise hidden but targets the specified conversation's frontend run.
-- The BFF proxies agentfoundry's SSE run-events stream verbatim to the browser;
-  on the `done` event it persists the final assistant text in memory and clears
-  the conversation's `active_run_id`. On `error` it clears `active_run_id`.
+  likewise hidden but targets a separate frontend-event run for the specified
+  conversation, preserving the web chat run's restricted tool set. Eve
+  completes a leased event only after Foundry reports that the agent processed
+  its input; timed-out deliveries retry with the same input ID and backoff.
+  Confirmed agent failures rotate the input ID for a fresh attempt. Five
+  confirmed failures leave a durable failed record with its last error.
+  The authenticated event-status endpoint lets OpenDev retain its outbox entry
+  until Eve records `done`, rather than acknowledging only webhook acceptance.
+- The BFF proxies agentfoundry's SSE run-events stream verbatim to the browser.
+  Its reconciler persists the final assistant text or error in the local JSON
+  conversation store and clears the matching active run.
 - On startup the BFF reconciles any conversations with an in-flight
   `active_run_id` by polling agentfoundry's `GET /api/v1/runs/{id}`. Expired
   queue leases are eligible for delivery again after restart.
@@ -74,6 +102,10 @@ All configuration is via environment variables (no YAML).
 | `ROUTER_AGENT_ID` | *(empty, optional)* | Agent id of the message router (see `definitions/router.yaml` in agentfoundry). When set, proactive and async sends are routed by this agent; when empty, delivery falls back mechanically to the best reachable output channel. |
 | `EVEMCP_URL` | `http://localhost:8090/mcp` | URL agentfoundry dials to reach eve's MCP server. Attached as an ephemeral server to automation-triggered runs (task transitions), exposing the full tool surface — `send_message`, `list_channels`, task tools, calendar tools — so Eve can decide whether to proactively contact the user. In Docker, use `http://eve:8090/mcp`. |
 | `EVEMCP_CHAT_URL` | `http://localhost:8090/mcp/chat` | URL agentfoundry dials for user-triggered runs (web chat, email, Matrix, SMS, voice). Serves the chat surface: task + calendar tools but **no** `send_message`/`list_channels` — the user triggered Eve, so her reply is delivered mechanically back to the origin channel and she never routes her own reply mid-conversation. Defaults to the same host as `EVEMCP_URL` with the path swapped to `/mcp/chat`. |
+
+User-triggered runs attach this restricted server as `eve-chat`; automation
+runs attach the full MCP server as `eve`. The distinct names let concurrent
+runs use different endpoints without replacing each other's connections.
 | `PROACTIVE_ENABLED` | `true` | Whether Eve may deliver messages outside a conversation turn (notifications, reminders, questions via `send_message`). |
 | `PROACTIVE_COOLDOWN` | `2m` | Minimum gap between proactive messages (Go duration). |
 | `PROACTIVE_BACKOFF_MAX` | `10m` | Max retry backoff when delivery is deferred (e.g. user absent, conversation busy) (Go duration). |

@@ -49,6 +49,8 @@ type runResponse struct {
 
 type persistentRunRequest struct {
 	MCPServers []MCPServer `json:"mcp_servers,omitempty"`
+	ClientKey  string      `json:"client_key,omitempty"`
+	History    []Message   `json:"history,omitempty"`
 }
 
 type runInputRequest struct {
@@ -58,9 +60,12 @@ type runInputRequest struct {
 }
 
 type RunStatus struct {
-	Status   string `json:"status"`
-	Response string `json:"response"`
-	Error    string `json:"error"`
+	Status         string `json:"status"`
+	Response       string `json:"response"`
+	Error          string `json:"error"`
+	Persistent     bool   `json:"persistent"`
+	CurrentInputID string `json:"current_input_id"`
+	LastInputID    string `json:"last_input_id"`
 }
 
 type Client struct {
@@ -95,7 +100,7 @@ func IsStaleRun(err error) bool {
 		return false
 	}
 	return apiErr.StatusCode == http.StatusNotFound ||
-		(apiErr.StatusCode == http.StatusConflict && strings.Contains(apiErr.Body, "run is not active"))
+		(apiErr.StatusCode == http.StatusConflict && (strings.Contains(apiErr.Body, "run is not active") || strings.Contains(apiErr.Body, "run is not running")))
 }
 
 func NewClient(baseURL, apiKey string) (*Client, error) {
@@ -127,10 +132,12 @@ type RunOptions struct {
 
 type PersistentRunOptions struct {
 	MCPServers []MCPServer
+	ClientKey  string
+	History    []Message
 }
 
 func (c *Client) CreatePersistentRun(ctx context.Context, agentID string, opts PersistentRunOptions) (string, error) {
-	data, err := json.Marshal(persistentRunRequest{MCPServers: opts.MCPServers})
+	data, err := json.Marshal(persistentRunRequest{MCPServers: opts.MCPServers, ClientKey: opts.ClientKey, History: opts.History})
 	if err != nil {
 		return "", fmt.Errorf("marshal persistent run request: %w", err)
 	}
@@ -260,6 +267,34 @@ func (c *Client) GetRun(ctx context.Context, runID string) (*RunStatus, error) {
 	return &rs, nil
 }
 
+func (c *Client) GetRunInputStatus(ctx context.Context, runID, inputID string) (string, error) {
+	u := c.baseURL.JoinPath("/api/v1/runs/" + url.PathEscape(runID) + "/inputs/" + url.PathEscape(inputID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	c.withAuth(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("agentfoundry input status: %s: %s", resp.Status, body)
+	}
+	var status struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return "", err
+	}
+	return status.Status, nil
+}
+
 // CancelRun cancels a running agentfoundry run (terminates its workflow).
 func (c *Client) CancelRun(ctx context.Context, runID string) error {
 	u := c.baseURL.JoinPath("/api/v1/runs/" + url.PathEscape(runID) + "/cancel")
@@ -275,7 +310,7 @@ func (c *Client) CancelRun(ctx context.Context, runID string) error {
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("agentfoundry cancel run: %s: %s", resp.Status, string(b))
+		return &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(b)}
 	}
 	return nil
 }

@@ -3,13 +3,18 @@ package io
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/iamangus/eve/internal/store"
 
+	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
 
@@ -42,6 +47,9 @@ type matrixAdapter struct {
 func (a *matrixAdapter) Type() ChannelType { return ChannelMatrix }
 
 func (a *matrixAdapter) Send(ctx context.Context, msg OutboundMessage) error {
+	if a.store.HasAssistantForTurn(msg.ConversationID, msg.TurnID) {
+		return nil
+	}
 	roomID := msg.ThreadRef
 	if roomID == "" {
 		roomID = msg.Recipient
@@ -58,14 +66,17 @@ func (a *matrixAdapter) Send(ctx context.Context, msg OutboundMessage) error {
 			return fmt.Errorf("matrix: unresolved recipient %q", msg.Recipient)
 		}
 	}
-	if err := a.sendText(ctx, roomID, msg.Text); err != nil {
+	if err := a.sendText(ctx, roomID, msg.Text, msg.TurnID); err != nil {
 		return err
 	}
 	// Record the delivery in the conversation so the web UI shows it as a
 	// message Eve sent via matrix, tagged with the matrix channel.
-	m, err := a.store.AppendAssistantMessageReturn(msg.ConversationID, "", msg.Text, "matrix", "eve")
+	m, created, err := a.store.AppendAssistantForTurn(msg.ConversationID, "", msg.TurnID, msg.Text, "matrix", "eve")
 	if err != nil {
 		return err
+	}
+	if !created {
+		return nil
 	}
 	a.hub.Broadcast(Event{
 		Type:   EventMessage,
@@ -78,22 +89,27 @@ func (a *matrixAdapter) Send(ctx context.Context, msg OutboundMessage) error {
 // sendText delivers a message through the mautrix client so encrypted rooms
 // get encrypted messages. If the crypto client is unavailable (should not
 // happen once enabled), it falls back to plaintext via the client-server API.
-func (a *matrixAdapter) sendText(ctx context.Context, roomID, body string) error {
+func (a *matrixAdapter) sendText(ctx context.Context, roomID, body, turnID string) error {
+	txnID, err := matrixTransactionID(turnID)
+	if err != nil {
+		return err
+	}
 	if a.e2ee != nil {
-		_, err := a.e2ee.Client().SendText(ctx, id.RoomID(roomID), body)
+		_, err := a.e2ee.Client().SendMessageEvent(ctx, id.RoomID(roomID), event.EventMessage,
+			&event.MessageEventContent{MsgType: event.MsgText, Body: body}, mautrix.ReqSendEvent{TransactionID: txnID})
 		if err != nil {
 			return fmt.Errorf("matrix: send: %w", err)
 		}
 		return nil
 	}
-	return a.cfg.SendRoom(ctx, roomID, body)
+	return a.cfg.SendRoom(ctx, roomID, body, txnID)
 }
 
 // SendRoom delivers a plain-text message to a matrix room using the client
 // server API's PUT /rooms/{roomId}/send/m.room.message.
-func (c MatrixConfig) SendRoom(ctx context.Context, roomID, body string) error {
+func (c MatrixConfig) SendRoom(ctx context.Context, roomID, body, transactionID string) error {
 	endpoint := strings.TrimSuffix(c.Homeserver, "/") +
-		"/_matrix/client/v3/rooms/" + roomIDPath(roomID) + "/send/m.room.message"
+		"/_matrix/client/v3/rooms/" + roomIDPath(roomID) + "/send/m.room.message/" + url.PathEscape(transactionID)
 	content := map[string]any{
 		"msgtype": "m.text",
 		"body":    body,
@@ -121,6 +137,17 @@ func (c MatrixConfig) SendRoom(ctx context.Context, roomID, body string) error {
 		return fmt.Errorf("matrix: send %s: %s", resp.Status, er.Error)
 	}
 	return nil
+}
+
+func matrixTransactionID(turnID string) (string, error) {
+	if turnID != "" {
+		return turnID, nil
+	}
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // roomIDPath URL-escapes each path segment of a room id. Room ids commonly

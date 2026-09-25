@@ -20,6 +20,9 @@
   let globalEvents = null
   let heartbeatTimer = null
   let tasksTimer = null
+  let queueTimer = null
+  let pendingMessageID = null
+  let retryMessage = null
   let tasks = $state([])
   let taskReplies = $state({})
   let tasksOpen = $state(false)
@@ -39,6 +42,7 @@
       if (heartbeatTimer) clearInterval(heartbeatTimer)
       heartbeatTimer = null
       if (tasksTimer) clearInterval(tasksTimer)
+      if (queueTimer) clearInterval(queueTimer)
       tasksTimer = null
       window.removeEventListener('popstate', handlePopState)
     }
@@ -61,6 +65,11 @@
       const msg = ev.data
       if (!msg || !msg.id) return
       if (messages.some((m) => m.id === msg.id)) return
+      const last = messages[messages.length - 1]
+      if (last && !last.id && last.role === msg.role && last.content === msg.content) {
+        messages = [...messages.slice(0, -1), msg]
+        return
+      }
       messages = [...messages, msg]
       requestAnimationFrame(() => scrollDown())
     })
@@ -76,6 +85,7 @@
   function startHeartbeat() {
     const beat = () => {
       fetch('/api/presence', { method: 'POST' }).catch(() => {})
+      if (currentConv?.active_run_id) refreshConversationMeta()
     }
     beat()
     heartbeatTimer = setInterval(beat, 30000)
@@ -163,18 +173,40 @@
   }
 
   function applyConversation(full) {
+    if (currentConv?.id && currentConv.id !== full.id) {
+      if (queueTimer) clearInterval(queueTimer)
+      queueTimer = null
+      pendingMessageID = null
+      sending = false
+      eventSource?.close()
+      eventSource = null
+    }
     currentConv = full
     messages = full.messages || []
     pushUrl('/?conv=' + full.id)
     requestAnimationFrame(() => scrollDown())
-    if (full.active_run_id) {
+    if (full.active_run_id && full.active_submitted) {
       startStream(full.active_run_id)
     }
+    if (!queueTimer && pendingMessageID === null) {
+      const queuedWeb = (full.pending_message_ids || []).map(id => messages.find(m => m.id === id && m.channel === 'web')).find(Boolean)
+      const waitingWeb = messages.find(m => m.id === full.active_message_id && m.channel === 'web' && !full.active_submitted)
+      const pending = queuedWeb || waitingWeb
+      if (pending) {
+        pendingMessageID = pending.id
+        sending = true
+        notice = 'Queued — Eve will reply after the current turn.'
+        waitForQueuedTurn(full.id, pending.id)
+      }
+    }
+    updateDeliveryNotice(full)
   }
 
   async function sendMessage() {
     if (sending || !newMessage.trim() || !currentConv) return
     const content = newMessage
+    const clientID = retryMessage?.content === content ? retryMessage.id : (globalThis.crypto?.randomUUID?.() || String(Date.now()) + '-' + Math.random())
+    retryMessage = null
     newMessage = ''
     if (inputEl) {
       inputEl.value = ''
@@ -182,18 +214,60 @@
     }
     sending = true
     notice = ''
-    messages = [...messages, { role: 'user', content }]
+    if (!messages.some(m => m.source_id === clientID)) {
+      messages = [...messages, { role: 'user', content, source_id: clientID }]
+    }
     requestAnimationFrame(() => scrollDown())
 
     try {
-      const result = await api.post('/api/conversations/' + currentConv.id + '/messages', { content })
-      startStream(result.run_id)
+      const result = await api.post('/api/conversations/' + currentConv.id + '/messages', { content, client_id: clientID })
+      messages = messages.map(m => m.source_id === clientID ? { ...m, id: result.message_id } : m)
+      if (result.queued) {
+        pendingMessageID = result.message_id
+        notice = 'Queued — Eve will reply after the current turn.'
+        waitForQueuedTurn(currentConv.id, result.message_id)
+      } else {
+        startStream(result.run_id)
+      }
     } catch (e) {
       sending = false
       console.error('Failed to send message', e)
-      messages = [...messages, { role: 'assistant', content: '⚠️ Failed to send message. (' + e.message + ')' }]
+      retryMessage = { content, id: clientID }
+      newMessage = content
+      notice = 'Could not confirm delivery. Retry to check the same message.'
       scrollDown()
     }
+  }
+
+  function waitForQueuedTurn(convID, messageID) {
+    if (queueTimer) clearInterval(queueTimer)
+    const check = async () => {
+      try {
+        const conv = await api.get('/api/conversations/' + convID)
+        if (conv.active_message_id === messageID) {
+          if (conv.active_run_id && conv.active_submitted) {
+            clearInterval(queueTimer)
+            queueTimer = null
+            pendingMessageID = null
+            notice = ''
+            if (currentConv?.id === convID) startStream(conv.active_run_id)
+          }
+          return
+        }
+        if (!(conv.pending_message_ids || []).includes(messageID)) {
+          clearInterval(queueTimer)
+          queueTimer = null
+          pendingMessageID = null
+          sending = false
+          notice = ''
+          if (currentConv?.id === convID) applyConversation(conv)
+        }
+      } catch (e) {
+        console.error('Failed to check queued turn', e)
+      }
+    }
+    queueTimer = setInterval(check, 2000)
+    check()
   }
 
   function startStream(runId) {
@@ -222,7 +296,7 @@
         messages = [...messages, { role: 'assistant', content: e.data }]
       }
       stream = { runId: '', status: '', raw: '', html: '' }
-      sending = false
+      sending = pendingMessageID !== null
       scrollDown()
       refreshConversationMeta()
     })
@@ -234,7 +308,7 @@
       stream = { runId: '', status: '', raw: '', html: '' }
       messages = [...messages, { role: 'assistant', content: e.data }]
       scrollDown()
-      sending = false
+      sending = pendingMessageID !== null
       refreshConversationMeta()
     })
 
@@ -248,7 +322,7 @@
         messages = [...messages, { role: 'assistant', content: partial }]
         scrollDown()
       }
-      sending = false
+      sending = pendingMessageID !== null
       healConversation()
     }
   }
@@ -266,6 +340,8 @@
         continue
       }
       currentConv = full
+      updateDeliveryNotice(full)
+      if (full.delivery_failures) return
       if (full.active_run_id) continue
       if (full.messages && full.messages.length > 0) {
         messages = full.messages
@@ -285,7 +361,16 @@
     try {
       const full = await api.get('/api/conversations/' + currentConv.id)
       currentConv = full
+      updateDeliveryNotice(full)
     } catch {}
+  }
+
+  function updateDeliveryNotice(full) {
+    if (full.delivery_failures > 0) {
+      notice = 'Reply delivery is retrying. Queued turns will wait until the channel recovers.'
+    } else if (notice.startsWith('Reply delivery is retrying.')) {
+      notice = ''
+    }
   }
 
   function summarizedBoundary() {

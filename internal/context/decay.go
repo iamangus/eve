@@ -49,6 +49,14 @@ type renderedCompartment struct {
 // decay-rendered compartments, then the raw unsummarized tail. Rendering is
 // deterministic — no LLM in this path.
 func (m *Manager) RenderHistory(convID string) ([]agentfoundry.Message, RenderStats, error) {
+	return m.renderHistory(convID, 0)
+}
+
+func (m *Manager) RenderHistoryBefore(convID string, beforeID int64) ([]agentfoundry.Message, RenderStats, error) {
+	return m.renderHistory(convID, beforeID)
+}
+
+func (m *Manager) renderHistory(convID string, beforeID int64) ([]agentfoundry.Message, RenderStats, error) {
 	msgs, err := m.store.ConversationHistory(convID)
 	if err != nil {
 		return nil, RenderStats{}, err
@@ -57,10 +65,22 @@ func (m *Manager) RenderHistory(convID string) ([]agentfoundry.Message, RenderSt
 	if err != nil {
 		return nil, RenderStats{}, err
 	}
+	comps := m.store.Compartments(convID)
+	if beforeID > 0 {
+		boundary = 0
+		eligible := comps[:0:0]
+		for _, comp := range comps {
+			if comp.EndMsgID < beforeID {
+				eligible = append(eligible, comp)
+				boundary = comp.EndMsgID
+			}
+		}
+		comps = eligible
+	}
 
 	var tail []store.Message
 	for _, msg := range msgs {
-		if msg.ID > boundary {
+		if msg.ID > boundary && (beforeID == 0 || msg.ID < beforeID) {
 			tail = append(tail, msg)
 		}
 	}
@@ -80,7 +100,6 @@ func (m *Manager) RenderHistory(convID string) ([]agentfoundry.Message, RenderSt
 		compTarget = 0
 	}
 
-	comps := m.store.Compartments(convID)
 	rendered := renderCompartments(comps, compTarget)
 
 	history := make([]agentfoundry.Message, 0, 1+len(rendered)+len(tail))

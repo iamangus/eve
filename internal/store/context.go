@@ -77,8 +77,17 @@ func (s *Store) AddCompartment(convID string, c Compartment) (Compartment, error
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.convs[convID]; !ok {
+		return Compartment{}, ErrNotFound
+	}
+	prior, existed := s.compartments[convID]
 	s.compartments[convID] = append(s.compartments[convID], c)
 	if err := s.saveCompartments(); err != nil {
+		if existed {
+			s.compartments[convID] = prior
+		} else {
+			delete(s.compartments, convID)
+		}
 		return Compartment{}, err
 	}
 	return c, nil
@@ -114,16 +123,26 @@ func (s *Store) AddMemory(m Memory) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	prior := s.memories
 	s.memories = append(s.memories, m)
-	return s.saveMemories()
+	if err := s.saveMemories(); err != nil {
+		s.memories = prior
+		return err
+	}
+	return nil
 }
 
 // ReplaceMemories swaps the whole memory pool (used by curation).
 func (s *Store) ReplaceMemories(mems []Memory) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	prior := s.memories
 	s.memories = append([]Memory(nil), mems...)
-	return s.saveMemories()
+	if err := s.saveMemories(); err != nil {
+		s.memories = prior
+		return err
+	}
+	return nil
 }
 
 func (s *Store) saveMemories() error {
@@ -137,9 +156,10 @@ func (s *Store) SetHistorianState(convID string, runAt time.Time, errMsg string)
 	if !ok {
 		return ErrNotFound
 	}
+	before := cloneConversationRecord(r)
 	r.HistorianRunAt = runAt
 	r.HistorianError = errMsg
-	return s.saveConversations()
+	return s.saveConversationLocked(convID, before)
 }
 
 func (s *Store) HistorianState(convID string) (runAt time.Time, errMsg string, err error) {

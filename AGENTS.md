@@ -32,8 +32,9 @@
   `POST /api/v1/runs/{id}/inputs`; do not reconstruct visible history for each
   turn. Hidden OpenDev inputs go through the durable internal-events queue and
   never enter conversation messages.
-- The BFF proxies agentfoundry's SSE run-events stream verbatim to the browser
-  and persists the final assistant text from the `done` event.
+- The BFF proxies agentfoundry's SSE run-events stream verbatim to the browser.
+  The reconciler is the single writer of final assistant text, based on the
+  durable run/turn result; it also starts queued conversation inputs.
 - Auth to agentfoundry is a single personal API key (`AGENTFOUNDRY_API_KEY`)
   sent as `Authorization: Bearer <key>`. No OIDC in this service (single-user).
 - Conversation titles are truncated from the first user message at send time;

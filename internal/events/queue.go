@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -18,19 +19,24 @@ const (
 	StatePending = "pending"
 	StateLeased  = "leased"
 	StateDone    = "done"
+	StateFailed  = "failed"
 )
 
 type Event struct {
-	Source     string          `json:"source"`
-	Category   string          `json:"category"`
-	ID         string          `json:"id"`
-	Payload    json.RawMessage `json:"payload"`
-	Attempt    int             `json:"attempt"`
-	State      string          `json:"state"`
-	LeaseUntil time.Time       `json:"lease_until,omitempty"`
-	LeaseToken string          `json:"lease_token,omitempty"`
-	CreatedAt  time.Time       `json:"created_at"`
-	UpdatedAt  time.Time       `json:"updated_at"`
+	Source        string          `json:"source"`
+	Category      string          `json:"category"`
+	ID            string          `json:"id"`
+	InputID       string          `json:"input_id,omitempty"`
+	AgentFailures int             `json:"agent_failures,omitempty"`
+	LastError     string          `json:"last_error,omitempty"`
+	Payload       json.RawMessage `json:"payload"`
+	Attempt       int             `json:"attempt"`
+	State         string          `json:"state"`
+	LeaseUntil    time.Time       `json:"lease_until,omitempty"`
+	NextAttemptAt time.Time       `json:"next_attempt_at,omitempty"`
+	LeaseToken    string          `json:"lease_token,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
 }
 
 type Queue struct {
@@ -65,6 +71,9 @@ func NewQueue(dir string) (*Queue, error) {
 		if event.State == "" {
 			event.State = StatePending
 		}
+		if event.InputID == "" {
+			event.InputID = event.ID
+		}
 	}
 	return q, nil
 }
@@ -94,8 +103,24 @@ func (q *Queue) Enqueue(source, category, id string, payload json.RawMessage) (b
 		return false, nil
 	}
 	now := time.Now().UTC()
-	q.events[key] = &Event{Source: source, Category: category, ID: id, Payload: append(json.RawMessage(nil), payload...), State: StatePending, CreatedAt: now, UpdatedAt: now}
-	return true, q.saveLocked()
+	q.events[key] = &Event{Source: source, Category: category, ID: id, InputID: id, Payload: append(json.RawMessage(nil), payload...), State: StatePending, CreatedAt: now, UpdatedAt: now}
+	if err := q.saveLocked(); err != nil {
+		delete(q.events, key)
+		return false, err
+	}
+	return true, nil
+}
+
+func (q *Queue) Status(source, id string) (*Event, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	event := q.events[eventKey(source, id)]
+	if event == nil {
+		return nil, false
+	}
+	copy := *event
+	copy.Payload = append(json.RawMessage(nil), event.Payload...)
+	return &copy, true
 }
 
 func (q *Queue) Lease(now time.Time, duration time.Duration) (*Event, error) {
@@ -103,7 +128,7 @@ func (q *Queue) Lease(now time.Time, duration time.Duration) (*Event, error) {
 	defer q.mu.Unlock()
 	var candidates []*Event
 	for _, event := range q.events {
-		if event.State == StatePending || (event.State == StateLeased && !event.LeaseUntil.After(now)) {
+		if (event.State == StatePending && !event.NextAttemptAt.After(now)) || (event.State == StateLeased && !event.LeaseUntil.After(now)) {
 			candidates = append(candidates, event)
 		}
 	}
@@ -112,12 +137,15 @@ func (q *Queue) Lease(now time.Time, duration time.Duration) (*Event, error) {
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].CreatedAt.Before(candidates[j].CreatedAt) })
 	event := candidates[0]
+	before := *event
 	event.Attempt++
 	event.State = StateLeased
 	event.LeaseUntil = now.Add(duration)
 	event.LeaseToken = randomID()
+	event.NextAttemptAt = time.Time{}
 	event.UpdatedAt = now.UTC()
 	if err := q.saveLocked(); err != nil {
+		*event = before
 		return nil, err
 	}
 	copy := *event
@@ -133,6 +161,55 @@ func (q *Queue) Retry(event *Event) error {
 	return q.finish(event, StatePending)
 }
 
+func (q *Queue) Fail(event *Event, reason string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	stored := q.events[eventKey(event.Source, event.ID)]
+	if stored == nil || stored.State != StateLeased || stored.LeaseToken != event.LeaseToken {
+		return errors.New("event lease no longer held")
+	}
+	before := *stored
+	stored.State = StateFailed
+	stored.LastError = reason
+	stored.LeaseToken = ""
+	stored.LeaseUntil = time.Time{}
+	stored.NextAttemptAt = time.Time{}
+	stored.UpdatedAt = time.Now().UTC()
+	if err := q.saveLocked(); err != nil {
+		*stored = before
+		return err
+	}
+	return nil
+}
+
+func (q *Queue) AgentInputFailed(event *Event, reason string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	stored := q.events[eventKey(event.Source, event.ID)]
+	if stored == nil || stored.State != StateLeased || stored.LeaseToken != event.LeaseToken {
+		return errors.New("event lease no longer held")
+	}
+	before := *stored
+	stored.AgentFailures++
+	stored.LastError = reason
+	stored.LeaseToken = ""
+	stored.LeaseUntil = time.Time{}
+	stored.UpdatedAt = time.Now().UTC()
+	if stored.AgentFailures >= 5 {
+		stored.State = StateFailed
+		stored.NextAttemptAt = time.Time{}
+	} else {
+		stored.State = StatePending
+		stored.InputID = fmt.Sprintf("%s-retry-%d", stored.ID, stored.AgentFailures)
+		stored.NextAttemptAt = stored.UpdatedAt.Add(time.Second << min(stored.AgentFailures-1, 6))
+	}
+	if err := q.saveLocked(); err != nil {
+		*stored = before
+		return err
+	}
+	return nil
+}
+
 func (q *Queue) finish(event *Event, state string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -140,11 +217,22 @@ func (q *Queue) finish(event *Event, state string) error {
 	if stored == nil || stored.State != StateLeased || stored.LeaseToken != event.LeaseToken {
 		return errors.New("event lease no longer held")
 	}
+	before := *stored
 	stored.State = state
 	stored.LeaseToken = ""
 	stored.LeaseUntil = time.Time{}
 	stored.UpdatedAt = time.Now().UTC()
-	return q.saveLocked()
+	if state == StatePending {
+		backoff := time.Second << min(stored.Attempt-1, 6)
+		stored.NextAttemptAt = stored.UpdatedAt.Add(backoff)
+	} else {
+		stored.NextAttemptAt = time.Time{}
+	}
+	if err := q.saveLocked(); err != nil {
+		*stored = before
+		return err
+	}
+	return nil
 }
 
 func randomID() string {

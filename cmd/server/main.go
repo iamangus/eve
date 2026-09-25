@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -128,7 +129,7 @@ func main() {
 	})
 	ioMgr.SetContext(ctxMgr)
 
-	chatH := chat.NewHandler(st, af, cfg, ctxMgr, ioMgr)
+	chatH := chat.NewHandler(st, af, ctxMgr, ioMgr)
 
 	taskStore, err := tasks.NewStore(cfg.DataDir)
 	if err != nil {
@@ -191,10 +192,15 @@ func main() {
 			sender = fromAddr
 		}
 		if ident := ioMgr.Ident.Resolve(io.ChannelEmail, sender); ident != nil && ident.Owner {
+			sourceID := msg.MessageID
+			if sourceID == "" && msg.UID != 0 {
+				sourceID = fmt.Sprintf("%s:%d", acct.ID, msg.UID)
+			}
 			_, err := ioMgr.Inbound(ctx, io.InboundMessage{
-				Channel: io.ChannelEmail,
-				Sender:  sender,
-				Text:    msg.Body,
+				Channel:  io.ChannelEmail,
+				Sender:   sender,
+				Text:     msg.Body,
+				SourceID: sourceID,
 			})
 			if err != nil {
 				slog.Warn("email inbound", "from", sender, "error", err)

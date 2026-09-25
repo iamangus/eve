@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -25,9 +26,6 @@ func (h *Handler) Reconcile(ctx context.Context) {
 	}
 }
 
-// maxReconcileRetries is how many consecutive GetRun failures (network or 5xx)
-// the Reconcile loop tolerates before giving up on a run. A single transient
-// agentfoundry blip must not abandon a run, or its response is lost forever.
 const maxReconcileRetries = 3
 
 func (h *Handler) reconcileOnce(ctx context.Context) {
@@ -36,9 +34,15 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 		slog.Error("reconcile active runs", "error", err)
 		return
 	}
-	for convID, runID := range runs {
-		if err := h.reconcileRun(ctx, convID, runID); err != nil {
-			slog.Warn("reconcile run", "conv", convID, "run", runID, "error", err)
+	for _, active := range runs {
+		if err := h.reconcileRun(ctx, active.ConversationID, active.RunID); err != nil {
+			slog.Warn("reconcile run", "conv", active.ConversationID, "run", active.RunID, "error", err)
+		}
+	}
+	h.ioMgr.MigrateLegacyRuns(ctx)
+	for _, convID := range h.store.PendingOwnerConversations() {
+		if _, err := h.ioMgr.DrainPending(ctx, convID); err != nil {
+			slog.Warn("start queued conversation input", "conv", convID, "error", err)
 		}
 	}
 	h.ctxMgr.MaybeCompact(ctx)
@@ -50,51 +54,98 @@ func (h *Handler) reconcileRun(ctx context.Context, convID, runID string) error 
 
 	rs, err := h.client.GetRun(pollCtx, runID)
 	if err != nil {
-		// Transient agentfoundry error (network or 5xx): keep the run active
-		// and retry on a later tick so the response is not lost. A 404 already
-		// surfaces as status "unknown" below (no error) and is treated as
-		// terminal. Only give up after several consecutive failures.
 		h.failedRuns[runID]++
-		if h.failedRuns[runID] >= maxReconcileRetries {
-			delete(h.failedRuns, runID)
-			return h.store.ClearActiveRun(convID)
+		if h.failedRuns[runID] == maxReconcileRetries {
+			slog.Warn("agentfoundry run temporarily unavailable", "conv", convID, "run", runID)
 		}
 		return err
 	}
 	delete(h.failedRuns, runID)
+	if rs.Persistent && rs.Status == "running" {
+		msg, err := h.store.ActiveOwnerMessage(convID, runID)
+		if err != nil {
+			return err
+		}
+		if rs.CurrentInputID == fmt.Sprintf("chat-%s-%d", convID, msg.ID) {
+			conv, err := h.store.GetConversation(convID)
+			if err != nil {
+				return err
+			}
+			if conv.ActiveRunID == runID && !conv.ActiveSubmitted {
+				return h.ioMgr.RetryActiveInput(ctx, convID, runID)
+			}
+		}
+	}
+	if rs.Persistent && (rs.Status == "waiting" || rs.Status == "completed") {
+		msg, err := h.store.ActiveOwnerMessage(convID, runID)
+		if err != nil {
+			return err
+		}
+		expected := fmt.Sprintf("chat-%s-%d", convID, msg.ID)
+		if rs.LastInputID != expected {
+			if rs.Status == "completed" {
+				if err := h.deliverTurn(ctx, convID, runID, "Error: run ended before processing this message"); err != nil {
+					return err
+				}
+				return h.store.ClearActiveRunID(convID, runID)
+			}
+			return h.ioMgr.RetryActiveInput(ctx, convID, runID)
+		}
+	}
+	if rs.Status == "failed" || rs.Status == "cancelled" || rs.Status == "canceled" || rs.Status == "error" || rs.Status == "unknown" {
+		message := rs.Error
+		if message == "" {
+			message = "agent run unavailable"
+		}
+		return h.finishTurn(ctx, convID, runID, "Error: "+message)
+	}
 	switch rs.Status {
 	case "completed", "waiting":
 		// Persistent AgentFoundry runs return to waiting after each completed
 		// turn. For the visible frontend, that turn is complete even though the
 		// underlying run remains available for future input.
-		if rs.Response != "" {
-			channel, threadRef, replyTo, cerr := h.store.LastUserReply(convID)
-			if cerr != nil {
-				channel = "web"
+		if rs.Response != "" || rs.Error != "" {
+			response := rs.Response
+			if rs.Error != "" {
+				response = "Error: " + rs.Error
 			}
-			if channel == "web" {
-				// Web replies were already streamed to the open SSE proxy;
-				// persist so the transcript is complete on reload.
-				if err := h.store.AppendAssistantMessage(convID, runID, rs.Response, "web", "eve"); err != nil {
-					return err
-				}
-			} else {
-				// Mechanical async reply: deliver back through the router to
-				// the origin channel. The adapter persists + broadcasts, so we
-				// skip AppendAssistantMessage here. On routing failure fall
-				// back to persisting so the response is never lost.
-				if err := h.ioMgr.Router.Reply(ctx, convID, rs.Response, io.ChannelType(channel), threadRef, replyTo); err != nil {
-					slog.Warn("route reply", "conv", convID, "channel", channel, "error", err)
-					if aerr := h.store.AppendAssistantMessage(convID, runID, rs.Response, channel, "eve"); aerr != nil {
-						return aerr
-					}
-				}
-			}
+			return h.finishTurn(ctx, convID, runID, response)
 		}
-		return h.store.ClearActiveRun(convID)
-	case "failed", "cancelled", "canceled", "error", "unknown":
-		return h.store.ClearActiveRun(convID)
+		return h.store.ClearActiveRunID(convID, runID)
 	default:
 		return nil
 	}
+}
+
+func (h *Handler) finishTurn(ctx context.Context, convID, runID, response string) error {
+	if !h.store.DeliveryReady(convID, runID) {
+		return nil
+	}
+	if err := h.deliverTurn(ctx, convID, runID, response); err != nil {
+		if recordErr := h.store.RecordDeliveryFailure(convID, runID); recordErr != nil {
+			return recordErr
+		}
+		return err
+	}
+	return h.store.ClearActiveRunID(convID, runID)
+}
+
+func (h *Handler) deliverTurn(ctx context.Context, convID, runID, response string) error {
+	channel, threadRef, replyTo, err := h.store.ActiveRunReply(convID, runID)
+	if err != nil {
+		channel = "web"
+	}
+	turnID := ""
+	if msg, err := h.store.ActiveOwnerMessage(convID, runID); err == nil {
+		turnID = fmt.Sprintf("chat-%s-%d", convID, msg.ID)
+	}
+	if channel == "web" {
+		_, _, err := h.store.AppendAssistantForTurn(convID, runID, turnID, response, "web", "eve")
+		return err
+	}
+	if err := h.ioMgr.Router.Reply(ctx, convID, response, io.ChannelType(channel), threadRef, replyTo, turnID); err != nil {
+		slog.Warn("route reply", "conv", convID, "channel", channel, "error", err)
+		return err
+	}
+	return nil
 }

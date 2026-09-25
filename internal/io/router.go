@@ -118,7 +118,7 @@ func (r *Router) Notify(ctx context.Context, convID, content, purpose, forceChan
 // recipient pin the destination (matrix room / sender address) when the
 // origin channel needs them; the adapter falls back to the channel's default
 // recipient otherwise.
-func (r *Router) Reply(ctx context.Context, convID, content string, origin ChannelType, originThread, recipient string) error {
+func (r *Router) Reply(ctx context.Context, convID, content string, origin ChannelType, originThread, recipient string, turnIDs ...string) error {
 	participants, err := r.store.ConversationParticipants(convID)
 	if err != nil {
 		participants = []string{"owner"}
@@ -131,6 +131,9 @@ func (r *Router) Reply(ctx context.Context, convID, content string, origin Chann
 		OriginThread:   originThread,
 		Recipient:      recipient,
 		Participants:   participants,
+	}
+	if len(turnIDs) > 0 {
+		req.TurnID = turnIDs[0]
 	}
 	dest, err := r.Decide(ctx, req)
 	if err != nil {
@@ -188,6 +191,7 @@ func (r *Router) Deliver(ctx context.Context, req SendRequest, dest EndpointSnap
 		Text:           adaptContent(req.Content, dest),
 		ThreadRef:      req.OriginThread,
 		ConversationID: req.ConversationID,
+		TurnID:         req.TurnID,
 	}
 	if req.Recipient != "" {
 		msg.Recipient = req.Recipient
@@ -350,9 +354,12 @@ type webAdapter struct {
 func (a *webAdapter) Type() ChannelType { return ChannelWeb }
 
 func (a *webAdapter) Send(ctx context.Context, msg OutboundMessage) error {
-	m, err := a.store.AppendAssistantMessageReturn(msg.ConversationID, "", msg.Text, "web", "eve")
+	m, created, err := a.store.AppendAssistantForTurn(msg.ConversationID, "", msg.TurnID, msg.Text, "web", "eve")
 	if err != nil {
 		return err
+	}
+	if !created {
+		return nil
 	}
 	a.hub.Broadcast(Event{
 		Type:   EventMessage,
