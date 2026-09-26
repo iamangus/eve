@@ -447,6 +447,15 @@ func (m *Manager) RetryActiveInput(ctx context.Context, convID, runID string) er
 	return m.submitOwnerInput(ctx, convID, runID, msg)
 }
 
+// SteerActive injects a follow-up owner message into the conversation's
+// running persistent-run turn. agentfoundry folds it in at the next LLM
+// boundary, labeled with the source, instead of starting a later turn.
+func (m *Manager) SteerActive(ctx context.Context, convID, runID string, msg *store.Message) error {
+	inputID := fmt.Sprintf("chat-%s-%d", convID, msg.ID)
+	_, err := m.client.SendPersistentRunInputWithMetadata(ctx, runID, msg.Content, inputID, map[string]string{"source": "web"})
+	return err
+}
+
 func (m *Manager) submitOwnerInput(ctx context.Context, convID, runID string, msg *store.Message) error {
 	inputID := fmt.Sprintf("chat-%s-%d", convID, msg.ID)
 	_, err := m.client.SendPersistentRunInput(ctx, runID, msg.Content, inputID)

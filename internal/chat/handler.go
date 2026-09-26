@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -158,6 +159,7 @@ type sendMessageResponse struct {
 	RunID     string `json:"run_id,omitempty"`
 	MessageID int64  `json:"message_id"`
 	Queued    bool   `json:"queued"`
+	Steered   bool   `json:"steered"`
 }
 
 func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
@@ -190,7 +192,15 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	appended, _, err := h.store.AppendQueuedOwnerMessageWithSource(convID, req.Content, "web", "owner", "", "", req.ClientID)
+	steerRun := h.store.SteerTarget(convID)
+
+	var appended *store.Message
+	var steerTarget string
+	if steerRun != "" {
+		appended, _, steerTarget, err = h.store.AppendSteeredOwnerMessageWithSource(convID, req.Content, "web", "owner", "", "", req.ClientID, steerRun)
+	} else {
+		appended, _, err = h.store.AppendQueuedOwnerMessageWithSource(convID, req.Content, "web", "owner", "", "", req.ClientID)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
@@ -213,12 +223,63 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		_ = h.store.SetTitle(convID, defaultTitle)
 	}
 
+	if steerTarget != "" {
+		if h.store.ConfirmedSteer(convID, steerTarget, appended.ID) {
+			writeJSON(w, http.StatusAccepted, sendMessageResponse{RunID: steerTarget, MessageID: appended.ID, Steered: true})
+			return
+		}
+		steer, pending := h.store.PendingSteer(convID, steerTarget, appended.ID)
+		if !pending {
+			writeJSON(w, http.StatusAccepted, sendMessageResponse{MessageID: appended.ID, Queued: true})
+			return
+		}
+		settled, steerErr := h.settleSteer(r.Context(), convID, steer)
+		if steerErr != nil {
+			slog.Warn("steering confirmation pending", "conv", convID, "run", steerTarget, "message", appended.ID, "error", steerErr)
+			writeJSON(w, http.StatusAccepted, sendMessageResponse{MessageID: appended.ID, Queued: true})
+			return
+		}
+		if settled {
+			writeJSON(w, http.StatusAccepted, sendMessageResponse{RunID: steerTarget, MessageID: appended.ID, Steered: true})
+			return
+		}
+	}
+
 	runID, err := h.ioMgr.DrainPending(r.Context(), convID)
 	if err != nil {
 		slog.Warn("queued web input for retry", "conv", convID, "message", appended.ID, "error", err)
 		runID = ""
 	}
 	writeJSON(w, http.StatusAccepted, sendMessageResponse{RunID: runID, MessageID: appended.ID, Queued: runID == ""})
+}
+
+func (h *Handler) settleSteer(ctx context.Context, convID string, steer store.SteeringInput) (bool, error) {
+	message, active := h.store.SteeringMessage(convID, steer)
+	if message == nil {
+		return false, store.ErrNotFound
+	}
+	if !active {
+		return false, h.store.QueueSteer(convID, steer.RunID, steer.MessageID)
+	}
+	if err := h.ioMgr.SteerActive(ctx, convID, steer.RunID, message); err != nil {
+		var httpErr *agentfoundry.HTTPError
+		if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusConflict {
+			var reason struct {
+				Code string `json:"code"`
+			}
+			if json.Unmarshal([]byte(httpErr.Body), &reason) == nil && reason.Code == "input_failed" {
+				return true, h.store.ConfirmSteer(convID, steer.RunID, steer.MessageID)
+			}
+		}
+		if errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusConflict || httpErr.StatusCode == http.StatusNotFound) {
+			return false, h.store.QueueSteer(convID, steer.RunID, steer.MessageID)
+		}
+		return false, err
+	}
+	if err := h.store.ConfirmSteer(convID, steer.RunID, steer.MessageID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (h *Handler) runEvents(w http.ResponseWriter, r *http.Request) {

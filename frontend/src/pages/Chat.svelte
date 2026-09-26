@@ -11,6 +11,7 @@
   let newMessage = $state('')
   let loading = $state(true)
   let sending = $state(false)
+  let posting = $state(false)
   let notice = $state('')
   let messageListEl = $state(null)
   let inputEl = $state(null)
@@ -203,7 +204,7 @@
   }
 
   async function sendMessage() {
-    if (sending || !newMessage.trim() || !currentConv) return
+    if (posting || !newMessage.trim() || !currentConv) return
     const content = newMessage
     const clientID = retryMessage?.content === content ? retryMessage.id : (globalThis.crypto?.randomUUID?.() || String(Date.now()) + '-' + Math.random())
     retryMessage = null
@@ -212,7 +213,7 @@
       inputEl.value = ''
       inputEl.style.height = 'auto'
     }
-    sending = true
+    posting = true
     notice = ''
     if (!messages.some(m => m.source_id === clientID)) {
       messages = [...messages, { role: 'user', content, source_id: clientID }]
@@ -224,18 +225,22 @@
       messages = messages.map(m => m.source_id === clientID ? { ...m, id: result.message_id } : m)
       if (result.queued) {
         pendingMessageID = result.message_id
+        sending = true
         notice = 'Queued — Eve will reply after the current turn.'
         waitForQueuedTurn(currentConv.id, result.message_id)
+      } else if (result.steered && eventSource && stream.runId === result.run_id) {
+        notice = 'Eve will fold this into her current reply.'
       } else {
         startStream(result.run_id)
       }
     } catch (e) {
-      sending = false
       console.error('Failed to send message', e)
       retryMessage = { content, id: clientID }
       newMessage = content
       notice = 'Could not confirm delivery. Retry to check the same message.'
       scrollDown()
+    } finally {
+      posting = false
     }
   }
 
@@ -244,6 +249,16 @@
     const check = async () => {
       try {
         const conv = await api.get('/api/conversations/' + convID)
+        if ((conv.steered_message_ids || []).includes(messageID)) {
+          clearInterval(queueTimer)
+          queueTimer = null
+          pendingMessageID = null
+          notice = 'Eve will fold this into her current reply.'
+          if (currentConv?.id === convID && conv.active_run_id && (!eventSource || stream.runId !== conv.active_run_id)) {
+            startStream(conv.active_run_id)
+          }
+          return
+        }
         if (conv.active_message_id === messageID) {
           if (conv.active_run_id && conv.active_submitted) {
             clearInterval(queueTimer)
@@ -285,6 +300,12 @@
       scrollDown()
     })
 
+    es.addEventListener('reset', () => {
+      stream.raw = ''
+      stream.html = ''
+      stream.status = 'Revising answer'
+    })
+
     es.addEventListener('status', (e) => {
       stream.status = e.data
     })
@@ -296,6 +317,7 @@
         messages = [...messages, { role: 'assistant', content: e.data }]
       }
       stream = { runId: '', status: '', raw: '', html: '' }
+      if (notice && !notice.startsWith('Reply delivery is retrying.')) notice = ''
       sending = pendingMessageID !== null
       scrollDown()
       refreshConversationMeta()
@@ -522,10 +544,10 @@
             bind:value={newMessage}
             onkeydown={handleKeydown}
             rows="1"
-            placeholder="Write a message to Eve"
+            placeholder={stream.runId ? 'Interrupt with a follow-up…' : 'Write a message to Eve'}
             oninput={(e) => { e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px'; }}
           ></textarea>
-          <button onclick={sendMessage} class="send-btn" aria-label="Send message" disabled={sending || !currentConv}>
+          <button onclick={sendMessage} class="send-btn" aria-label="Send message" disabled={posting || !currentConv}>
             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" d="M6 12 3.269 3.125A59.769 59.769 0 0 1 21.485 12 59.768 59.768 0 0 1 3.27 20.875L5.999 12Zm0 0h7.5" />
             </svg>

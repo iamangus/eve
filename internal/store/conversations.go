@@ -104,6 +104,12 @@ func (s *Store) GetConversation(id string) (*Conversation, error) {
 		PendingMessageIDs: append([]int64(nil), r.PendingOwnerInputs...),
 		SummarizedUpTo:    s.boundaryLocked(id),
 	}
+	for _, steer := range r.PendingSteers {
+		c.PendingMessageIDs = append(c.PendingMessageIDs, steer.MessageID)
+	}
+	for _, steer := range r.ConfirmedSteers {
+		c.SteeredMessageIDs = append(c.SteeredMessageIDs, steer.MessageID)
+	}
 	if len(r.Messages) > 0 {
 		c.Messages = append([]Message(nil), r.Messages...)
 	}
@@ -198,20 +204,39 @@ func (s *Store) AppendUserMessageReturn(convID, content, channel, sender, thread
 }
 
 func (s *Store) AppendQueuedOwnerMessageWithSource(convID, content, channel, sender, threadRef, replyTo, sourceID string) (*Message, bool, error) {
+	m, created, _, err := s.appendOwnerMessage(convID, content, channel, sender, threadRef, replyTo, sourceID, "")
+	return m, created, err
+}
+
+func (s *Store) AppendSteeredOwnerMessageWithSource(convID, content, channel, sender, threadRef, replyTo, sourceID, runID string) (*Message, bool, string, error) {
+	return s.appendOwnerMessage(convID, content, channel, sender, threadRef, replyTo, sourceID, runID)
+}
+
+func (s *Store) appendOwnerMessage(convID, content, channel, sender, threadRef, replyTo, sourceID, steerRun string) (*Message, bool, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.convs[convID]
 	if !ok || s.deleting[convID] {
-		return nil, false, ErrNotFound
+		return nil, false, "", ErrNotFound
 	}
 	if sourceID != "" {
 		for _, prior := range r.Messages {
 			if prior.Role == "user" && prior.Channel == channel && prior.SourceID == sourceID {
 				if prior.Content != content || prior.Sender != sender || prior.ThreadRef != threadRef || prior.ReplyTo != replyTo {
-					return nil, false, ErrSourceConflict
+					return nil, false, "", ErrSourceConflict
 				}
 				copy := prior
-				return &copy, false, nil
+				for _, steer := range r.PendingSteers {
+					if steer.MessageID == prior.ID {
+						return &copy, false, steer.RunID, nil
+					}
+				}
+				for _, steer := range r.ConfirmedSteers {
+					if steer.MessageID == prior.ID {
+						return &copy, false, steer.RunID, nil
+					}
+				}
+				return &copy, false, "", nil
 			}
 		}
 	}
@@ -219,13 +244,204 @@ func (s *Store) AppendQueuedOwnerMessageWithSource(convID, content, channel, sen
 	now := time.Now()
 	m := Message{ID: r.NextMsgID, Role: "user", Content: content, Channel: channel, Sender: sender, ThreadRef: threadRef, ReplyTo: replyTo, SourceID: sourceID, CreatedAt: now}
 	r.Messages = append(r.Messages, m)
-	r.PendingOwnerInputs = append(r.PendingOwnerInputs, m.ID)
+	anchorID := r.ActiveMessageID
+	if tracked, ok := r.ActiveRunMessages[steerRun]; ok {
+		anchorID = tracked
+	}
+	steerable := steerRun != "" && steerRun == r.ActiveRunID && r.ActiveSubmitted && channel == "web"
+	if steerable {
+		steerable = false
+		for _, prior := range r.Messages {
+			if prior.ID == anchorID && prior.Role == "user" && (prior.Channel == "" || prior.Channel == "web") {
+				steerable = true
+				break
+			}
+		}
+	}
+	if steerable {
+		r.PendingSteers = append(r.PendingSteers, SteeringInput{MessageID: m.ID, RunID: steerRun, AnchorID: anchorID})
+	} else {
+		r.PendingOwnerInputs = append(r.PendingOwnerInputs, m.ID)
+	}
 	r.NextMsgID++
 	r.Updated = now
 	if err := s.saveConversationLocked(convID, before); err != nil {
-		return nil, false, err
+		return nil, false, "", err
 	}
-	return &m, true, nil
+	if steerable {
+		return &m, true, steerRun, nil
+	}
+	return &m, true, "", nil
+}
+
+func (s *Store) PendingSteersForRun(convID, runID string) []SteeringInput {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r := s.convs[convID]
+	if r == nil || s.deleting[convID] {
+		return nil
+	}
+	var out []SteeringInput
+	for _, steer := range r.PendingSteers {
+		if steer.RunID == runID {
+			out = append(out, steer)
+		}
+	}
+	return out
+}
+
+func (s *Store) PendingSteer(convID, runID string, messageID int64) (SteeringInput, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r := s.convs[convID]
+	if r == nil || s.deleting[convID] {
+		return SteeringInput{}, false
+	}
+	for _, steer := range r.PendingSteers {
+		if steer.RunID == runID && steer.MessageID == messageID {
+			return steer, true
+		}
+	}
+	return SteeringInput{}, false
+}
+
+func (s *Store) SteeringMessage(convID string, steer SteeringInput) (*Message, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r := s.convs[convID]
+	if r == nil || s.deleting[convID] {
+		return nil, false
+	}
+	for _, msg := range r.Messages {
+		if msg.ID == steer.MessageID && msg.Role == "user" {
+			copy := msg
+			return &copy, r.ActiveRunID == steer.RunID && r.ActiveMessageID == steer.AnchorID
+		}
+	}
+	return nil, false
+}
+
+func (s *Store) ConfirmedSteer(convID, runID string, messageID int64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r := s.convs[convID]
+	if r == nil {
+		return false
+	}
+	for _, steer := range r.ConfirmedSteers {
+		if steer.RunID == runID && steer.MessageID == messageID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) ConfirmSteer(convID, runID string, messageID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.convs[convID]
+	if r == nil || s.deleting[convID] {
+		return ErrNotFound
+	}
+	for _, steer := range r.ConfirmedSteers {
+		if steer.RunID == runID && steer.MessageID == messageID {
+			return nil
+		}
+	}
+	for i, steer := range r.PendingSteers {
+		if steer.RunID == runID && steer.MessageID == messageID {
+			before := cloneConversationRecord(r)
+			r.PendingSteers = append(r.PendingSteers[:i], r.PendingSteers[i+1:]...)
+			r.ConfirmedSteers = append(r.ConfirmedSteers, steer)
+			return s.saveConversationLocked(convID, before)
+		}
+	}
+	return ErrNotFound
+}
+
+func (s *Store) QueueSteer(convID, runID string, messageID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.convs[convID]
+	if r == nil || s.deleting[convID] {
+		return ErrNotFound
+	}
+	for i, steer := range r.PendingSteers {
+		if steer.RunID == runID && steer.MessageID == messageID {
+			before := cloneConversationRecord(r)
+			r.PendingSteers = append(r.PendingSteers[:i], r.PendingSteers[i+1:]...)
+			queueOwnerInput(r, messageID)
+			return s.saveConversationLocked(convID, before)
+		}
+	}
+	return ErrNotFound
+}
+
+func (s *Store) RequeueSteersForRun(convID, runID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.convs[convID]
+	if r == nil || s.deleting[convID] {
+		return ErrNotFound
+	}
+	before := cloneConversationRecord(r)
+	for _, steer := range r.PendingSteers {
+		if steer.RunID == runID {
+			queueOwnerInput(r, steer.MessageID)
+		}
+	}
+	for _, steer := range r.ConfirmedSteers {
+		if steer.RunID == runID {
+			queueOwnerInput(r, steer.MessageID)
+		}
+	}
+	r.PendingSteers = removeSteersForRun(r.PendingSteers, runID)
+	r.ConfirmedSteers = removeSteersForRun(r.ConfirmedSteers, runID)
+	return s.saveConversationLocked(convID, before)
+}
+
+func queueOwnerInput(r *conversationRecord, messageID int64) {
+	for i, id := range r.PendingOwnerInputs {
+		if id == messageID {
+			return
+		}
+		if id > messageID {
+			r.PendingOwnerInputs = append(r.PendingOwnerInputs, 0)
+			copy(r.PendingOwnerInputs[i+1:], r.PendingOwnerInputs[i:])
+			r.PendingOwnerInputs[i] = messageID
+			return
+		}
+	}
+	r.PendingOwnerInputs = append(r.PendingOwnerInputs, messageID)
+}
+
+// SteerTarget returns the run that a new web message should be injected into,
+// or "" when it must queue instead: no turn is in flight, the active input has
+// not been submitted yet, or the active turn would reply on a non-web channel
+// (the shared response must keep the originating message's reply destination).
+func (s *Store) SteerTarget(convID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, ok := s.convs[convID]
+	if !ok || s.deleting[convID] {
+		return ""
+	}
+	if r.ActiveRunID == "" || !r.ActiveSubmitted {
+		return ""
+	}
+	msgID := r.ActiveMessageID
+	if tracked, ok := r.ActiveRunMessages[r.ActiveRunID]; ok {
+		msgID = tracked
+	}
+	for _, m := range r.Messages {
+		if m.ID == msgID && m.Role == "user" {
+			if m.Channel != "" && m.Channel != "web" {
+				return ""
+			}
+			break
+		}
+	}
+	return r.ActiveRunID
 }
 
 func (s *Store) appendUserMessage(convID, content, channel, sender, threadRef, replyTo string) (*Message, error) {
@@ -325,11 +541,33 @@ func (s *Store) ReplaceActiveOwnerRun(convID, oldRunID, newRunID string, message
 		return ErrNotFound
 	}
 	before := cloneConversationRecord(r)
+	for _, steer := range r.PendingSteers {
+		if steer.RunID == oldRunID {
+			queueOwnerInput(r, steer.MessageID)
+		}
+	}
+	for _, steer := range r.ConfirmedSteers {
+		if steer.RunID == oldRunID {
+			queueOwnerInput(r, steer.MessageID)
+		}
+	}
+	r.PendingSteers = removeSteersForRun(r.PendingSteers, oldRunID)
+	r.ConfirmedSteers = removeSteersForRun(r.ConfirmedSteers, oldRunID)
 	delete(r.ActiveRunMessages, oldRunID)
 	r.ActiveRunID = newRunID
 	r.ActiveSubmitted = false
 	r.ActiveRunMessages[newRunID] = messageID
 	return s.saveConversationLocked(convID, before)
+}
+
+func removeSteersForRun(steers []SteeringInput, runID string) []SteeringInput {
+	out := steers[:0]
+	for _, steer := range steers {
+		if steer.RunID != runID {
+			out = append(out, steer)
+		}
+	}
+	return out
 }
 
 func (s *Store) ActiveOwnerMessage(convID, runID string) (*Message, error) {
@@ -528,7 +766,13 @@ func (s *Store) ClearActiveRunID(convID, runID string) error {
 	if !ok {
 		return ErrNotFound
 	}
+	for _, steer := range r.PendingSteers {
+		if steer.RunID == runID {
+			return ErrSteerPending
+		}
+	}
 	before := cloneConversationRecord(r)
+	r.ConfirmedSteers = removeSteersForRun(r.ConfirmedSteers, runID)
 	delete(r.ActiveRunMessages, runID)
 	if r.ActiveRunID == runID {
 		r.ActiveRunID = ""

@@ -14,6 +14,7 @@ import (
 var ErrNotFound = errors.New("conversation not found")
 var ErrSourceConflict = errors.New("source ID already belongs to a different message")
 var ErrDeleteInProgress = errors.New("conversation deletion already in progress")
+var ErrSteerPending = errors.New("steering inputs are still pending")
 
 type Message struct {
 	ID        int64     `json:"id"`
@@ -39,8 +40,15 @@ type Conversation struct {
 	ActiveSubmitted   bool      `json:"active_submitted,omitempty"`
 	DeliveryFailures  int       `json:"delivery_failures,omitempty"`
 	PendingMessageIDs []int64   `json:"pending_message_ids,omitempty"`
+	SteeredMessageIDs []int64   `json:"steered_message_ids,omitempty"`
 	SummarizedUpTo    int64     `json:"summarized_up_to,omitempty"`
 	Messages          []Message `json:"messages,omitempty"`
+}
+
+type SteeringInput struct {
+	MessageID int64  `json:"message_id"`
+	RunID     string `json:"run_id"`
+	AnchorID  int64  `json:"anchor_id"`
 }
 
 type ConversationSummary struct {
@@ -62,6 +70,8 @@ type conversationRecord struct {
 	NextDeliveryAt     time.Time        `json:"next_delivery_at,omitempty"`
 	ActiveRunMessages  map[string]int64 `json:"active_run_messages,omitempty"`
 	PendingOwnerInputs []int64          `json:"pending_owner_inputs,omitempty"`
+	PendingSteers      []SteeringInput  `json:"pending_steers,omitempty"`
+	ConfirmedSteers    []SteeringInput  `json:"confirmed_steers,omitempty"`
 	Messages           []Message        `json:"messages"`
 	NextMsgID          int64            `json:"next_msg_id"`
 	Participants       []string         `json:"participants,omitempty"`
@@ -170,6 +180,8 @@ func cloneConversationRecord(r *conversationRecord) conversationRecord {
 	copy := *r
 	copy.Messages = append([]Message(nil), r.Messages...)
 	copy.PendingOwnerInputs = append([]int64(nil), r.PendingOwnerInputs...)
+	copy.PendingSteers = append([]SteeringInput(nil), r.PendingSteers...)
+	copy.ConfirmedSteers = append([]SteeringInput(nil), r.ConfirmedSteers...)
 	copy.Participants = append([]string(nil), r.Participants...)
 	if r.ActiveRunMessages != nil {
 		copy.ActiveRunMessages = make(map[string]int64, len(r.ActiveRunMessages))

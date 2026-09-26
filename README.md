@@ -19,6 +19,11 @@ Browser ──HTTP──> eve BFF ──HTTP + Bearer API key──> agentfoundr
   message is saved locally and submitted as an input to that run; Eve does not
   reconstruct or submit local history on each turn. The conversation scope is
   a stable idempotency key when creating the run.
+- A web follow-up during an active web turn is held durably while Eve requests
+  a Temporal steering update. The worker accepts it only while the current turn
+  can incorporate it, then revises that turn's answer. An unconfirmed update is
+  retried with the same input ID; a rejected update becomes the next queued
+  turn.
 - Owner messages from web, email, Matrix, SMS, and voice share the same
   persistent conversation run. Each turn is queued durably in the conversation
   store and submitted in message order with its message-derived input ID. A

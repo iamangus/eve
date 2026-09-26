@@ -61,6 +61,17 @@ func (h *Handler) reconcileRun(ctx context.Context, convID, runID string) error 
 		return err
 	}
 	delete(h.failedRuns, runID)
+	if rs.Status == "failed" || rs.Status == "cancelled" || rs.Status == "canceled" || rs.Status == "error" || rs.Status == "unknown" {
+		if err := h.store.RequeueSteersForRun(convID, runID); err != nil {
+			return err
+		}
+	} else {
+		for _, steer := range h.store.PendingSteersForRun(convID, runID) {
+			if _, err := h.settleSteer(ctx, convID, steer); err != nil {
+				return err
+			}
+		}
+	}
 	if rs.Persistent && rs.Status == "running" {
 		msg, err := h.store.ActiveOwnerMessage(convID, runID)
 		if err != nil {

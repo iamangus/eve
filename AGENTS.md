@@ -31,10 +31,18 @@
   AgentFoundry runs in `persistent_runs.json`. Web messages use
   `POST /api/v1/runs/{id}/inputs`; do not reconstruct visible history for each
   turn. Hidden OpenDev inputs go through the durable internal-events queue and
-  never enter conversation messages.
+  never enter conversation messages. A web follow-up stays durable in the
+  conversation until Foundry confirms a Temporal steering update incorporated
+  it into the active turn; rejected updates become ordinary queued turns.
 - The BFF proxies agentfoundry's SSE run-events stream verbatim to the browser.
   The reconciler is the single writer of final assistant text, based on the
   durable run/turn result; it also starts queued conversation inputs.
+- A web message sent while a web-originated turn is in flight is injected into
+  the running persistent run (`metadata.source=web`, folded in by agentfoundry
+  at the next LLM boundary) instead of queued. Queueing remains the fallback
+  for non-web active turns and injection failures; the active message stays
+  the turn anchor, so the shared response keeps the original reply
+  destination.
 - Auth to agentfoundry is a single personal API key (`AGENTFOUNDRY_API_KEY`)
   sent as `Authorization: Bearer <key>`. No OIDC in this service (single-user).
 - Conversation titles are truncated from the first user message at send time;
