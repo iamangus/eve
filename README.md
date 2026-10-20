@@ -230,6 +230,9 @@ commands; `make check` runs all checks. Both local and CI builds use `goolm`.
 Install the browser test runtime once with
 `cd frontend && npx playwright install chromium`. CI also tests a fresh
 container volume and a stopped-store backup/restore before image publishing.
+The `docker` workflow calls the reusable Eve checks once, then builds the image
+only after they pass. OpenDev CI remains a separate PR check; `ci.yml` has no
+independent push/PR trigger, avoiding a duplicate full test run.
 The process-level restore test can be run without Docker:
 `python3 scripts/smoke_restore.py /absolute/path/to/the/built/eve`.
 It uses isolated temporary data and no external accounts. The complete numbered
