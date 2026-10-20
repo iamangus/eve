@@ -233,6 +233,14 @@ container volume and a stopped-store backup/restore before image publishing.
 The `docker` workflow calls the reusable Eve checks once, then builds the image
 only after they pass. OpenDev CI remains a separate PR check; `ci.yml` has no
 independent push/PR trigger, avoiding a duplicate full test run.
+Routine Dependabot updates are grouped into at most one open PR per ecosystem
+(Go, frontend, Actions, and Docker). Weekly checks are staggered Monday through
+Thursday rather than all starting on the same day. Automatic
+rebases are disabled to avoid restarting CI after every base-branch change;
+update/rebase dependency PRs explicitly when needed. Security updates remain
+enabled and are not constrained by the routine-update PR limit. Existing
+individual PRs and running jobs are not manually closed/cancelled as part of
+this change.
 The process-level restore test can be run without Docker:
 `python3 scripts/smoke_restore.py /absolute/path/to/the/built/eve`.
 It uses isolated temporary data and no external accounts. The complete numbered

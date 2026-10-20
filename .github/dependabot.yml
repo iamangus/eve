@@ -4,15 +4,39 @@ updates:
     directory: /
     schedule:
       interval: weekly
+      day: monday
+    open-pull-requests-limit: 1
+    rebase-strategy: disabled
+    groups:
+      go-dependencies:
+        patterns: ["*"]
   - package-ecosystem: npm
     directory: /frontend
     schedule:
       interval: weekly
+      day: tuesday
+    open-pull-requests-limit: 1
+    rebase-strategy: disabled
+    groups:
+      frontend-dependencies:
+        patterns: ["*"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+      day: wednesday
+    open-pull-requests-limit: 1
+    rebase-strategy: disabled
+    groups:
+      action-dependencies:
+        patterns: ["*"]
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
+      day: thursday
+    open-pull-requests-limit: 1
+    rebase-strategy: disabled
+    groups:
+      container-images:
+        patterns: ["*"]
