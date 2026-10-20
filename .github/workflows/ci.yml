@@ -1,6 +1,7 @@
 name: Eve checks
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -13,17 +14,53 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: go.mod
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - run: sudo apt-get update && sudo apt-get install -y libolm-dev
-      - run: npm ci && npm run build
+      - run: npm ci --ignore-scripts && npm test && npm run build && npm audit
         working-directory: frontend
-      - run: go test -tags goolm ./...
+      - run: npx playwright install --with-deps chromium && npm run test:e2e
+        working-directory: frontend
+      - run: go test -race -cover -tags goolm ./...
       - run: go vet -tags goolm ./...
+      - run: go build -tags goolm -o /tmp/eve-smoke ./cmd/server/ && python3 scripts/smoke_restore.py /tmp/eve-smoke
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest -tags goolm ./...
+      - name: Fresh volume, shutdown, and backup restore smoke test
+        run: |
+          set -eu
+          docker build -t eve:smoke .
+          docker volume create eve-smoke-data
+          docker volume create eve-smoke-restore
+          start_eve() {
+            docker run -d --name eve-smoke --network none \
+              -e AGENTFOUNDRY_API_KEY=smoke -e ASSISTANT_AGENT_ID=smoke \
+              -e AGENTFOUNDRY_URL=http://127.0.0.1:1 \
+              -v "$1:/data" eve:smoke
+            for attempt in $(seq 1 30); do
+              if docker exec eve-smoke wget -q -O /dev/null http://127.0.0.1:8090/readyz; then return 0; fi
+              sleep 1
+            done
+            docker logs eve-smoke
+            return 1
+          }
+          start_eve eve-smoke-data
+          docker exec eve-smoke wget -q -O - --header='Content-Type: application/json' \
+            --post-data='{"title":"Smoke restore"}' http://127.0.0.1:8090/api/conversations
+          docker stop -t 15 eve-smoke
+          docker rm eve-smoke
+          docker run --rm -u 0 -v eve-smoke-data:/source:ro -v eve-smoke-restore:/target \
+            --entrypoint /bin/sh eve:smoke -c 'cp -a /source/. /target/'
+          start_eve eve-smoke-restore
+          docker exec eve-smoke wget -q -O - http://127.0.0.1:8090/api/conversations | grep 'Smoke restore'
+          docker stop -t 15 eve-smoke
+      - name: Clean up smoke test
+        if: always()
+        run: |
+          docker rm -f eve-smoke || true
+          docker volume rm eve-smoke-data eve-smoke-restore || true

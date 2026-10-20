@@ -2,24 +2,28 @@
 
 ## Commands
 
-- Build frontend: `cd frontend && npm install && npm run build`
-- Build backend: `go build -o eve ./cmd/server/`
+- Build frontend: `make frontend`
+- Build backend: `go build -tags goolm -o eve ./cmd/server/`
 - Run (dev): `air` (Go BFF reload) + `cd frontend && npm run dev` (Vite, proxies `/api` and `/runs` to :8090)
 - Run (prod): `./eve` with env vars set (see README)
-- Vet: `go vet ./...`
-- Test: `go test ./...`
+- Vet: `make vet`
+- Test: `make test`
+- Full checks: `make check`
 
 ## Conventions
 
-- Go 1.25.3, module path `github.com/iamangus/eve`.
+- Go 1.26.9 or newer patched toolchain, module path `github.com/iamangus/eve`.
 - Standard library `net/http` with `http.ServeMux` path patterns (`GET /api/...`).
 - `log/slog` text handler for logging.
 - Chat conversations/messages, persistent-run IDs, and internal events persist
   in JSON under `DATA_DIR` (`internal/store`, `internal/events`). Email
   accounts, triggers, and run history persist to JSON in `DATA_DIR`
-  (`internal/store/email.go`). The only external Go deps are
-  `github.com/emersion/go-imap/v2` and `github.com/emersion/go-message`
-  (IMAP polling + MIME parsing).
+  (`internal/store/email.go`, atomically migrated from legacy files to
+  `email_state.json`). Durable outbound and Matrix inbound queues live in
+  their own subdirectories. `internal/durable` owns synced atomic writes and
+  the process data-directory lock. External packages provide IMAP/MIME,
+  trusted gateway auth-result parsing, CalDAV/iCalendar recurrence, MCP,
+  and Matrix E2EE.
 - Frontend: Svelte 5 (runes, `$state`/`$effect`), Vite 6, `marked` for markdown. Mirrors `../agentfoundry-ui/frontend`.
 - Embed `frontend/dist` via `//go:embed all:dist` in `frontend/embed.go`.
 - SPA fallback: serve `index.html` for any non-API path (see `internal/web`).

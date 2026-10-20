@@ -3,3 +3,7 @@ validations:
     directory: frontend
     command: npm run build
     timeout_seconds: 300
+  backend-check:
+    directory: .
+    command: make build && go test -tags goolm ./... && go vet -tags goolm ./...
+    timeout_seconds: 900

@@ -2,13 +2,17 @@ package email
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"fmt"
 	"html"
 	"io"
 	"math"
 	"mime"
 	"net"
+	stdmail "net/mail"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +21,7 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
+	"github.com/emersion/go-msgauth/authres"
 
 	"github.com/iamangus/eve/internal/store"
 )
@@ -29,11 +34,15 @@ const (
 // Check verifies that the account credentials work by connecting and
 // authenticating to the IMAP server.
 func Check(a store.Account) error {
-	c, err := dial(a)
+	return CheckContext(context.Background(), a)
+}
+
+func CheckContext(ctx context.Context, a store.Account) error {
+	c, stop, err := dialContext(ctx, a)
 	if err != nil {
 		return err
 	}
-	defer c.Logout()
+	defer stop()
 
 	if err := c.Login(a.Username, a.Password).Wait(); err != nil {
 		return fmt.Errorf("imap login: %w", err)
@@ -45,21 +54,31 @@ func Check(a store.Account) error {
 // greater than the account's cursor, along with the highest UID seen. The
 // first fetch (cursor 0) is limited to the last initialWindowDays.
 func FetchNew(a store.Account) ([]store.EmailMessage, uint32, error) {
-	if a.LastUID == math.MaxUint32 {
-		return nil, a.LastUID, nil
-	}
+	return fetchNew(context.Background(), a, new(uint32))
+}
 
-	c, err := dial(a)
+func fetchNew(ctx context.Context, a store.Account, validity *uint32) ([]store.EmailMessage, uint32, error) {
+	*validity = a.UIDValidity
+
+	c, stop, err := dialContext(ctx, a)
 	if err != nil {
 		return nil, a.LastUID, err
 	}
-	defer c.Logout()
+	defer stop()
 
 	if err := c.Login(a.Username, a.Password).Wait(); err != nil {
 		return nil, a.LastUID, fmt.Errorf("imap login: %w", err)
 	}
-	if _, err := c.Select("INBOX", &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
+	selected, err := c.Select("INBOX", &imap.SelectOptions{ReadOnly: true}).Wait()
+	if err != nil {
 		return nil, a.LastUID, fmt.Errorf("select inbox: %w", err)
+	}
+	*validity = selected.UIDValidity
+	if a.UIDValidity != 0 && a.UIDValidity != selected.UIDValidity {
+		a.LastUID = 0
+	}
+	if a.LastUID == math.MaxUint32 {
+		return nil, a.LastUID, nil
 	}
 
 	uidSet := new(imap.UIDSet)
@@ -73,6 +92,10 @@ func FetchNew(a store.Account) ([]store.EmailMessage, uint32, error) {
 		return nil, a.LastUID, fmt.Errorf("imap search: %w", err)
 	}
 	uids := res.AllUIDs()
+	sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
+	if len(uids) > 100 {
+		uids = uids[:100]
+	}
 	if len(uids) == 0 {
 		return nil, a.LastUID, nil
 	}
@@ -94,7 +117,7 @@ func FetchNew(a store.Account) ([]store.EmailMessage, uint32, error) {
 	bufs, err := c.Fetch(fetchSet, &imap.FetchOptions{
 		UID:         true,
 		Envelope:    true,
-		BodySection: []*imap.FetchItemBodySection{{}},
+		BodySection: []*imap.FetchItemBodySection{{Peek: true, Partial: &imap.SectionPartial{Size: 2 << 20}}},
 	}).Collect()
 	if err != nil {
 		return nil, a.LastUID, fmt.Errorf("imap fetch: %w", err)
@@ -102,22 +125,84 @@ func FetchNew(a store.Account) ([]store.EmailMessage, uint32, error) {
 
 	var msgs []store.EmailMessage
 	for _, b := range bufs {
+		if b.UID == 0 || b.Envelope == nil {
+			return nil, a.LastUID, fmt.Errorf("IMAP returned a message without UID or envelope; cursor retained")
+		}
 		if m := buildMessage(b); m != nil {
+			for _, section := range b.BodySection {
+				m.AuthenticatedSender = authenticatedSender(section.Bytes, a.TrustedAuthservID, m.From)
+			}
 			msgs = append(msgs, *m)
 		}
 	}
+	sort.Slice(msgs, func(i, j int) bool { return msgs[i].UID < msgs[j].UID })
 	return msgs, maxUID, nil
 }
 
 func dial(a store.Account) (*imapclient.Client, error) {
+	c, _, err := dialContext(context.Background(), a)
+	return c, err
+}
+
+func dialContext(ctx context.Context, a store.Account) (*imapclient.Client, func(), error) {
 	host := a.Host
 	if a.Port != 0 {
 		host = net.JoinHostPort(a.Host, strconv.Itoa(a.Port))
 	}
-	if a.UseTLS {
-		return imapclient.DialTLS(host, nil)
+	conn, err := (&net.Dialer{Timeout: 15 * time.Second}).DialContext(ctx, "tcp", host)
+	if err != nil {
+		return nil, nil, err
 	}
-	return imapclient.DialStartTLS(host, nil)
+	deadline := time.Now().Add(60 * time.Second)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = conn.SetDeadline(deadline)
+	after := context.AfterFunc(ctx, func() { conn.Close() })
+	stop := func() { after(); conn.Close() }
+	tlsCfg := &tls.Config{ServerName: a.Host, MinVersion: tls.VersionTLS12}
+	if a.UseTLS {
+		tconn := tls.Client(conn, tlsCfg)
+		if err := tconn.HandshakeContext(ctx); err != nil {
+			stop()
+			return nil, nil, err
+		}
+		return imapclient.New(tconn, nil), stop, nil
+	}
+	c, err := imapclient.NewStartTLS(conn, &imapclient.Options{TLSConfig: tlsCfg})
+	if err != nil {
+		stop()
+		return nil, nil, err
+	}
+	return c, stop, nil
+}
+
+func authenticatedSender(raw []byte, trusted, from string) bool {
+	if trusted == "" {
+		return false
+	}
+	msg, err := stdmail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		return false
+	}
+	addr, err := stdmail.ParseAddress(from)
+	if err != nil {
+		return false
+	}
+	_, domain, ok := strings.Cut(addr.Address, "@")
+	if !ok {
+		return false
+	}
+	server, results, err := authres.Parse(msg.Header.Get("Authentication-Results"))
+	if err != nil || !strings.EqualFold(server, trusted) {
+		return false
+	}
+	for _, result := range results {
+		if dmarc, ok := result.(*authres.DMARCResult); ok && dmarc.Value == authres.ResultPass && strings.EqualFold(dmarc.From, domain) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildMessage(b *imapclient.FetchMessageBuffer) *store.EmailMessage {
@@ -137,6 +222,9 @@ func buildMessage(b *imapclient.FetchMessageBuffer) *store.EmailMessage {
 			continue
 		}
 		m.Body = extractText(section.Bytes)
+		if len(section.Bytes) >= 2<<20 {
+			m.Body += "\n[Email truncated at the 2 MiB ingestion limit.]"
+		}
 		if strings.TrimSpace(m.Body) != "" {
 			break
 		}
@@ -162,17 +250,25 @@ func extractText(raw []byte) string {
 		return ""
 	}
 	var textParts, htmlParts []string
-	for {
+	remaining := maxBodyBytes
+	for parts := 0; parts < 100 && remaining > 0; parts++ {
 		p, err := reader.NextPart()
 		if err == io.EOF {
 			break
 		}
-		if err != nil || p.Header == nil {
+		if err != nil {
+			break
+		}
+		if p.Header == nil {
+			continue
+		}
+		if disposition, _, _ := mime.ParseMediaType(p.Header.Get("Content-Disposition")); disposition == "attachment" {
 			continue
 		}
 		ct, _, _ := mime.ParseMediaType(p.Header.Get("Content-Type"))
 		ct = strings.ToLower(ct)
-		body, _ := io.ReadAll(io.LimitReader(p.Body, maxBodyBytes))
+		body, _ := io.ReadAll(io.LimitReader(p.Body, int64(remaining)))
+		remaining -= len(body)
 		switch {
 		case strings.HasPrefix(ct, "text/plain"):
 			textParts = append(textParts, string(body))

@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/emersion/go-ical"
+	"github.com/iamangus/eve/internal/events"
+	"github.com/teambition/rrule-go"
 	"io"
 	"log/slog"
 	"net/http"
-	"regexp"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,16 +38,20 @@ func (c CalDAVConfig) calendarURL() string {
 	if c.CalendarPath != "" {
 		base += strings.TrimPrefix(c.CalendarPath, "/")
 	}
-	return base
+	return strings.TrimRight(base, "/") + "/"
 }
 
 // CalEvent is a parsed iCalendar event as Eve understands it.
 type CalEvent struct {
-	UID     string
-	Summary string
-	Start   time.Time
-	End     time.Time
-	RRule   string
+	UID          string
+	Summary      string
+	Start        time.Time
+	End          time.Time
+	RRule        string
+	Resource     string `json:"-"`
+	ETag         string `json:"-"`
+	RecurrenceID string `json:"recurrence_id,omitempty"`
+	raw          *ical.Calendar
 }
 
 // CalStore is a thin CalDAV client speaking only what we need: fetch the
@@ -55,31 +63,18 @@ type CalStore struct {
 }
 
 func NewCalStore(cfg CalDAVConfig) *CalStore {
-	return &CalStore{cfg: cfg, hc: &http.Client{Timeout: 30 * time.Second}}
+	return &CalStore{cfg: cfg, hc: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) > 5 || req.URL.Host != via[0].URL.Host || req.URL.Scheme != via[0].URL.Scheme {
+			return fmt.Errorf("calendar redirect rejected")
+		}
+		return nil
+	}}}
 }
 
 // List fetches the calendar collection and parses all VEVENTs.
 func (c *CalStore) List(ctx context.Context) ([]CalEvent, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.calendarURL(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "text/calendar")
-	c.auth(req)
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
-		return nil, fmt.Errorf("caldav get %s: %s", resp.Status, body)
-	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	return parseICalendar(string(data)), nil
+	now := time.Now()
+	return c.ListRange(ctx, now.AddDate(0, 0, -1), now.AddDate(0, 0, 60))
 }
 
 func (c *CalStore) auth(req *http.Request) {
@@ -94,14 +89,39 @@ func (c *CalStore) auth(req *http.Request) {
 func (c *CalStore) Put(ctx context.Context, ev CalEvent) error {
 	resource := c.cfg.calendarURL()
 	if ev.UID == "" {
-		ev.UID = fmt.Sprintf("eve-%d@local", time.Now().UnixNano())
+		return fmt.Errorf("event UID is required")
 	}
-	resource += ev.UID + ".ics"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, resource, strings.NewReader(ev.ICS()))
+	resource += url.PathEscape(ev.UID) + ".ics"
+	if ev.Resource != "" {
+		resource = ev.Resource
+	} else if c.cfg.CalendarPath == "" {
+		_, collection, err := c.calendarClient(ctx)
+		if err != nil {
+			return err
+		}
+		base, err := c.resourceURL(collection)
+		if err != nil {
+			return err
+		}
+		resource = strings.TrimRight(base, "/") + "/" + url.PathEscape(ev.UID) + ".ics"
+	}
+	if ev.Start.IsZero() || !ev.End.After(ev.Start) {
+		return fmt.Errorf("event end must be after start")
+	}
+	data, err := encodeCalendar(ev)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, resource, strings.NewReader(data))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "text/calendar; charset=utf-8")
+	if ev.ETag != "" {
+		req.Header.Set("If-Match", strconv.Quote(ev.ETag))
+	} else {
+		req.Header.Set("If-None-Match", "*")
+	}
 	c.auth(req)
 	resp, err := c.hc.Do(req)
 	if err != nil {
@@ -117,11 +137,19 @@ func (c *CalStore) Put(ctx context.Context, ev CalEvent) error {
 
 // Delete removes the calendar resource for the event UID.
 func (c *CalStore) Delete(ctx context.Context, uid string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.cfg.calendarURL()+uid+".ics", nil)
+	ev, err := c.Find(ctx, uid)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, ev.Resource, nil)
 	if err != nil {
 		return err
 	}
 	c.auth(req)
+	if ev.ETag == "" {
+		return fmt.Errorf("calendar resource has no ETag; refusing unsafe delete")
+	}
+	req.Header.Set("If-Match", strconv.Quote(ev.ETag))
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return err
@@ -136,104 +164,34 @@ func (c *CalStore) Delete(ctx context.Context, uid string) error {
 
 // ICS renders the VEVENT as an iCalendar payload.
 func (ev CalEvent) ICS() string {
-	uid := ev.UID
-	if uid == "" {
-		uid = fmt.Sprintf("eve-%d@local", time.Now().UnixNano())
-	}
-	var b strings.Builder
-	b.WriteString("BEGIN:VCALENDAR\r\n")
-	b.WriteString("VERSION:2.0\r\n")
-	b.WriteString("PRODID:-//eve//calendar//EN\r\n")
-	b.WriteString("BEGIN:VEVENT\r\n")
-	fmt.Fprintf(&b, "UID:%s\r\n", uid)
-	if ev.Summary != "" {
-		b.WriteString("SUMMARY:")
-		b.WriteString(strings.ReplaceAll(ev.Summary, "\n", "\\n"))
-		b.WriteString("\r\n")
-	}
-	b.WriteString("DTSTART:")
-	b.WriteString(ev.Start.UTC().Format("20060102T150405Z"))
-	b.WriteString("\r\n")
-	if !ev.End.IsZero() {
-		b.WriteString("DTEND:")
-		b.WriteString(ev.End.UTC().Format("20060102T150405Z"))
-		b.WriteString("\r\n")
-	}
-	if ev.RRule != "" {
-		b.WriteString("RRULE:")
-		b.WriteString(ev.RRule)
-		b.WriteString("\r\n")
-	}
-	b.WriteString("END:VEVENT\r\n")
-	b.WriteString("END:VCALENDAR\r\n")
-	return b.String()
+	text, _ := encodeCalendar(ev)
+	return text
 }
 
 // --- minimal iCalendar parsing ---------------------------------------------
-
-var (
-	lineSplitRe = regexp.MustCompile(`\r?\n`)
-	propRe      = regexp.MustCompile(`^([A-Z]+)(;[^:]*)?:(.*)$`)
-)
 
 // parseICalendar extracts VEVENTs from an .ics payload. Recurring events are
 // expanded only for the quiet-hours pattern (FREQ=DAILY with DURATION via the
 // event span): for the next 60 days each occurrence becomes a concrete event.
 func parseICalendar(data string) []CalEvent {
-	var out []CalEvent
-	lines := lineSplitRe.Split(data, -1)
-	var cur *CalEvent
-	inVEVENT := false
-	for _, raw := range lines {
-		line := strings.TrimRight(raw, "\r")
-		if strings.HasPrefix(line, "BEGIN:VEVENT") {
-			inVEVENT = true
-			cur = &CalEvent{}
-			continue
-		}
-		if strings.HasPrefix(line, "END:VEVENT") {
-			if cur != nil && !cur.Start.IsZero() {
-				out = append(out, *cur)
-			}
-			inVEVENT = false
-			cur = nil
-			continue
-		}
-		if !inVEVENT || cur == nil {
-			continue
-		}
-		m := propRe.FindStringSubmatch(line)
-		if m == nil {
-			continue
-		}
-		key, params, val := m[1], m[2], strings.TrimSpace(m[3])
-		switch key {
-		case "UID":
-			cur.UID = val
-		case "SUMMARY":
-			cur.Summary = val
-		case "DTSTART":
-			cur.Start = parseICalTime(val, params)
-		case "DTEND":
-			cur.End = parseICalTime(val, params)
-		case "RRULE":
-			cur.RRule = val
-		}
+	cal, err := ical.NewDecoder(strings.NewReader(data)).Decode()
+	if err != nil {
+		return nil
 	}
-	return expandRecurring(out)
+	now := time.Now()
+	out, _ := calendarEvents(cal, now.AddDate(0, 0, -1), now.AddDate(0, 0, 60))
+	return out
 }
 
 // parseICalTime handles the two common DTSTART forms: UTC (20060102T150405Z)
 // and date-only. Zone-less values are treated as UTC.
 func parseICalTime(val, params string) time.Time {
-	val = strings.TrimSuffix(val, "Z")
-	if t, err := time.Parse("20060102T150405", val); err == nil {
-		return t.UTC()
+	cal, err := ical.NewDecoder(strings.NewReader("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nDTSTART" + params + ":" + val + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")).Decode()
+	if err != nil || len(cal.Children) == 0 {
+		return time.Time{}
 	}
-	if t, err := time.Parse("20060102", val); err == nil {
-		return t.UTC()
-	}
-	return time.Time{}
+	t, _ := cal.Children[0].Props.DateTime("DTSTART", time.UTC)
+	return t
 }
 
 // expandRecurring materializes DAILY recurring events (quiet hours) into
@@ -241,7 +199,7 @@ func parseICalTime(val, params string) time.Time {
 func expandRecurring(evs []CalEvent) []CalEvent {
 	var out []CalEvent
 	for _, ev := range evs {
-		if ev.RRule == "" || !strings.HasPrefix(ev.RRule, "FREQ=DAILY") {
+		if ev.RRule == "" {
 			out = append(out, ev)
 			continue
 		}
@@ -249,10 +207,19 @@ func expandRecurring(evs []CalEvent) []CalEvent {
 		if dur <= 0 {
 			dur = time.Hour
 		}
-		for i := 0; i < 60; i++ {
+		option, err := rrule.StrToROption(ev.RRule)
+		if err != nil {
+			continue
+		}
+		option.Dtstart = ev.Start
+		rule, err := rrule.NewRRule(*option)
+		if err != nil {
+			continue
+		}
+		for _, start := range rule.Between(time.Now().AddDate(0, 0, -1), time.Now().AddDate(0, 0, 60), true) {
 			o := ev
 			o.RRule = ""
-			o.Start = ev.Start.AddDate(0, 0, i)
+			o.Start = start
 			o.End = o.Start.Add(dur)
 			out = append(out, o)
 		}
@@ -282,7 +249,7 @@ func upcomingReminder(evs []CalEvent, lead time.Duration) (CalEvent, bool) {
 
 // freeBusy returns the busy intervals overlapping [from, to].
 func freeBusy(evs []CalEvent, from, to time.Time) []map[string]string {
-	var out []map[string]string
+	out := make([]map[string]string, 0)
 	for _, ev := range evs {
 		if ev.End.Before(from) || ev.Start.After(to) {
 			continue
@@ -344,12 +311,15 @@ func (m *MCP) addCalendarTools(s *server.MCPServer) {
 }
 
 func (m *MCP) handleGetCalendar(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	evs, err := m.mgr.Cal.List(ctx)
+	from, to, err := checkedCalRange(req)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	evs, err := m.mgr.Cal.ListRange(ctx, from, to)
 	if err != nil {
 		return mcp.NewToolResultError("calendar unavailable: " + err.Error()), nil
 	}
-	from, to := calRange(req)
-	var list []CalEvent
+	list := make([]CalEvent, 0)
 	for _, ev := range evs {
 		if ev.End.Before(from) || ev.Start.After(to) {
 			continue
@@ -376,32 +346,27 @@ func (m *MCP) handleUpdateEvent(ctx context.Context, req mcp.CallToolRequest) (*
 	if uid == "" {
 		return mcp.NewToolResultError("uid is required"), nil
 	}
-	evs, err := m.mgr.Cal.List(ctx)
+	master, err := m.mgr.Cal.Find(ctx, uid)
 	if err != nil {
 		return mcp.NewToolResultError("calendar unavailable: " + err.Error()), nil
 	}
-	var target *CalEvent
-	for i := range evs {
-		if evs[i].UID == uid {
-			target = &evs[i]
-			break
-		}
-	}
-	if target == nil {
-		return mcp.NewToolResultError("no event with uid " + uid), nil
-	}
+	target := &master
 	if v, ok := req.GetArguments()["summary"].(string); ok && v != "" {
 		target.Summary = v
 	}
 	if v, ok := req.GetArguments()["start"].(string); ok {
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
-			target.Start = t
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			return mcp.NewToolResultError("start must be RFC3339"), nil
 		}
+		target.Start = t
 	}
 	if v, ok := req.GetArguments()["end"].(string); ok {
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
-			target.End = t
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			return mcp.NewToolResultError("end must be RFC3339"), nil
 		}
+		target.End = t
 	}
 	if err := m.mgr.Cal.Put(ctx, *target); err != nil {
 		return mcp.NewToolResultError("update failed: " + err.Error()), nil
@@ -421,11 +386,14 @@ func (m *MCP) handleDeleteEvent(ctx context.Context, req mcp.CallToolRequest) (*
 }
 
 func (m *MCP) handleFreeBusy(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	evs, err := m.mgr.Cal.List(ctx)
+	from, to, err := checkedCalRange(req)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	evs, err := m.mgr.Cal.ListRange(ctx, from, to)
 	if err != nil {
 		return mcp.NewToolResultError("calendar unavailable: " + err.Error()), nil
 	}
-	from, to := calRange(req)
 	data, _ := json.Marshal(freeBusy(evs, from, to))
 	return mcp.NewToolResultText(string(data)), nil
 }
@@ -447,6 +415,21 @@ func calRange(req mcp.CallToolRequest) (from, to time.Time) {
 	return
 }
 
+func checkedCalRange(req mcp.CallToolRequest) (time.Time, time.Time, error) {
+	from, to := calRange(req)
+	for _, key := range []string{"from", "to"} {
+		if value, ok := req.GetArguments()[key].(string); ok && value != "" {
+			if _, err := time.Parse(time.RFC3339, value); err != nil {
+				return from, to, fmt.Errorf("%s must be RFC3339", key)
+			}
+		}
+	}
+	if !to.After(from) || to.Sub(from) > 366*24*time.Hour {
+		return from, to, fmt.Errorf("range must be positive and at most 366 days")
+	}
+	return from, to, nil
+}
+
 func calEventFromArgs(req mcp.CallToolRequest) (CalEvent, error) {
 	args := req.GetArguments()
 	summary, _ := args["summary"].(string)
@@ -459,14 +442,25 @@ func calEventFromArgs(req mcp.CallToolRequest) (CalEvent, error) {
 	if err != nil {
 		return CalEvent{}, fmt.Errorf("start must be RFC3339")
 	}
-	ev := CalEvent{Summary: summary, Start: start}
+	ev := CalEvent{UID: "eve-" + events.NewID() + "@local", Summary: summary, Start: start, End: start.Add(time.Hour)}
 	if endStr != "" {
-		if t, err := time.Parse(time.RFC3339, endStr); err == nil {
-			ev.End = t
+		t, err := time.Parse(time.RFC3339, endStr)
+		if err != nil {
+			return CalEvent{}, fmt.Errorf("end must be RFC3339")
 		}
+		ev.End = t
 	}
 	if r, ok := args["rrule"].(string); ok {
+		if strings.ContainsAny(r, "\r\n") {
+			return CalEvent{}, fmt.Errorf("invalid recurrence rule")
+		}
+		if _, err := rrule.StrToROption(r); r != "" && err != nil {
+			return CalEvent{}, err
+		}
 		ev.RRule = r
+	}
+	if !ev.End.After(ev.Start) {
+		return CalEvent{}, fmt.Errorf("end must be after start")
 	}
 	return ev, nil
 }
@@ -480,15 +474,19 @@ type CalPoller struct {
 	cal      *CalStore
 	manager  *Manager
 	interval time.Duration
-	seen     map[string]bool
 }
 
 func NewCalPoller(cal *CalStore, m *Manager, interval time.Duration) *CalPoller {
-	return &CalPoller{cal: cal, manager: m, interval: interval, seen: map[string]bool{}}
+	pollInterval := 30 * time.Second
+	if cal.cfg.ReminderLead > 0 {
+		pollInterval = min(pollInterval, max(time.Second, cal.cfg.ReminderLead/2))
+	}
+	return &CalPoller{cal: cal, manager: m, interval: pollInterval}
 }
 
 // Run blocks until ctx is cancelled, checking for imminent events on each tick.
 func (p *CalPoller) Run(ctx context.Context) {
+	p.check(ctx)
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 	for {
@@ -512,17 +510,15 @@ func (p *CalPoller) check(ctx context.Context) {
 	if lead == 0 {
 		lead = 15 * time.Minute
 	}
-	ev, ok := upcomingReminder(evs, lead)
-	if !ok {
-		return
-	}
-	key := ev.UID + "@" + ev.Start.Format("20060102T150405Z")
-	if p.seen[key] {
-		return
-	}
-	p.seen[key] = true
-	msg := fmt.Sprintf("Reminder: %s at %s.", ev.Summary, ev.Start.Local().Format(time.RFC3339))
-	if err := p.manager.Router.Notify(ctx, p.manager.store.PrimaryConversationID(), msg, PurposeReminder, ""); err != nil {
-		slog.Warn("calendar reminder notify", "uid", ev.UID, "error", err)
+	for _, ev := range evs {
+		if !ev.Start.After(time.Now()) || ev.Start.After(time.Now().Add(lead)) {
+			continue
+		}
+		key := "calendar-" + ev.UID + "@" + ev.Start.UTC().Format("20060102T150405Z")
+		msg := fmt.Sprintf("Reminder: %s at %s.", ev.Summary, ev.Start.Local().Format(time.RFC3339))
+		if _, err := p.manager.EnqueueNotification(key, p.manager.store.PrimaryConversationID(), msg, PurposeReminder, ""); err != nil {
+			p.manager.RecordPollHealth("calendar", err)
+			slog.Warn("calendar reminder enqueue", "uid", ev.UID, "error", err)
+		}
 	}
 }

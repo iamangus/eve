@@ -62,6 +62,33 @@ Browser ──HTTP──> eve BFF ──HTTP + Bearer API key──> agentfoundr
   `active_run_id` by polling agentfoundry's `GET /api/v1/runs/{id}`. Expired
   queue leases are eligible for delivery again after restart.
 
+### Reliability and privacy
+
+- Authentication remains an external deployment concern; Eve does not add a
+  login or MCP authentication layer. Do not expose it to untrusted networks.
+- A Matrix room may use the private owner conversation only when a fresh
+  membership lookup finds exactly two joined members: Eve and a configured
+  owner Matrix identity. Membership is checked again before delivery. Shared
+  rooms are not given private context; rejected inbound events remain visible
+  in `GET /api/inbox/matrix`. Unknown membership never authorizes delivery.
+- Matrix events are queued before their sync cursor is committed. Missing keys
+  and transient storage/network failures retry durably. Replay indices and
+  encryption state survive restarts. Previously encrypted rooms never silently
+  downgrade to plaintext.
+- Proactive messages are accepted only after a durable outbox write. Busy or
+  unavailable channels retry with backoff; `GET /api/deliveries` exposes status
+  and errors. Supply `delivery_id` to `POST /api/notify` or `send_message` when
+  retrying the same notification. Accepted means queued, not delivered.
+- Task replies use distinct persistent attempt IDs. Completed attempts are
+  applied once; stale outcomes cannot overwrite replies or cancellation.
+- A data-directory lock prevents concurrent Eve processes. JSON writes sync
+  both the file and containing directory. Conversation deletion is journaled
+  and resumed after restart, including derived memories and associated tasks.
+- History APIs default to 200 messages; `before_id` and `limit` (1–1000) page
+  backwards. The browser offers **Load earlier messages**. The Context tab
+  describes local bootstrap history, not the live token usage of an existing
+  persistent AgentFoundry run. Task tools query current task state explicitly.
+
 ## Leveraging agentfoundry for derived tasks
 
 agentfoundry agents are cheap to spin up and composable. Conversation titles
@@ -87,12 +114,23 @@ matches a configured trigger.
   runs `ASSISTANT_AGENT_ID` with the trigger prompt plus the email details and
   records the outcome in a **runs** log (status, agent result, error).
 - The first poll of a new account only ingests the last 7 days of mail.
-- Accounts, triggers, and run history persist as JSON in `DATA_DIR`
-  (`accounts.json`, `triggers.json`, `runs.json`). Account passwords are stored
-  in plaintext in `accounts.json` — fine for a single-user self-hosted
-  deployment, not for shared hosting. Run history is capped at the latest 1000
-  runs. A `processed.json` set records delivered message IDs so a message is
-  handled at most once even if it is re-fetched.
+- Accounts, triggers, cursors, processed IDs, and run history persist atomically
+  in `DATA_DIR/email_state.json`. Legacy `accounts.json`, `triggers.json`,
+  `runs.json`, and `processed.json` are imported when no combined state exists;
+  the originals are left untouched and are no longer authoritative after the
+  first successful write. Back up before upgrading. Account passwords remain
+  plaintext in the protected state file; protect the directory and backups.
+- At most 1000 terminal/history records are retained, without evicting pending
+  or running jobs. Accepted trigger attempts survive restart and are dispatched
+  with stable idempotency keys. IMAP cursors advance only after durable
+  acceptance and track UIDVALIDITY. Fetches are batched and bodies are bounded.
+- Owner-command email requires both an owner identity match and a passing,
+  aligned DMARC result from the account's configured `trusted_authserv_id`.
+  Configure this in the account editor only when the trusted mail gateway
+  strips forged Authentication-Results headers and enforces sender policy.
+  Without that configuration, email can match automation rules but cannot
+  impersonate an owner conversation input. From-address matching alone is not
+  authentication. Do not use a sender substring trigger as authorization.
 
 ## Configuration
 
@@ -107,18 +145,15 @@ All configuration is via environment variables (no YAML).
 | `ROUTER_AGENT_ID` | *(empty, optional)* | Agent id of the message router (see `definitions/router.yaml` in agentfoundry). When set, proactive and async sends are routed by this agent; when empty, delivery falls back mechanically to the best reachable output channel. |
 | `EVEMCP_URL` | `http://localhost:8090/mcp` | URL agentfoundry dials to reach eve's MCP server. Attached as an ephemeral server to automation-triggered runs (task transitions), exposing the full tool surface — `send_message`, `list_channels`, task tools, calendar tools — so Eve can decide whether to proactively contact the user. In Docker, use `http://eve:8090/mcp`. |
 | `EVEMCP_CHAT_URL` | `http://localhost:8090/mcp/chat` | URL agentfoundry dials for user-triggered runs (web chat, email, Matrix, SMS, voice). Serves the chat surface: task + calendar tools but **no** `send_message`/`list_channels` — the user triggered Eve, so her reply is delivered mechanically back to the origin channel and she never routes her own reply mid-conversation. Defaults to the same host as `EVEMCP_URL` with the path swapped to `/mcp/chat`. |
-
-User-triggered runs attach this restricted server as `eve-chat`; automation
-runs attach the full MCP server as `eve`. The distinct names let concurrent
-runs use different endpoints without replacing each other's connections.
 | `PROACTIVE_ENABLED` | `true` | Whether Eve may deliver messages outside a conversation turn (notifications, reminders, questions via `send_message`). |
 | `PROACTIVE_COOLDOWN` | `2m` | Minimum gap between proactive messages (Go duration). |
-| `PROACTIVE_BACKOFF_MAX` | `10m` | Max retry backoff when delivery is deferred (e.g. user absent, conversation busy) (Go duration). |
 | `TASK_POLL_INTERVAL` | `2s` | How often eve polls background task runs in agentfoundry (Go duration). |
+| `TASK_HISTORY_RETENTION` | `0s` | Optional time after which reported terminal tasks move to individual files under `tasks-archive/`. Zero disables automatic archiving. Active/unreported tasks and pending cancellations are never archived. |
+| `EVENT_HISTORY_RETENTION` | `720h` | Completed events move from the hot JSON queues to indexed individual records after 30 days. Pending, leased, and failed events are never automatically removed. |
+| `EVENT_DEDUP_RETENTION` | `2160h` | Completed event deduplication/status records expire after 90 days. Must be at least `EVENT_HISTORY_RETENTION`. Retrying an ID after this window may execute it again. |
 | `TASK_DECISION_AGENT` | *(empty, optional)* | Agent id Eve runs on task transitions (normally `ASSISTANT_AGENT_ID`). The run gets the full MCP surface (`send_message` included) and Eve decides autonomously whether to contact the user; no reply text is ever delivered mechanically. When empty, transitions are surfaced without a decision run. |
-| `TASKS_FILE` | `./data/tasks.json` | JSON file persisting background tasks (task board). |
 | `WEB_PRESENCE_TIMEOUT` | `60s` | How long the web channel counts as "present" after the last heartbeat or message. Drives routing decisions for proactive sends. |
-| `HISTORIAN_AGENT_ID` | *(empty, optional)* | Agent id of the historian agent (see `definitions/historian.yaml` in agentfoundry). When set, eve compresses old history into tiered summaries, captures durable memories, and renders a decayed context within the budget. When empty, full raw history is sent. |
+| `HISTORIAN_AGENT_ID` | *(empty, optional)* | Agent id of the historian agent (see `definitions/historian.yaml` in agentfoundry). When set, Eve summarizes old history and captures durable memories. When empty, history stays raw, subject to bootstrap safety limits. |
 | `CONTEXT_BUDGET_TOKENS` | `64000` | Target size of the rendered conversation history in tokens. |
 | `CONTEXT_TRIGGER_FRACTION` | `0.5` | Fraction of the budget at which the unsummarized tail triggers a historian run. |
 | `CONTEXT_PROTECTED_TAIL_TOKENS` | `12000` | Newest raw history (tokens) that always stays raw, never summarized or truncated. |
@@ -132,10 +167,12 @@ runs use different endpoints without replacing each other's connections.
 | `SMTP_PORT` | `587` | SMTP port (STARTTLS; use `465` for implicit TLS). |
 | `SMTP_USERNAME` | _unset_ | SMTP auth username (empty disables auth). |
 | `SMTP_PASSWORD` | _unset_ | SMTP auth password. |
-| `SMTP_FROM` | _unset_ | Sender address used on outbound mail, e.g. `eve@example.com`. Also the default recipient for email replies. |
+| `SMTP_FROM` | _unset_ | Sender address used on outbound mail, e.g. `eve@example.com`. |
+| `SMTP_TO` | _unset_ | Optional proactive email destination; otherwise the configured owner's email channel is used. Never defaults to the bot sender address. |
 | `MATRIX_HOMESERVER` | _unset_ | Matrix homeserver base URL, e.g. `https://matrix.example.com`. When set, the matrix channel is enabled: Eve's `send_message` and proactive notifications can be delivered to a room, and incoming `m.room.message` events are ingested into the primary conversation. |
 | `MATRIX_ACCESS_TOKEN` | _unset_ | Matrix client access token for the bot account. |
-| `MATRIX_USER_ID` | _unset_ | Matrix user ID of the bot (own messages are never re-ingested). Also the default recipient for matrix sends. |
+| `MATRIX_USER_ID` | _unset_ | Matrix user ID of the bot. Startup discovers the canonical user/device from the token; bot messages are never re-ingested. |
+| `MATRIX_OWNER_ROOM` | _unset_ | Optional proactive room preference. It must still contain exactly Eve and the owner. Without it, Eve discovers a qualifying joined room. |
 | `MATRIX_PICKLE_KEY` | _unset_ | Optional key protecting the matrix E2EE crypto store (`eve_matrix.json`). When unset it is derived from `MATRIX_ACCESS_TOKEN`, so the key stays stable across restarts without extra config. |
 | `CALDAV_URL` | _unset_ | CalDAV server base URL. When set, the calendar channel is enabled: Eve gets `get_calendar` / `create_event` / `update_event` / `delete_event` / `free_busy` MCP tools, and a poller fires proactive reminders for events starting within `CAL_REMINDER_LEAD`. Quiet hours are expressed as daily recurring events. |
 | `CALDAV_USERNAME` | _unset_ | CalDAV basic-auth username. |
@@ -146,6 +183,31 @@ runs use different endpoints without replacing each other's connections.
 | `VOICE_WEBHOOK_TOKEN` | _unset_ | Token guarding the voice-device inbound webhook `POST /api/inbound/voice`. Same behavior as SMS: input-only, with an optional `transcript` field for STT payloads, exercising the fallback router since a speakerless device cannot receive Eve's answer. |
 
 The web UI has a **Channels** tab (`GET /api/channels`) showing every registered channel's capabilities, presence (`connected`, last activity, which lapses after `WEB_PRESENCE_TIMEOUT`), and the health of each background poller (email/matrix/calendar — last check time and last error). It refreshes every 5s and live-updates via the `/api/events` stream when presence changes.
+
+Secrets `AGENTFOUNDRY_API_KEY`, `SMTP_PASSWORD`, `MATRIX_ACCESS_TOKEN`,
+`MATRIX_PICKLE_KEY`, `CALDAV_PASSWORD`, and webhook tokens also support a
+`_FILE` variant containing the secret, for example `SMTP_PASSWORD_FILE`.
+Setting both forms is an error. Invalid settings fail startup rather than
+silently falling back. `BACKEND_AGENT_ID` defaults to `ASSISTANT_AGENT_ID`.
+
+User-triggered runs attach the restricted server as `eve-chat`; automation
+runs attach the full MCP server as `eve`. The distinct names let concurrent
+runs use different endpoints without replacing each other's connections.
+
+CalDAV uses discovery when no collection path is configured (exactly one
+calendar must be found), otherwise the configured collection. Updates and
+deletes retain resource hrefs and require ETags. Event updates affect the
+series master and preserve recurrence exceptions. iCalendar parsing supports
+IANA time zones, DST, recurrence rules, exclusions, and folded/escaped text;
+expansion is bounded. Reminder polling is at least every 30 seconds (faster for short leads), independently of
+lead time, and every due occurrence is durably enqueued.
+
+`GET /healthz` reports process liveness; `GET /readyz` reports whether Eve is
+accepting requests. Dependency outages do not prevent durable acceptance.
+Authenticated OpenDev event inspection/retry uses
+`GET /api/inbound/opendev/events` and
+`POST /api/inbound/opendev/events/{id}/retry`. Failed Matrix inbox entries can
+be retried with `POST /api/inbox/matrix/{id}/retry` after resolving their cause.
 
 ## Build and Run
 
@@ -160,6 +222,19 @@ npm run build     # outputs frontend/dist (embedded via //go:embed)
 ```
 
 ### Backend
+
+Use Go **1.26.9 or a newer patched toolchain**. If your environment sets
+`GOTOOLCHAIN=local`, update Go or explicitly use `GOTOOLCHAIN=go1.26.9`.
+`make build`, `make test`, `make e2e`, `make vet`, and `make audit` are the canonical
+commands; `make check` runs all checks. Both local and CI builds use `goolm`.
+Install the browser test runtime once with
+`cd frontend && npx playwright install chromium`. CI also tests a fresh
+container volume and a stopped-store backup/restore before image publishing.
+The process-level restore test can be run without Docker:
+`python3 scripts/smoke_restore.py /absolute/path/to/the/built/eve`.
+It uses isolated temporary data and no external accounts. The complete numbered
+implementation audit and remaining live-validation limits are in
+[`docs/review-implementation.md`](docs/review-implementation.md).
 
 ```bash
 go build -tags goolm -o eve ./cmd/server/
@@ -199,6 +274,52 @@ docker run -p 8090:8090 \
 ```
 
 ## Store
+
+### Backup and restore
+
+1. Stop Eve and wait for shutdown; never copy a live multi-file store as a
+   supposedly consistent backup.
+2. Back up the entire `DATA_DIR`, including crypto metadata, inbox/outbox
+   subdirectories, deletion journals, and `email_state.json`. Encrypt backups.
+3. Restore into a dedicated directory readable/writable only by Eve's runtime
+   user. Preserve the Matrix pickle key independently; rotating the access
+   token without an explicit stable pickle key changes the derived key.
+4. Start one Eve instance. Verify health, task/queue statuses, and an owner
+   channel reply before resuming automation. Do not run an older version
+   against a directory migrated to `email_state.json`.
+
+Completed queue payloads are discarded after successful acknowledgement while
+deduplication tombstones remain queryable for `EVENT_DEDUP_RETENTION` (90 days
+by default). Records older than `EVENT_HISTORY_RETENTION` (30 days) move to
+individual indexed files under each queue's `completed/` directory, reducing
+the hot store's rewrite costs. Inspection lists and queue metrics cover the hot
+store; the individual event status API also looks up archived records. Failed
+or unfinished work never expires automatically. Conversation history and tasks are not
+silently expired. The task board can archive reported terminal tasks explicitly,
+or `TASK_HISTORY_RETENTION` can move old reported results out of the hot store.
+Archived results remain readable by task ID and from the paginated archive
+view; no task data is deleted. Conversations can be exported from Chat before
+explicit deletion. `go test -tags goolm ./internal/store -run '^$'
+-bench BenchmarkConversationAppend -benchtime=1x` measures whole-file write
+cost; large deployments should plan an indexed/transactional storage migration.
+
+Matrix keys and replay-protection state intentionally do not expire
+automatically: removing them can make retained history undecryptable or weaken
+replay protection. Include them in protected backups and budget disk space for
+retained encrypted history. Conversation exports followed by explicit deletion
+and task archival are deliberate, non-silent history retention controls.
+
+SMTP delivery is **at least once**, not exactly once. A disconnect after DATA
+but before its acknowledgement is ambiguous: retries retain the same
+Message-ID, but receiving servers need not deduplicate it. The delivery error
+reports this uncertainty instead of claiming success. A disconnect during QUIT
+does not invalidate a successful DATA acknowledgement.
+
+Existing persistent runs can call `get_context_snapshot` for current durable
+memories and `list_tasks` for current task state. They are not silently rebuilt
+each turn. The Context page separately reports renderer estimates and the
+next-run bootstrap preview after task context and final message/byte limits;
+neither is advertised as live AgentFoundry token usage.
 
 Conversations live in a Go map guarded by a sync.RWMutex (`internal/store`)
 and persist as JSON in `DATA_DIR` (`conversations.json`,

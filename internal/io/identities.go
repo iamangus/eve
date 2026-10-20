@@ -7,7 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
+
+	"github.com/iamangus/eve/internal/durable"
 )
 
 // Identity is a known person who interacts with Eve. The owner identity is
@@ -108,6 +111,12 @@ func LoadResolver(dir string) (*Resolver, error) {
 }
 
 func key(t ChannelType, address string) string {
+	address = strings.TrimSpace(address)
+	if t == ChannelEmail {
+		if at := strings.LastIndexByte(address, '@'); at >= 0 {
+			address = address[:at+1] + strings.ToLower(address[at+1:])
+		}
+	}
 	return string(t) + "/" + address
 }
 
@@ -128,6 +137,26 @@ func (r *Resolver) ResolveName(name string) *Identity {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return cloneIdentity(r.byName[name])
+}
+
+func (r *Resolver) Destination(name string, channel ChannelType) (string, error) {
+	identity := r.ResolveName(name)
+	if identity == nil {
+		return "", fmt.Errorf("unknown identity %q", name)
+	}
+	address := ""
+	for _, entry := range identity.Channels {
+		if entry.Type == channel {
+			if address != "" && address != entry.Address {
+				return "", fmt.Errorf("identity %q has multiple %s destinations; configure an explicit address", name, channel)
+			}
+			address = entry.Address
+		}
+	}
+	if address == "" {
+		return "", fmt.Errorf("identity %q has no %s destination", name, channel)
+	}
+	return address, nil
 }
 
 // Owner returns the owner identity.
@@ -188,6 +217,12 @@ func (r *Resolver) Upsert(in Identity) error {
 	channels := make([]IdentityChannel, 0, len(in.Channels))
 	seen := make(map[string]bool)
 	for _, c := range in.Channels {
+		switch c.Type {
+		case ChannelWeb, ChannelEmail, ChannelMatrix, ChannelSMS, ChannelVoice:
+		default:
+			return fmt.Errorf("unknown channel type: %s", c.Type)
+		}
+		c.Address = strings.TrimSpace(c.Address)
 		if c.Address == "" {
 			continue
 		}
@@ -322,16 +357,12 @@ func (r *Resolver) saveLocked() error {
 	if err != nil {
 		return fmt.Errorf("encode identities.json: %w", err)
 	}
-	if err := os.MkdirAll(r.dir, 0o755); err != nil {
+	if err := os.MkdirAll(r.dir, 0o700); err != nil {
 		return fmt.Errorf("ensure data dir: %w", err)
 	}
 	path := filepath.Join(r.dir, "identities.json")
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := durable.Write(path, data); err != nil {
 		return fmt.Errorf("write identities.json tmp: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("rename identities.json: %w", err)
 	}
 	return nil
 }

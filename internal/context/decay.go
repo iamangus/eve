@@ -61,6 +61,22 @@ func (m *Manager) renderHistory(convID string, beforeID int64) ([]agentfoundry.M
 	if err != nil {
 		return nil, RenderStats{}, err
 	}
+	if !m.Enabled() {
+		var history []agentfoundry.Message
+		tokens := 0
+		for _, msg := range msgs {
+			if beforeID > 0 && msg.ID >= beforeID {
+				continue
+			}
+			history = append(history, agentfoundry.Message{Role: msg.Role, Content: store.HistoryContent(msg)})
+			tokens += EstimateTokens(store.HistoryContent(msg))
+		}
+		stats := RenderStats{BudgetTokens: m.cfg.BudgetTokens, TailTokens: tokens, RenderedTokens: tokens}
+		if stats.BudgetTokens > 0 {
+			stats.Pressure = float64(tokens) / float64(stats.BudgetTokens)
+		}
+		return history, stats, nil
+	}
 	boundary, err := m.store.SummarizedUpTo(convID)
 	if err != nil {
 		return nil, RenderStats{}, err
@@ -86,7 +102,7 @@ func (m *Manager) renderHistory(convID string, beforeID int64) ([]agentfoundry.M
 	}
 	tailTokens := 0
 	for _, msg := range tail {
-		tailTokens += EstimateTokens(msg.Content)
+		tailTokens += EstimateTokens(store.HistoryContent(msg))
 	}
 
 	mems := m.store.Memories()
@@ -112,11 +128,11 @@ func (m *Manager) renderHistory(convID string, beforeID int64) ([]agentfoundry.M
 		if text == "" {
 			continue
 		}
-		compTokens += rc.tokens
+		compTokens += EstimateTokens(text)
 		history = append(history, agentfoundry.Message{Role: "user", Content: text})
 	}
 	for _, msg := range tail {
-		history = append(history, agentfoundry.Message{Role: msg.Role, Content: msg.Content})
+		history = append(history, agentfoundry.Message{Role: msg.Role, Content: store.HistoryContent(msg)})
 	}
 
 	stats := RenderStats{
@@ -144,9 +160,17 @@ func (m *Manager) renderHistory(convID string, beforeID int64) ([]agentfoundry.M
 			Content: "[Earlier history truncated to stay within the context budget.]",
 		})
 		for _, msg := range keep {
-			history = append(history, agentfoundry.Message{Role: msg.Role, Content: msg.Content})
+			history = append(history, agentfoundry.Message{Role: msg.Role, Content: store.HistoryContent(msg)})
 		}
 		stats.Truncated = true
+		stats.TailTokens = 0
+		for _, msg := range keep {
+			stats.TailTokens += EstimateTokens(store.HistoryContent(msg))
+		}
+		stats.RenderedTokens = stats.CompartmentTokens + stats.MemoryTokens + stats.TailTokens + EstimateTokens("[Earlier history truncated to stay within the context budget.]")
+		if budget > 0 {
+			stats.Pressure = float64(stats.RenderedTokens) / float64(budget)
+		}
 	}
 	return history, stats, nil
 }

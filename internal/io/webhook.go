@@ -1,6 +1,9 @@
 package io
 
-import "net/http"
+import (
+	"crypto/subtle"
+	"net/http"
+)
 
 // WebhookConfig guards the inbound webhook endpoints for input-only channels.
 // SMS and voice have no output adapter in v1: they exercise the fallback
@@ -95,7 +98,7 @@ func tokenOK(r *http.Request, expected string) bool {
 		return false
 	}
 	if t := r.URL.Query().Get("token"); t != "" {
-		return t == expected
+		return subtle.ConstantTimeCompare([]byte(t), []byte(expected)) == 1
 	}
-	return r.Header.Get("Authorization") == "Bearer "+expected
+	return subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+expected)) == 1
 }

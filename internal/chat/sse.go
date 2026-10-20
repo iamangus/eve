@@ -22,6 +22,7 @@ func proxySSE(w http.ResponseWriter, src io.Reader, onEvent func(SSEEvent)) {
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	rc := http.NewResponseController(w)
+	_ = rc.Flush()
 	flushed := 0
 	lastFlush := time.Now()
 
@@ -56,6 +57,11 @@ func proxySSE(w http.ResponseWriter, src io.Reader, onEvent func(SSEEvent)) {
 			switch {
 			case trimmed == "":
 				dispatch()
+				if err := rc.Flush(); err != nil {
+					return
+				}
+				flushed = 0
+				lastFlush = time.Now()
 			case strings.HasPrefix(trimmed, ":"):
 			case strings.HasPrefix(trimmed, "id:"):
 			case strings.HasPrefix(trimmed, "retry:"):

@@ -9,6 +9,6 @@ permissions:
 
 jobs:
   ci:
-    uses: iamangus/opendev/.github/workflows/opendev-ci.yml@v4
+    uses: iamangus/opendev/.github/workflows/opendev-ci.yml@85a800c95e9b1d64ecc4031a5e62e571acccf8c8
     with:
       profile: auto

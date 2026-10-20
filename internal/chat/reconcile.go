@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/iamangus/eve/internal/agentfoundry"
 	"github.com/iamangus/eve/internal/io"
 )
 
@@ -29,6 +30,11 @@ func (h *Handler) Reconcile(ctx context.Context) {
 const maxReconcileRetries = 3
 
 func (h *Handler) reconcileOnce(ctx context.Context) {
+	for _, id := range h.store.DeleteRequests() {
+		if err := h.removeConversation(ctx, id); err != nil {
+			slog.Warn("resume conversation deletion", "conversation", id, "error", err)
+		}
+	}
 	runs, err := h.store.ActiveRuns()
 	if err != nil {
 		slog.Error("reconcile active runs", "error", err)
@@ -83,7 +89,7 @@ func (h *Handler) reconcileRun(ctx context.Context, convID, runID string) error 
 				return err
 			}
 			if conv.ActiveRunID == runID && !conv.ActiveSubmitted {
-				return h.ioMgr.RetryActiveInput(ctx, convID, runID)
+				return h.retryActiveInput(ctx, convID, runID)
 			}
 		}
 	}
@@ -100,7 +106,7 @@ func (h *Handler) reconcileRun(ctx context.Context, convID, runID string) error 
 				}
 				return h.store.ClearActiveRunID(convID, runID)
 			}
-			return h.ioMgr.RetryActiveInput(ctx, convID, runID)
+			return h.retryActiveInput(ctx, convID, runID)
 		}
 	}
 	if rs.Status == "failed" || rs.Status == "cancelled" || rs.Status == "canceled" || rs.Status == "error" || rs.Status == "unknown" {
@@ -128,12 +134,26 @@ func (h *Handler) reconcileRun(ctx context.Context, convID, runID string) error 
 	}
 }
 
+func (h *Handler) retryActiveInput(ctx context.Context, convID, runID string) error {
+	err := h.ioMgr.RetryActiveInput(ctx, convID, runID)
+	if agentfoundry.IsInvalidRequest(err) {
+		active, lookupErr := h.store.ActiveRunForConversation(convID)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if active != "" {
+			return h.finishTurn(ctx, convID, active, "Error: input rejected: "+err.Error())
+		}
+	}
+	return err
+}
+
 func (h *Handler) finishTurn(ctx context.Context, convID, runID, response string) error {
 	if !h.store.DeliveryReady(convID, runID) {
 		return nil
 	}
 	if err := h.deliverTurn(ctx, convID, runID, response); err != nil {
-		if recordErr := h.store.RecordDeliveryFailure(convID, runID); recordErr != nil {
+		if recordErr := h.store.RecordDeliveryFailure(convID, runID, err.Error()); recordErr != nil {
 			return recordErr
 		}
 		return err

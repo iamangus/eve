@@ -25,7 +25,9 @@ func newID() string {
 // busy check) is injected as functions so tasks never imports io (io imports
 // tasks for the MCP tools).
 type Config struct {
-	PollInterval time.Duration
+	PollInterval       time.Duration
+	HistoryRetention   time.Duration
+	ConversationExists func(string) error
 	// DecisionAgent is the main assistant agent id, used to decide whether a
 	// task transition warrants a proactive message.
 	DecisionAgent string
@@ -70,9 +72,22 @@ func (m *Manager) Get(id string) (Task, error)             { return m.store.Get(
 func (m *Manager) List() []Task                            { return m.store.List() }
 func (m *Manager) ListByConversation(convID string) []Task { return m.store.ListByConversation(convID) }
 
+func (m *Manager) Archive(id string) error { return m.store.Archive(id) }
+func (m *Manager) ListArchived(offset, limit int) ([]Task, error) {
+	return m.store.ListArchived(offset, limit)
+}
+
 // SpawnTask kicks off a background subtask: the given agent is run with a
 // structured-output schema so it can report completion or request input.
 func (m *Manager) SpawnTask(ctx context.Context, convID, agentID, agentName, message string) (Task, error) {
+	if strings.TrimSpace(agentID) == "" || strings.TrimSpace(message) == "" || len(agentID) > 256 || len(agentName) > 256 || len(message) > 512*1024 {
+		return Task{}, fmt.Errorf("invalid task agent, name, or message")
+	}
+	if m.cfg.ConversationExists != nil {
+		if err := m.cfg.ConversationExists(convID); err != nil {
+			return Task{}, err
+		}
+	}
 	if strings.TrimSpace(message) == "" {
 		return Task{}, fmt.Errorf("task message is required")
 	}
@@ -93,15 +108,21 @@ func (m *Manager) SpawnTask(ctx context.Context, convID, agentID, agentName, mes
 		return Task{}, err
 	}
 	if err := m.startRun(ctx, &t); err != nil {
-		_ = m.store.SetFailed(t.ID, "failed to start: "+err.Error())
-		return Task{}, err
+		current, _ := m.store.Get(t.ID)
+		if current.Status != StatusRunning {
+			return Task{}, err
+		}
+		slog.Warn("task queued for dispatch retry", "task", t.ID, "error", err)
 	}
 	slog.Info("task spawned", "task", t.ID, "agent", agentID, "conv", convID)
-	return t, nil
+	return m.store.Get(t.ID)
 }
 
 // Reply appends a user reply and re-runs the child agent with it.
 func (m *Manager) Reply(ctx context.Context, id, content string) error {
+	if strings.TrimSpace(content) == "" || len(content) > 512*1024 {
+		return fmt.Errorf("task reply must be nonempty and at most 512 KiB")
+	}
 	if strings.TrimSpace(content) == "" {
 		return fmt.Errorf("reply is required")
 	}
@@ -109,7 +130,7 @@ func (m *Manager) Reply(ctx context.Context, id, content string) error {
 	if err != nil {
 		return err
 	}
-	if existing.Terminal() {
+	if existing.Status != StatusNeedsInput {
 		return fmt.Errorf("task %s is %s and cannot receive replies", id, existing.Status)
 	}
 	if err := m.store.Reply(id, content); err != nil {
@@ -120,7 +141,14 @@ func (m *Manager) Reply(ctx context.Context, id, content string) error {
 		return err
 	}
 	slog.Info("task replied", "task", id)
-	return m.startRun(ctx, &t)
+	if err := m.startRun(ctx, &t); err != nil {
+		current, getErr := m.store.Get(id)
+		if getErr != nil || current.Status != StatusRunning {
+			return err
+		}
+		slog.Warn("task reply queued for dispatch retry", "task", id, "error", err)
+	}
+	return nil
 }
 
 // Cancel stops a background task. If the task's child run is still executing
@@ -134,28 +162,59 @@ func (m *Manager) Cancel(ctx context.Context, id string) error {
 	if existing.Terminal() {
 		return fmt.Errorf("task %s is %s and cannot be cancelled", id, existing.Status)
 	}
+	if err := m.store.Cancel(id); err != nil {
+		return err
+	}
 	if existing.RunID != "" && existing.Status == StatusRunning {
 		if err := m.client.CancelRun(ctx, existing.RunID); err != nil {
 			slog.Warn("cancel task run", "task", id, "run", existing.RunID, "error", err)
 		}
 	}
-	return m.store.Cancel(id)
+	return nil
 }
 
 // startRun launches the child agent for a task and records the run id. The
 // prompt carries the full task context plus any prior replies. The run is
 // tagged with the task id so it can be rediscovered after an eve restart.
 func (m *Manager) startRun(ctx context.Context, t *Task) error {
+	if m.cfg.ConversationExists != nil {
+		if err := m.cfg.ConversationExists(t.ConversationID); err != nil {
+			_ = m.store.Cancel(t.ID)
+			return err
+		}
+	}
 	prompt := m.buildPrompt(t)
 	runID, err := m.client.RunAgentWith(ctx, t.AgentID, agentfoundry.RunOptions{
 		Message:        prompt,
 		ResponseSchema: taskSchema(),
-		TaskID:         t.ID,
+		TaskID:         t.DispatchKey(),
 	})
 	if err != nil {
+		if agentfoundry.IsInvalidRequest(err) {
+			_ = m.store.Finish(*t, StatusFailed, err.Error())
+		} else {
+			_ = m.store.DispatchFailed(*t, err.Error())
+		}
 		return fmt.Errorf("task agent run: %w", err)
 	}
-	return m.store.SetRunID(t.ID, runID)
+	if err := m.store.AttachRun(*t, runID); err != nil {
+		if current, getErr := m.store.Get(t.ID); getErr == nil && current.Attempt == t.Attempt && current.Status == StatusRunning {
+			if current.RunID == runID {
+				return nil
+			}
+			if current.RunID == "" {
+				return err
+			}
+		}
+		_ = m.store.TrackCancelledAttempt(*t, runID)
+		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		if err := m.client.CancelRun(cancelCtx, runID); err == nil || agentfoundry.IsStaleRun(err) {
+			_ = m.store.CancelAcknowledged(t.ID, runID)
+		}
+		cancel()
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) buildPrompt(t *Task) string {
@@ -184,6 +243,7 @@ func (m *Manager) buildPrompt(t *Task) string {
 // forever. Call once before the poller starts.
 func (m *Manager) Reconcile(ctx context.Context) {
 	for _, t := range m.store.Active() {
+		expected := t
 		rs, err := m.resolveRun(ctx, t)
 		if err != nil {
 			slog.Warn("task reconcile", "task", t.ID, "error", err)
@@ -191,21 +251,27 @@ func (m *Manager) Reconcile(ctx context.Context) {
 		}
 		if rs == nil {
 			if t.RunID == "" {
-				slog.Warn("task reconcile: no run found", "task", t.ID)
-				_ = m.store.SetFailed(t.ID, "task run was lost during restart")
+				_ = m.startRun(ctx, &t)
 			}
+			continue
+		}
+		t, err = m.store.Get(t.ID)
+		if err != nil {
+			continue
+		}
+		if t.Attempt != expected.Attempt || (expected.RunID != "" && expected.RunID != t.RunID) {
 			continue
 		}
 		switch rs.Status {
 		case "completed":
 			outcome := parseOutcome(rs.Response)
-			if err := m.store.SetOutcome(t.ID, outcome.Status, outcome.Text); err != nil {
+			if err := m.store.Finish(t, outcome.Status, outcome.Text); err != nil {
 				slog.Warn("task reconcile outcome", "task", t.ID, "error", err)
 			} else {
 				slog.Info("task reconciled", "task", t.ID, "status", outcome.Status)
 			}
 		case "failed", "error", "cancelled", "canceled":
-			_ = m.store.SetFailed(t.ID, "child agent run did not complete")
+			_ = m.store.Finish(t, StatusFailed, "child agent run did not complete")
 		case "running", "":
 			if t.RunID == "" {
 				slog.Info("task run reattached", "task", t.ID)
@@ -227,7 +293,17 @@ func (m *Manager) resolveRun(ctx context.Context, t Task) (*agentfoundry.RunStat
 			slog.Warn("task reconcile get run", "task", t.ID, "run", t.RunID, "error", err)
 		}
 	}
-	return m.client.FindRunByTaskID(ctx, t.ID)
+	rs, err := m.client.FindRunByTaskID(ctx, t.DispatchKey())
+	if err != nil || rs == nil {
+		return rs, err
+	}
+	if rs.ID == "" {
+		return nil, fmt.Errorf("task lookup returned no run ID")
+	}
+	if err := m.store.AttachRun(t, rs.ID); err != nil {
+		return nil, err
+	}
+	return rs, nil
 }
 
 func (m *Manager) Run(ctx context.Context) {
@@ -245,8 +321,33 @@ func (m *Manager) Run(ctx context.Context) {
 }
 
 func (m *Manager) poll(ctx context.Context) {
+	if m.cfg.ConversationExists != nil {
+		for _, task := range m.store.List() {
+			if task.Active() {
+				if err := m.cfg.ConversationExists(task.ConversationID); err != nil {
+					if err := m.Cancel(ctx, task.ID); err != nil {
+						slog.Warn("cancel detached task", "task", task.ID, "error", err)
+					}
+				}
+			}
+		}
+	}
+	for _, task := range m.store.List() {
+		if !task.CancellationPending {
+			continue
+		}
+		if err := m.client.CancelRun(ctx, task.RunID); err == nil || agentfoundry.IsStaleRun(err) {
+			_ = m.store.CancelAcknowledged(task.ID, task.RunID)
+		}
+	}
 	for _, t := range m.store.Active() {
 		if t.RunID == "" {
+			if time.Now().Before(t.NextDispatchAt) {
+				continue
+			}
+			if err := m.startRun(ctx, &t); err != nil {
+				slog.Warn("retry task dispatch", "task", t.ID, "error", err)
+			}
 			continue
 		}
 		pollCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -258,18 +359,27 @@ func (m *Manager) poll(ctx context.Context) {
 		switch rs.Status {
 		case "completed":
 			outcome := parseOutcome(rs.Response)
-			if err := m.store.SetOutcome(t.ID, outcome.Status, outcome.Text); err != nil {
+			if err := m.store.Finish(t, outcome.Status, outcome.Text); err != nil {
 				slog.Warn("task outcome", "task", t.ID, "error", err)
 			} else {
 				slog.Info("task transition", "task", t.ID, "status", outcome.Status)
 			}
 		case "failed", "error", "cancelled", "canceled", "unknown":
-			if err := m.store.SetFailed(t.ID, "child agent run did not complete"); err != nil {
+			if err := m.store.Finish(t, StatusFailed, "child agent run did not complete"); err != nil {
 				slog.Warn("task failed", "task", t.ID, "error", err)
 			}
 		}
 	}
 	m.decidePending(ctx)
+	if m.cfg.HistoryRetention > 0 {
+		for _, task := range m.store.List() {
+			if task.Terminal() && task.Reported && !task.CancellationPending && time.Since(task.UpdatedAt) > m.cfg.HistoryRetention {
+				if err := m.store.Archive(task.ID); err != nil {
+					slog.Warn("archive task", "task", task.ID, "error", err)
+				}
+			}
+		}
+	}
 }
 
 // decidePending surfaces task transitions: for each unreported terminal or
@@ -279,9 +389,9 @@ func (m *Manager) poll(ctx context.Context) {
 // send_message herself, and if she does not, the user is not bothered. It
 // never interrupts an in-flight conversation.
 func (m *Manager) decidePending(ctx context.Context) {
-	if m.cfg.DecisionAgent == "" {
+	if m.cfg.DecisionAgent == "" || !m.cfg.Proactive {
 		for _, t := range m.store.Unreported() {
-			_ = m.store.MarkReported(t.ID)
+			_ = m.store.Report(t)
 		}
 		return
 	}
@@ -309,7 +419,7 @@ func (m *Manager) decidePending(ctx context.Context) {
 		}
 		// Eve made her call (called send_message or chose not to); the
 		// transition is handled either way.
-		_ = m.store.MarkReported(t.ID)
+		_ = m.store.Report(t)
 	}
 }
 
@@ -321,6 +431,7 @@ func (m *Manager) decide(ctx context.Context, t Task) error {
 	runID, err := m.client.RunAgentWith(ctx, m.cfg.DecisionAgent, agentfoundry.RunOptions{
 		Message:    prompt,
 		MCPServers: m.cfg.MCPServers,
+		TaskID:     fmt.Sprintf("decision-%s-%d", t.ID, t.Revision),
 	})
 	if err != nil {
 		return fmt.Errorf("decision run: %w", err)
@@ -336,6 +447,9 @@ func (m *Manager) decide(ctx context.Context, t Task) error {
 func (m *Manager) decisionPrompt(t Task) string {
 	var b strings.Builder
 	b.WriteString("A background task just changed state. Review it and decide whether the user needs to hear about it.\n\n")
+	if t.ConversationID != "" {
+		fmt.Fprintf(&b, "Conversation ID: %s. Use this conversation_id when calling send_message.\n", t.ConversationID)
+	}
 	fmt.Fprintf(&b, "Task: %s\n", t.AgentName)
 	fmt.Fprintf(&b, "Details: %s\n", t.Message)
 	switch t.Status {

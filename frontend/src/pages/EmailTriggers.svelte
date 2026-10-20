@@ -7,6 +7,8 @@
   let loading = $state(true)
 
   let showAccountForm = $state(false)
+  let editingAccountID = $state('')
+  let savingAccount = $state(false)
   let acctForm = $state({ address: '', host: '', port: 993, username: '', password: '', use_tls: true })
   let acctError = $state('')
   let acctResults = $state({})
@@ -40,6 +42,7 @@
       runs = r
     } catch (e) {
       console.error('Failed to load email data', e)
+      acctError = e.message
     } finally {
       loading = false
     }
@@ -59,22 +62,33 @@
   }
 
   function openAccountForm() {
+    editingAccountID = ''
     showAccountForm = !showAccountForm
     acctError = ''
     if (showAccountForm) {
-      acctForm = { address: '', host: '', port: 993, username: '', password: '', use_tls: true }
+      acctForm = { address: '', host: '', port: 993, username: '', password: '', use_tls: true, enabled: true, trusted_authserv_id: '' }
     }
   }
 
   async function saveAccount() {
+    if (savingAccount) return
+    savingAccount = true
     acctError = ''
     try {
-      await api.post('/api/email/accounts', acctForm)
+      if (editingAccountID) await api.put('/api/email/accounts/' + editingAccountID, acctForm)
+      else await api.post('/api/email/accounts', acctForm)
       showAccountForm = false
       await loadAll()
     } catch (e) {
       acctError = e.message
-    }
+    } finally { savingAccount = false }
+  }
+
+  function editAccount(a) {
+    editingAccountID = a.id
+    acctForm = { address: a.address, host: a.host, port: a.port, username: a.username, password: '', use_tls: a.use_tls, enabled: a.enabled, trusted_authserv_id: a.trusted_authserv_id || '' }
+    acctError = ''
+    showAccountForm = true
   }
 
   async function testAccount(id) {
@@ -206,6 +220,7 @@
       <p>Accounts, matching rules, and execution history.</p>
     </header>
     <section class="card">
+      {#if acctError && !showAccountForm}<div class="form-error" role="alert">{acctError}</div>{/if}
       <div class="card-head">
         <h2>Email accounts</h2>
         <button class="btn" onclick={openAccountForm}>{showAccountForm ? 'Cancel' : '+ Add account'}</button>
@@ -233,9 +248,13 @@
               <input type="checkbox" bind:checked={acctForm.use_tls} />
               Use implicit TLS (SSL)
             </label>
+            <label>Trusted authentication server ID
+              <input bind:value={acctForm.trusted_authserv_id} placeholder="Optional: your mail gateway's authserv-id" />
+            </label>
+            <label class="check"><input type="checkbox" bind:checked={acctForm.enabled} />Enabled</label>
           </div>
           {#if acctError}<div class="form-error">{acctError}</div>{/if}
-          <button class="btn primary" onclick={saveAccount}>Save account</button>
+          <button class="btn primary" onclick={saveAccount} disabled={savingAccount}>{savingAccount ? 'Saving…' : 'Save account'}</button>
         </div>
       {/if}
 
@@ -256,6 +275,7 @@
                 {/if}
               </div>
               <div class="row-actions">
+                <button class="btn" onclick={() => editAccount(a)}>Edit</button>
                 <button class="btn" onclick={() => testAccount(a.id)}>Test</button>
                 <button class="btn danger" onclick={() => deleteAccount(a.id)}>Delete</button>
               </div>

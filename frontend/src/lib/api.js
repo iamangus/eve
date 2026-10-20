@@ -5,8 +5,7 @@ async function request(method, path, body) {
     body: body !== undefined ? JSON.stringify(body) : undefined,
   })
   if (res.status === 401) {
-    window.location.href = '/login'
-    return
+    throw new Error('Access denied. Check your deployment authentication settings.')
   }
   if (!res.ok) {
     let msg = res.statusText

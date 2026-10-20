@@ -2,9 +2,12 @@ package io
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"maunium.net/go/mautrix"
@@ -20,9 +23,10 @@ import (
 // to the manager's inbound path. Undecryptable events are never silently
 // dropped: they trigger a key request and are logged with a reason.
 type MatrixPoller struct {
-	cfg     MatrixConfig
-	manager *Manager
-	e2ee    *MatrixE2EE
+	cfg       MatrixConfig
+	manager   *Manager
+	e2ee      *MatrixE2EE
+	acceptErr error
 }
 
 // NewMatrixPoller returns the sync poller for the configured matrix channel.
@@ -45,7 +49,12 @@ func (p *MatrixPoller) Run(ctx context.Context) {
 		return
 	}
 	p.setupHandlers(syncer)
+	client.Syncer = &durableMatrixSyncer{Syncer: client.Syncer, poller: p}
 	p.seedStateStore(ctx)
+	var worker sync.WaitGroup
+	worker.Add(1)
+	go func() { defer worker.Done(); p.processInbox(ctx) }()
+	defer worker.Wait()
 
 	slog.Info("matrix sync started", "user", client.UserID, "device", client.DeviceID)
 	const backoff = 5 * time.Second
@@ -102,6 +111,10 @@ func (p *MatrixPoller) seedStateStore(ctx context.Context) {
 		if err := client.StateEvent(ctx, roomID, event.StateEncryption, "", &enc); err != nil {
 			// 404 means the room is not encrypted; that's expected for
 			// plaintext rooms and not an error worth surfacing.
+			if !errors.Is(err, mautrix.MNotFound) {
+				p.manager.RecordPollHealth("matrix", err)
+				slog.Warn("matrix encryption state unavailable", "room", roomID, "error", err)
+			}
 			continue
 		}
 		if _, err := client.JoinedMembers(ctx, roomID); err != nil {
@@ -116,61 +129,7 @@ func (p *MatrixPoller) seedStateStore(ctx context.Context) {
 // requests the key from the sender. Undecryptable events are logged with a
 // reason — never silently dropped.
 func (p *MatrixPoller) handleEncrypted(ctx context.Context, evt *event.Event) {
-	if evt.Sender == id.UserID(p.cfg.UserID) {
-		return
-	}
-	mach := p.e2ee.Mach()
-	content := evt.Content.AsEncrypted()
-	if content == nil {
-		slog.Warn("matrix: encrypted event has no content", "room", evt.RoomID, "sender", evt.Sender)
-		return
-	}
-	if content.Algorithm != id.AlgorithmMegolmV1 {
-		slog.Warn("matrix: unsupported encryption algorithm", "room", evt.RoomID, "sender", evt.Sender, "algorithm", content.Algorithm)
-		return
-	}
-
-	decrypted, err := mach.DecryptMegolmEvent(ctx, evt)
-	if errors.Is(err, crypto.ErrNoSessionFound) {
-		slog.Info("matrix: no session, waiting for keys", "room", evt.RoomID, "sender", evt.Sender, "session_id", content.SessionID)
-		if mach.WaitForSession(ctx, evt.RoomID, content.SenderKey, content.SessionID, 3*time.Second) {
-			if decrypted, err = mach.DecryptMegolmEvent(ctx, evt); err != nil {
-				slog.Warn("matrix decrypt after wait", "room", evt.RoomID, "error", err)
-				p.manager.RecordPollHealth("matrix", err)
-				return
-			}
-		} else {
-			p.requestKeys(ctx, evt, content)
-			if !mach.WaitForSession(ctx, evt.RoomID, content.SenderKey, content.SessionID, 22*time.Second) {
-				err := errors.New("undecryptable message: no session after key request")
-				slog.Warn("matrix: still no session after key request; message undecryptable",
-					"room", evt.RoomID, "sender", evt.Sender, "session_id", content.SessionID)
-				p.manager.RecordPollHealth("matrix", err)
-				return
-			}
-			if decrypted, err = mach.DecryptMegolmEvent(ctx, evt); err != nil {
-				slog.Warn("matrix decrypt after key request", "room", evt.RoomID, "error", err)
-				p.manager.RecordPollHealth("matrix", err)
-				return
-			}
-		}
-	} else if err != nil {
-		var withheld *event.RoomKeyWithheldEventContent
-		if errors.As(err, &withheld) {
-			slog.Warn("matrix key withheld", "room", evt.RoomID, "sender", evt.Sender, "code", withheld.Code, "reason", withheld.Reason)
-		} else {
-			slog.Warn("matrix decrypt failed", "room", evt.RoomID, "sender", evt.Sender, "error", err)
-		}
-		p.manager.RecordPollHealth("matrix", err)
-		return
-	}
-	if decrypted == nil {
-		slog.Warn("matrix: decrypt returned nil event", "room", evt.RoomID)
-		return
-	}
-	if decrypted.Type == event.EventMessage {
-		p.handleMessage(ctx, decrypted)
-	}
+	p.enqueue(evt)
 }
 
 // requestKeys asks the sender (and our own devices) for the room key for a
@@ -188,8 +147,47 @@ func (p *MatrixPoller) requestKeys(ctx context.Context, evt *event.Event, conten
 // handleMessage forwards a plaintext (or decrypted) message event to the
 // manager's inbound path.
 func (p *MatrixPoller) handleMessage(ctx context.Context, evt *event.Event) {
+	p.enqueue(evt)
+}
+
+func (p *MatrixPoller) enqueue(evt *event.Event) {
 	if evt.Sender == id.UserID(p.cfg.UserID) {
 		return
+	}
+	copy := *evt
+	copy.Unsigned = event.Unsigned{}
+	data, err := json.Marshal(copy)
+	if err == nil {
+		_, err = p.manager.MatrixInbox.Enqueue("matrix", "inbound", evt.ID.String(), data)
+	}
+	if err != nil {
+		p.acceptErr = err
+		p.manager.RecordPollHealth("matrix", err)
+	}
+}
+
+func (p *MatrixPoller) processMessage(ctx context.Context, evt *event.Event) error {
+	if err := evt.Content.ParseRaw(evt.Type); err != nil {
+		return err
+	}
+	if evt.Type == event.EventEncrypted {
+		decrypted, err := p.e2ee.Mach().DecryptMegolmEvent(ctx, evt)
+		if err != nil {
+			if errors.Is(err, crypto.ErrNoSessionFound) {
+				p.requestKeys(ctx, evt, evt.Content.AsEncrypted())
+			}
+			return err
+		}
+		if decrypted == nil {
+			return fmt.Errorf("matrix: decryption returned no event")
+		}
+		evt = decrypted
+	}
+	if evt.Type != event.EventMessage {
+		return nil
+	}
+	if evt.Sender == id.UserID(p.cfg.UserID) {
+		return nil
 	}
 	body := evt.Content.AsMessage()
 	text := ""
@@ -197,7 +195,10 @@ func (p *MatrixPoller) handleMessage(ctx context.Context, evt *event.Event) {
 		text = strings.TrimSpace(body.Body)
 	}
 	if text == "" {
-		return
+		return nil
+	}
+	if err := p.e2ee.store.ms.Flush(ctx); err != nil {
+		return err
 	}
 	if _, err := p.manager.Inbound(ctx, InboundMessage{
 		Channel:   ChannelMatrix,
@@ -206,6 +207,71 @@ func (p *MatrixPoller) handleMessage(ctx context.Context, evt *event.Event) {
 		ThreadRef: evt.RoomID.String(),
 		SourceID:  evt.ID.String(),
 	}); err != nil {
-		slog.Warn("matrix inbound", "room", evt.RoomID, "sender", evt.Sender, "error", err)
+		return err
 	}
+	return nil
+}
+
+func (p *MatrixPoller) processInbox(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		entry, err := p.manager.MatrixInbox.Lease(time.Now().UTC(), time.Minute)
+		if err == nil && entry != nil {
+			var evt event.Event
+			err = json.Unmarshal(entry.Payload, &evt)
+			if err == nil {
+				messageCtx, cancel := context.WithTimeout(ctx, 50*time.Second)
+				err = p.processMessage(messageCtx, &evt)
+				cancel()
+			}
+			if errors.Is(err, ErrMatrixNotPrivate) {
+				err = p.manager.MatrixInbox.Fail(entry, err.Error())
+			} else if err == nil {
+				err = p.manager.MatrixInbox.Complete(entry)
+			} else {
+				err = errors.Join(err, p.manager.MatrixInbox.RetryError(entry, err.Error()))
+			}
+		}
+		if err != nil {
+			p.manager.RecordPollHealth("matrix", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+type durableMatrixSyncer struct {
+	mautrix.Syncer
+	poller *MatrixPoller
+}
+
+func (s *durableMatrixSyncer) ProcessResponse(ctx context.Context, response *mautrix.RespSync, since string) error {
+	s.poller.acceptErr = nil
+	err := s.Syncer.ProcessResponse(ctx, response, since)
+	if err == nil {
+		err = s.poller.acceptErr
+	}
+	store := s.poller.e2ee.store
+	if err == nil {
+		err = store.ms.Flush(ctx)
+	}
+	store.snapshotMu.Lock()
+	defer store.snapshotMu.Unlock()
+	if err != nil {
+		store.nextBatch = store.committedBatch
+		return err
+	}
+	previous := store.committedBatch
+	store.committedBatch = store.nextBatch
+	if err := store.persistMeta(); err != nil {
+		store.committedBatch = previous
+		store.nextBatch = previous
+		return err
+	}
+	s.poller.manager.RecordPollHealth("matrix", nil)
+	return nil
 }

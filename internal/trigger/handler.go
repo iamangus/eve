@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/mail"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/iamangus/eve/internal/agentfoundry"
 	"github.com/iamangus/eve/internal/email"
 	"github.com/iamangus/eve/internal/store"
+	"github.com/iamangus/eve/internal/web"
 )
 
 type Handler struct {
@@ -27,6 +29,7 @@ func NewHandler(st *store.EmailStore, client *agentfoundry.Client, engine *Engin
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/email/accounts", h.listAccounts)
 	mux.HandleFunc("POST /api/email/accounts", h.createAccount)
+	mux.HandleFunc("PUT /api/email/accounts/{id}", h.updateAccount)
 	mux.HandleFunc("DELETE /api/email/accounts/{id}", h.deleteAccount)
 	mux.HandleFunc("POST /api/email/accounts/{id}/test", h.testAccount)
 
@@ -40,13 +43,14 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 }
 
 type accountInput struct {
-	Address  string `json:"address"`
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	UseTLS   bool   `json:"use_tls"`
-	Enabled  bool   `json:"enabled"`
+	Address           string `json:"address"`
+	Host              string `json:"host"`
+	Port              int    `json:"port"`
+	Username          string `json:"username"`
+	Password          string `json:"password"`
+	UseTLS            bool   `json:"use_tls"`
+	Enabled           *bool  `json:"enabled"`
+	TrustedAuthservID string `json:"trusted_authserv_id,omitempty"`
 }
 
 func (h *Handler) listAccounts(w http.ResponseWriter, r *http.Request) {
@@ -64,7 +68,7 @@ func (h *Handler) listAccounts(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
 	var in accountInput
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := web.Decode(r, &in); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
@@ -82,15 +86,24 @@ func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
 			in.Port = 143
 		}
 	}
+	if _, err := mail.ParseAddress(in.Address); err != nil || in.Port < 1 || in.Port > 65535 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid address and port (1–65535) are required"})
+		return
+	}
+	enabled := true
+	if in.Enabled != nil {
+		enabled = *in.Enabled
+	}
 	acct, err := h.store.AddAccount(store.Account{
-		Address:   in.Address,
-		Host:      in.Host,
-		Port:      in.Port,
-		Username:  in.Username,
-		Password:  in.Password,
-		UseTLS:    in.UseTLS,
-		Enabled:   true,
-		CreatedAt: time.Now(),
+		Address:           in.Address,
+		Host:              in.Host,
+		Port:              in.Port,
+		Username:          in.Username,
+		Password:          in.Password,
+		UseTLS:            in.UseTLS,
+		Enabled:           enabled,
+		TrustedAuthservID: strings.TrimSpace(in.TrustedAuthservID),
+		CreatedAt:         time.Now(),
 	})
 	if err != nil {
 		slog.Error("create account", "error", err)
@@ -99,6 +112,41 @@ func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	acct.Password = ""
 	writeJSON(w, http.StatusCreated, acct)
+}
+
+func (h *Handler) updateAccount(w http.ResponseWriter, r *http.Request) {
+	account, err := h.store.GetAccount(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "account not found"})
+		return
+	}
+	var in accountInput
+	if err := web.Decode(r, &in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if _, err := mail.ParseAddress(in.Address); err != nil || in.Host == "" || in.Username == "" || in.Port < 1 || in.Port > 65535 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid address, host, username and port are required"})
+		return
+	}
+	if account.Host != in.Host || account.Username != in.Username {
+		account.LastUID = 0
+		account.UIDValidity = 0
+	}
+	account.Address, account.Host, account.Port, account.Username, account.UseTLS = in.Address, in.Host, in.Port, in.Username, in.UseTLS
+	account.TrustedAuthservID = strings.TrimSpace(in.TrustedAuthservID)
+	if in.Password != "" {
+		account.Password = in.Password
+	}
+	if in.Enabled != nil {
+		account.Enabled = *in.Enabled
+	}
+	if err := h.store.UpdateAccount(account); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist account"})
+		return
+	}
+	account.Password = ""
+	writeJSON(w, http.StatusOK, account)
 }
 
 func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
@@ -125,7 +173,7 @@ func (h *Handler) testAccount(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
-	if err := email.Check(acct); err != nil {
+	if err := email.CheckContext(r.Context(), acct); err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
@@ -150,7 +198,7 @@ func (h *Handler) listTriggers(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) createTrigger(w http.ResponseWriter, r *http.Request) {
 	var in triggerInput
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := web.Decode(r, &in); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
@@ -182,7 +230,7 @@ func (h *Handler) updateTrigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in triggerInput
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := web.Decode(r, &in); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
@@ -267,7 +315,7 @@ func (h *Handler) testTrigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in testTriggerRequest
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := web.Decode(r, &in); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}

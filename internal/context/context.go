@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -48,6 +49,17 @@ type Manager struct {
 	lastError atomic.Value // string
 	lifeCtx   atomic.Value // context.Context, set by Loop
 	wake      chan struct{}
+	workerMu  sync.Mutex
+	workers   sync.WaitGroup
+	stopping  bool
+	previewMu sync.RWMutex
+	preview   func(string) ([]agentfoundry.Message, error)
+}
+
+func (m *Manager) SetBootstrapPreview(provider func(string) ([]agentfoundry.Message, error)) {
+	m.previewMu.Lock()
+	defer m.previewMu.Unlock()
+	m.preview = provider
 }
 
 func NewManager(st *store.Store, client *agentfoundry.Client, cfg Config) *Manager {
@@ -68,6 +80,7 @@ func (m *Manager) Loop(ctx context.Context) {
 		return
 	}
 	m.lifeCtx.Store(ctx)
+	defer func() { m.workerMu.Lock(); m.stopping = true; m.workerMu.Unlock(); m.workers.Wait() }()
 	triggerTicker := time.NewTicker(30 * time.Second)
 	defer triggerTicker.Stop()
 	curateTicker := time.NewTicker(m.curateInterval())
@@ -102,8 +115,17 @@ func (m *Manager) MaybeCompact(ctx context.Context) {
 	if !m.Enabled() || m.running.Load() {
 		return
 	}
+	if last, ok := m.lastRunAt.Load().(time.Time); ok && time.Since(last) < 5*time.Minute {
+		if failure, ok := m.lastError.Load().(string); ok && failure != "" {
+			return
+		}
+	}
 	convID := m.store.PrimaryConversationID()
 	if convID == "" {
+		return
+	}
+	if err := m.repairFacts(convID); err != nil {
+		slog.Warn("repair memory promotion", "error", err)
 		return
 	}
 	tailTokens, err := m.unsummarizedTokens(convID)
@@ -113,7 +135,18 @@ func (m *Manager) MaybeCompact(ctx context.Context) {
 	if tailTokens < int(float64(m.cfg.BudgetTokens)*m.cfg.TriggerFraction) {
 		return
 	}
-	go m.runOnce(m.runCtx(), convID)
+	m.startHistorian(convID)
+}
+
+func (m *Manager) startHistorian(convID string) {
+	m.workerMu.Lock()
+	defer m.workerMu.Unlock()
+	ctx := m.runCtx()
+	if m.stopping || ctx.Err() != nil {
+		return
+	}
+	m.workers.Add(1)
+	go func() { defer m.workers.Done(); m.runOnce(ctx, convID) }()
 }
 
 // runCtx returns the process-lifetime context that background historian runs
@@ -139,7 +172,7 @@ func (m *Manager) ForceCompact(ctx context.Context) error {
 	if convID == "" {
 		return fmt.Errorf("no conversation yet")
 	}
-	go m.runOnce(m.runCtx(), convID)
+	m.startHistorian(convID)
 	return nil
 }
 
@@ -227,6 +260,9 @@ func (m *Manager) compact(ctx context.Context, convID string) error {
 	}
 
 	first, last := chunk[0], chunk[len(chunk)-1]
+	if len(manifest.Compartments) != 1 {
+		return fmt.Errorf("historian must return one aggregate compartment for the complete chunk")
+	}
 	best := manifest.Compartments[0]
 	comp := store.Compartment{
 		StartMsgID: first.ID,
@@ -278,6 +314,9 @@ func (m *Manager) selectChunk(tail []store.Message) []store.Message {
 			break
 		}
 	}
+	if acc < m.cfg.ProtectedTailTokens {
+		return nil
+	}
 	if end <= 0 {
 		return nil
 	}
@@ -313,11 +352,20 @@ func (m *Manager) promoteFacts(convID string, comp store.Compartment) error {
 	return nil
 }
 
+func (m *Manager) repairFacts(convID string) error {
+	for _, comp := range m.store.Compartments(convID) {
+		if err := m.promoteFacts(convID, comp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // buildChunkText formats a chunk with role labels and relative timestamps so
 // the historian can preserve temporal structure.
 func buildChunkText(chunk []store.Message) string {
 	var b strings.Builder
-	b.WriteString("Below is a chunk of a longer conversation. Compress it per your instructions.\n\n")
+	b.WriteString("Below is a chunk of a longer conversation. Return exactly one aggregate compartment covering the complete chunk, with all four summary tiers and its facts. Compress it per your instructions.\n\n")
 	for _, msg := range chunk {
 		b.WriteString("[")
 		b.WriteString(timeAgo(msg.CreatedAt))
@@ -361,7 +409,7 @@ func factHash(category, content string) string {
 
 // manifestCompartment is the JSON shape emitted by the historian agent.
 type manifestCompartment struct {
-	Importance int `json:"importance"`
+	Importance int    `json:"importance"`
 	P1         string `json:"p1"`
 	P2         string `json:"p2"`
 	P3         string `json:"p3"`
@@ -390,10 +438,21 @@ func ParseManifest(text string) (Manifest, error) {
 			return Manifest{}, fmt.Errorf("invalid JSON: %w", err)
 		}
 	}
+	if len(envelope.Compartments) != 1 {
+		return Manifest{}, fmt.Errorf("historian must return exactly one aggregate compartment")
+	}
 	usable := make([]manifestCompartment, 0, len(envelope.Compartments))
 	for _, c := range envelope.Compartments {
-		if strings.TrimSpace(c.P1) == "" {
+		if strings.TrimSpace(c.P1) == "" || strings.TrimSpace(c.P2) == "" || strings.TrimSpace(c.P3) == "" || strings.TrimSpace(c.P4) == "" {
 			continue
+		}
+		if len(c.P1) > 128*1024 || len(c.P2) > 128*1024 || len(c.P3) > 128*1024 || len(c.P4) > 128*1024 || len(c.Facts) > 200 {
+			return Manifest{}, fmt.Errorf("historian manifest exceeds safety limits")
+		}
+		for _, fact := range c.Facts {
+			if len(fact.Content) > 8192 {
+				return Manifest{}, fmt.Errorf("historian fact exceeds safety limit")
+			}
 		}
 		usable = append(usable, c)
 	}

@@ -6,23 +6,27 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/iamangus/eve/internal/agentfoundry"
 	ctxmgr "github.com/iamangus/eve/internal/context"
+	"github.com/iamangus/eve/internal/events"
 	"github.com/iamangus/eve/internal/store"
 	"github.com/iamangus/eve/internal/tasks"
+	"github.com/iamangus/eve/internal/web"
 )
 
 // Config configures the IO manager.
 type Config struct {
-	DataDir          string
-	ActivityTimeout  time.Duration
-	RouterAgentID    string
-	AssistantAgentID string
-	ProactiveEnabled bool
+	DataDir           string
+	ActivityTimeout   time.Duration
+	RouterAgentID     string
+	AssistantAgentID  string
+	ProactiveEnabled  bool
+	ProactiveCooldown time.Duration
 	// EVEMCPChatURL is the chat MCP surface (task + calendar tools, no
 	// send_message) attached to user-triggered inbound runs. Eve's reply is
 	// delivered mechanically back to the origin channel.
@@ -53,7 +57,11 @@ type Manager struct {
 	// is disabled or crypto failed to initialize).
 	MatrixE2EE *MatrixE2EE
 	// Cal is the calendar store (nil when the calendar channel is disabled).
-	Cal *CalStore
+	Cal              *CalStore
+	Outbox           *events.Queue
+	MatrixInbox      *events.Queue
+	cooldown         time.Duration
+	nextNotification time.Time
 
 	healthMu sync.Mutex
 	health   map[string]PollHealth
@@ -68,8 +76,17 @@ func (m *Manager) SetFrontendTrigger(trigger func(content, conversationID string
 // matrix, calendar). lastCheck is when the poller last completed a cycle;
 // lastError is empty when the last cycle succeeded.
 type PollHealth struct {
-	LastCheck time.Time `json:"last_check,omitempty"`
-	LastError string    `json:"last_error,omitempty"`
+	LastCheck               time.Time `json:"last_check,omitempty"`
+	LastError               string    `json:"last_error,omitempty"`
+	ExpectedIntervalSeconds int       `json:"expected_interval_seconds,omitempty"`
+}
+
+func (m *Manager) SetPollInterval(id string, interval time.Duration) {
+	m.healthMu.Lock()
+	defer m.healthMu.Unlock()
+	health := m.health[id]
+	health.ExpectedIntervalSeconds = int(interval / time.Second)
+	m.health[id] = health
 }
 
 // RecordPollHealth updates the health snapshot for a poller. A nil error
@@ -115,6 +132,14 @@ func NewManager(st *store.Store, client *agentfoundry.Client, cfg Config) (*Mana
 	if err != nil {
 		return nil, err
 	}
+	outbox, err := events.NewQueue(filepath.Join(cfg.DataDir, "outbound"))
+	if err != nil {
+		return nil, err
+	}
+	inbox, err := events.NewQueue(filepath.Join(cfg.DataDir, "matrix-inbound"))
+	if err != nil {
+		return nil, err
+	}
 	router := NewRouter(reg, hub, ident, st, client, RouterOptions{
 		RouterAgentID:    cfg.RouterAgentID,
 		AssistantAgentID: cfg.AssistantAgentID,
@@ -128,16 +153,26 @@ func NewManager(st *store.Store, client *agentfoundry.Client, cfg Config) (*Mana
 			Transport: "streamable-http",
 		})
 	}
+	next := time.Time{}
+	for _, event := range outbox.Snapshot() {
+		if event.State == events.StateDone && event.UpdatedAt.Add(cfg.ProactiveCooldown).After(next) {
+			next = event.UpdatedAt.Add(cfg.ProactiveCooldown)
+		}
+	}
 	return &Manager{
-		Reg:    reg,
-		Hub:    hub,
-		Ident:  ident,
-		Router: router,
-		store:  st,
-		client: client,
-		mcpSrv: mcpSrv,
-		agent:  cfg.AssistantAgentID,
-		health: make(map[string]PollHealth),
+		Reg:              reg,
+		Hub:              hub,
+		Ident:            ident,
+		Router:           router,
+		store:            st,
+		client:           client,
+		mcpSrv:           mcpSrv,
+		agent:            cfg.AssistantAgentID,
+		health:           make(map[string]PollHealth),
+		Outbox:           outbox,
+		MatrixInbox:      inbox,
+		cooldown:         cfg.ProactiveCooldown,
+		nextNotification: next,
 	}, nil
 }
 
@@ -181,6 +216,15 @@ func (m *Manager) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/presence", m.presence)
 	mux.HandleFunc("GET /api/channels", m.channels)
 	mux.HandleFunc("POST /api/notify", m.notify)
+	mux.HandleFunc("GET /api/deliveries", m.deliveryStatus)
+	mux.HandleFunc("GET /api/inbox/matrix", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, m.MatrixInbox.Snapshot()) })
+	mux.HandleFunc("POST /api/inbox/matrix/{id}/retry", func(w http.ResponseWriter, r *http.Request) {
+		if err := m.MatrixInbox.Requeue("matrix", r.PathValue("id")); err != nil {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]bool{"queued": true})
+	})
 	mux.HandleFunc("GET /api/identities", m.listIdentities)
 	mux.HandleFunc("POST /api/identities", m.createIdentity)
 	mux.HandleFunc("PUT /api/identities/{name}", m.updateIdentity)
@@ -193,7 +237,7 @@ func (m *Manager) listIdentities(w http.ResponseWriter, r *http.Request) {
 
 func (m *Manager) createIdentity(w http.ResponseWriter, r *http.Request) {
 	var in Identity
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := decodeJSON(r, &in); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body: " + err.Error()})
 		return
 	}
@@ -211,7 +255,7 @@ func (m *Manager) createIdentity(w http.ResponseWriter, r *http.Request) {
 func (m *Manager) updateIdentity(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	var in Identity
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := decodeJSON(r, &in); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body: " + err.Error()})
 		return
 	}
@@ -277,6 +321,7 @@ func (m *Manager) channels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"channels": m.Reg.Snapshot(),
 		"health":   m.healthSnapshot(),
+		"queues":   map[string]events.Metrics{"outbound": m.Outbox.Metrics(), "matrix_inbound": m.MatrixInbox.Metrics()},
 	})
 }
 
@@ -288,6 +333,7 @@ func (m *Manager) notify(w http.ResponseWriter, r *http.Request) {
 		ConversationID string `json:"conversation_id"`
 		Content        string `json:"content"`
 		Purpose        string `json:"purpose"`
+		DeliveryID     string `json:"delivery_id,omitempty"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
@@ -304,18 +350,17 @@ func (m *Manager) notify(w http.ResponseWriter, r *http.Request) {
 	if convID == "" {
 		convID = m.store.PrimaryConversationID()
 	}
-	if err := m.Router.Notify(r.Context(), convID, req.Content, req.Purpose, ""); err != nil {
+	id, err := m.EnqueueNotification(req.DeliveryID, convID, req.Content, req.Purpose, "")
+	if err != nil {
 		slog.Warn("notify", "conv", convID, "purpose", req.Purpose, "error", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "delivery_id": id})
 }
 
 func decodeJSON(r *http.Request, v any) error {
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	return dec.Decode(v)
+	return web.Decode(r, v)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -325,6 +370,14 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func (m *Manager) Inbound(ctx context.Context, msg InboundMessage) (runID string, err error) {
+	if strings.TrimSpace(msg.Text) == "" || len(msg.Text) > 1<<20 || len(msg.SourceID) > 1024 {
+		return "", fmt.Errorf("invalid inbound message")
+	}
+	if msg.Channel == ChannelMatrix && m.Matrix.Enabled() {
+		if err := m.Matrix.privateRoom(ctx, msg.ThreadRef, m.Ident); err != nil {
+			return "", err
+		}
+	}
 	ident := m.Ident.Resolve(msg.Channel, msg.Sender)
 	if msg.TrustedOwner {
 		ident = m.Ident.Owner()
@@ -333,13 +386,9 @@ func (m *Manager) Inbound(ctx context.Context, msg InboundMessage) (runID string
 	if ident != nil {
 		sender = ident.Name
 	}
-	convID := m.store.PrimaryConversationID()
-	if convID == "" {
-		c, cerr := m.store.CreateConversation("Chat")
-		if cerr != nil {
-			return "", cerr
-		}
-		convID = c.ID
+	convID, err := m.store.EnsurePrimaryConversation()
+	if err != nil {
+		return "", err
 	}
 	owner := m.Ident.IsOwner(sender)
 	var appended *store.Message
@@ -394,12 +443,20 @@ func (m *Manager) DrainPending(ctx context.Context, convID string) (string, erro
 		if err != nil {
 			return "", err
 		}
+		if _, err := m.store.GetConversation(convID); err != nil {
+			_ = m.client.CancelRun(ctx, runID)
+			return "", err
+		}
 		if err := m.store.SetPersistentRun(scope, runID); err != nil {
 			return "", err
 		}
 	}
 	claimed, err := m.store.ClaimPendingOwnerMessage(convID, runID, msg.ID)
 	if err != nil || !claimed {
+		if _, convErr := m.store.GetConversation(convID); convErr != nil {
+			_ = m.client.CancelRun(ctx, runID)
+			_ = m.store.SetPersistentRun(scope, "")
+		}
 		return "", err
 	}
 	if err := m.submitOwnerInput(ctx, convID, runID, msg); err != nil {
@@ -417,8 +474,28 @@ func (m *Manager) BootstrapHistory(convID string, beforeID int64) ([]agentfoundr
 }
 
 func boundedHistory(history []agentfoundry.Message) []agentfoundry.Message {
-	const maxMessages = 120
-	const maxBytes = 256 * 1024
+	var essential []agentfoundry.Message
+	bytes := 0
+	for len(history) > 0 && len(essential) < 2 {
+		text := fmt.Sprint(history[0].Content)
+		if !strings.HasPrefix(text, "## Background tasks\n") && !strings.HasPrefix(text, "[What I remember about you and our past conversations]") {
+			break
+		}
+		item := history[0]
+		if len(text) > 16*1024 {
+			item.Content = strings.ToValidUTF8(text[:16*1024], "") + "\n[Context block truncated.]"
+		}
+		bytes += len(fmt.Sprint(item.Content))
+		essential = append(essential, item)
+		history = history[1:]
+	}
+	return append(essential, boundedHistoryWithin(history, 256*1024-bytes, max(1, 120-len(essential)))...)
+}
+
+func boundedHistoryWithin(history []agentfoundry.Message, maxBytes, maxMessages int) []agentfoundry.Message {
+	if maxBytes < 1024 {
+		return []agentfoundry.Message{{Role: "user", Content: "[Conversation history omitted because essential context exhausted the bootstrap budget.]"}}
+	}
 	start, size := len(history), 0
 	for start > 0 && len(history)-start < maxMessages {
 		next := len(fmt.Sprint(history[start-1].Content))
@@ -475,6 +552,9 @@ func (m *Manager) submitOwnerInput(ctx context.Context, convID, runID string, ms
 		return createErr
 	}
 	if err := m.store.ReplaceActiveOwnerRun(convID, runID, replacement, msg.ID); err != nil {
+		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		_ = m.client.CancelRun(cancelCtx, replacement)
+		cancel()
 		return err
 	}
 	if err := m.store.SetPersistentRun(scope, replacement); err != nil {
@@ -538,10 +618,10 @@ func (m *Manager) EnableEmail(cfg SMTPConfig) {
 		Streams:          false,
 		RichText:         false,
 		Reachable:        true,
-		DefaultRecipient: cfg.From,
+		DefaultRecipient: cfg.Recipient,
 		Preference:       50,
 	})
-	m.Router.RegisterAdapter(&emailAdapter{cfg: cfg, reg: m.Reg, store: m.store, hub: m.Hub})
+	m.Router.RegisterAdapter(&emailAdapter{cfg: cfg, reg: m.Reg, store: m.store, hub: m.Hub, ident: m.Ident})
 }
 
 // EnableMatrix registers the matrix channel and its adapter. Called by main
@@ -553,6 +633,9 @@ func (m *Manager) EnableMatrix(cfg MatrixConfig, e2ee *MatrixE2EE) {
 	}
 	m.Matrix = cfg
 	m.MatrixE2EE = e2ee
+	if e2ee != nil {
+		e2ee.setPrivacyPolicy(cfg, m.Ident)
+	}
 	m.Reg.Register(Channel{
 		ID:               "matrix",
 		Type:             ChannelMatrix,
@@ -562,10 +645,10 @@ func (m *Manager) EnableMatrix(cfg MatrixConfig, e2ee *MatrixE2EE) {
 		Streams:          false,
 		RichText:         true,
 		Reachable:        true,
-		DefaultRecipient: cfg.UserID,
+		DefaultRecipient: cfg.OwnerRoom,
 		Preference:       30,
 	})
-	m.Router.RegisterAdapter(&matrixAdapter{cfg: cfg, reg: m.Reg, store: m.store, hub: m.Hub, e2ee: e2ee})
+	m.Router.RegisterAdapter(&matrixAdapter{cfg: cfg, reg: m.Reg, store: m.store, hub: m.Hub, e2ee: e2ee, ident: m.Ident})
 }
 
 // EnableCalendar activates the CalDAV calendar channel. Called by main when
@@ -582,6 +665,9 @@ func (m *Manager) EnableCalendar(cfg CalDAVConfig) {
 // are constructed.
 func (m *Manager) SetContext(cm *ctxmgr.Manager) {
 	m.ctxMgr = cm
+	if cm != nil {
+		cm.SetBootstrapPreview(func(id string) ([]agentfoundry.Message, error) { return m.BootstrapHistory(id, 0) })
+	}
 }
 
 // SetTasks attaches the background-task manager (also reachable as Tasks).
@@ -609,7 +695,7 @@ func (m *Manager) renderHistoryBefore(convID string, beforeID int64) ([]agentfou
 		if beforeID > 0 && msg.ID >= beforeID {
 			continue
 		}
-		history = append(history, agentfoundry.Message{Role: msg.Role, Content: msg.Content})
+		history = append(history, agentfoundry.Message{Role: msg.Role, Content: store.HistoryContent(msg)})
 	}
 	return history, ctxmgr.RenderStats{}, nil
 }

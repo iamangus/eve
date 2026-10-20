@@ -81,6 +81,8 @@
       <div class="ctx-kicker">SYSTEM / WORKING MEMORY</div>
       <h2 class="ctx-page-title">Context</h2>
       <h3 class="ctx-title">Status</h3>
+      <div class="ctx-banner">Local history prepared for new or replacement runs. Existing persistent runs retain their own context; this is not their live token usage.</div>
+      {#if status.bootstrap_preview_available}<div class="ctx-banner">Next-run preview after task context and safety limits: {status.bootstrap_preview_messages} messages, approximately {status.bootstrap_preview_tokens.toLocaleString()} tokens. The breakdown below describes the local renderer before those final limits.</div>{/if}
       {#if !status.enabled}
         <div class="ctx-banner">Context management is disabled (no historian agent configured).</div>
       {/if}

@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/iamangus/eve/internal/durable"
 )
 
 var ErrNotFound = errors.New("conversation not found")
@@ -39,10 +41,13 @@ type Conversation struct {
 	ActiveMessageID   int64     `json:"active_message_id,omitempty"`
 	ActiveSubmitted   bool      `json:"active_submitted,omitempty"`
 	DeliveryFailures  int       `json:"delivery_failures,omitempty"`
+	DeliveryError     string    `json:"delivery_error,omitempty"`
 	PendingMessageIDs []int64   `json:"pending_message_ids,omitempty"`
 	SteeredMessageIDs []int64   `json:"steered_message_ids,omitempty"`
 	SummarizedUpTo    int64     `json:"summarized_up_to,omitempty"`
 	Messages          []Message `json:"messages,omitempty"`
+	TotalMessages     int       `json:"total_messages"`
+	HasMore           bool      `json:"has_more,omitempty"`
 }
 
 type SteeringInput struct {
@@ -67,6 +72,7 @@ type conversationRecord struct {
 	ActiveMessageID    int64            `json:"active_message_id,omitempty"`
 	ActiveSubmitted    bool             `json:"active_submitted,omitempty"`
 	DeliveryFailures   int              `json:"delivery_failures,omitempty"`
+	DeliveryError      string           `json:"delivery_error,omitempty"`
 	NextDeliveryAt     time.Time        `json:"next_delivery_at,omitempty"`
 	ActiveRunMessages  map[string]int64 `json:"active_run_messages,omitempty"`
 	PendingOwnerInputs []int64          `json:"pending_owner_inputs,omitempty"`
@@ -91,10 +97,11 @@ type Store struct {
 	memories       []Memory
 	persistentRuns map[string]string
 	deleting       map[string]bool
+	deleteRequests map[string][]string
 }
 
 func New(dir string) (*Store, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	s := &Store{
@@ -103,6 +110,7 @@ func New(dir string) (*Store, error) {
 		compartments:   make(map[string][]Compartment),
 		persistentRuns: make(map[string]string),
 		deleting:       make(map[string]bool),
+		deleteRequests: make(map[string][]string),
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -111,6 +119,12 @@ func New(dir string) (*Store, error) {
 }
 
 func (s *Store) load() error {
+	if err := s.loadJSON("deletions.json", &s.deleteRequests); err != nil {
+		return err
+	}
+	if s.deleteRequests == nil {
+		s.deleteRequests = make(map[string][]string)
+	}
 	// conversations.json is a map keyed by conversation ID.
 	var raw map[string]*conversationRecord
 	if err := s.loadJSON("conversations.json", &raw); err != nil {
@@ -143,7 +157,47 @@ func (s *Store) load() error {
 	if persistentRuns != nil {
 		s.persistentRuns = persistentRuns
 	}
+	changed := false
+	for id, conv := range s.convs {
+		if conv.ActiveRunID != "" && !s.blockedLocked(id) && s.persistentRuns["frontend-v2:"+id] != conv.ActiveRunID {
+			s.persistentRuns["frontend-v2:"+id] = conv.ActiveRunID
+			changed = true
+		}
+	}
+	if changed {
+		return s.saveJSON("persistent_runs.json", s.persistentRuns)
+	}
 	return nil
+}
+
+func (s *Store) DeleteRequests() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var ids []string
+	for id := range s.deleteRequests {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (s *Store) FinishDelete(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prior, ok := s.deleteRequests[id]
+	if !ok {
+		return nil
+	}
+	delete(s.deleteRequests, id)
+	if err := s.saveJSON("deletions.json", s.deleteRequests); err != nil {
+		s.deleteRequests[id] = prior
+		return err
+	}
+	return nil
+}
+
+func (s *Store) blockedLocked(id string) bool {
+	_, requested := s.deleteRequests[id]
+	return requested || s.deleting[id]
 }
 
 func (s *Store) loadJSON(name string, v any) error {
@@ -161,15 +215,7 @@ func (s *Store) loadJSON(name string, v any) error {
 }
 
 func (s *Store) saveJSON(name string, v any) error {
-	data, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := filepath.Join(s.dir, name+".tmp")
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(s.dir, name))
+	return durable.JSON(filepath.Join(s.dir, name), v)
 }
 
 func (s *Store) saveConversations() error {
