@@ -1,6 +1,7 @@
 package store
 
 import (
+	"reflect"
 	"time"
 )
 
@@ -77,7 +78,7 @@ func (s *Store) AddCompartment(convID string, c Compartment) (Compartment, error
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.convs[convID]; !ok {
+	if _, ok := s.convs[convID]; !ok || s.blockedLocked(convID) {
 		return Compartment{}, ErrNotFound
 	}
 	prior, existed := s.compartments[convID]
@@ -124,6 +125,30 @@ func (s *Store) AddMemory(m Memory) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prior := s.memories
+	if m.SourceCompartment != "" {
+		found := false
+		for convID, comps := range s.compartments {
+			if s.blockedLocked(convID) {
+				continue
+			}
+			for _, comp := range comps {
+				if comp.ID == m.SourceCompartment {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return ErrNotFound
+		}
+	}
+	if m.Hash != "" {
+		for _, prior := range s.memories {
+			if prior.Hash == m.Hash {
+				return nil
+			}
+		}
+	}
 	s.memories = append(s.memories, m)
 	if err := s.saveMemories(); err != nil {
 		s.memories = prior
@@ -138,6 +163,21 @@ func (s *Store) ReplaceMemories(mems []Memory) error {
 	defer s.mu.Unlock()
 	prior := s.memories
 	s.memories = append([]Memory(nil), mems...)
+	if err := s.saveMemories(); err != nil {
+		s.memories = prior
+		return err
+	}
+	return nil
+}
+
+func (s *Store) CurateMemories(expected, next []Memory) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !reflect.DeepEqual(expected, s.memories) {
+		return nil
+	}
+	prior := s.memories
+	s.memories = append([]Memory(nil), next...)
 	if err := s.saveMemories(); err != nil {
 		s.memories = prior
 		return err

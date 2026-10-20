@@ -11,15 +11,19 @@ import (
 
 // Status is the snapshot served to the Context tab.
 type Status struct {
-	Enabled         bool         `json:"enabled"`
-	BudgetTokens    int          `json:"budget_tokens"`
-	RenderedTokens  int          `json:"rendered_tokens"`
-	Pressure        float64      `json:"pressure"`
-	Sources         SourceTokens `json:"sources"`
-	Historian       HistStatus   `json:"historian"`
-	Coverage        Coverage     `json:"coverage"`
-	Compartments    []CompView   `json:"compartments"`
-	Memories        []store.Memory `json:"memories"`
+	Enabled                   bool           `json:"enabled"`
+	Scope                     string         `json:"scope"`
+	BootstrapPreviewTokens    int            `json:"bootstrap_preview_tokens"`
+	BootstrapPreviewMessages  int            `json:"bootstrap_preview_messages"`
+	BootstrapPreviewAvailable bool           `json:"bootstrap_preview_available"`
+	BudgetTokens              int            `json:"budget_tokens"`
+	RenderedTokens            int            `json:"rendered_tokens"`
+	Pressure                  float64        `json:"pressure"`
+	Sources                   SourceTokens   `json:"sources"`
+	Historian                 HistStatus     `json:"historian"`
+	Coverage                  Coverage       `json:"coverage"`
+	Compartments              []CompView     `json:"compartments"`
+	Memories                  []store.Memory `json:"memories"`
 }
 
 type SourceTokens struct {
@@ -38,19 +42,19 @@ type HistStatus struct {
 }
 
 type Coverage struct {
-	TotalMessages    int `json:"total_messages"`
+	TotalMessages     int `json:"total_messages"`
 	Compartmentalized int `json:"compartmentalized"`
-	Raw              int `json:"raw"`
+	Raw               int `json:"raw"`
 }
 
 type CompView struct {
-	ID         string      `json:"id"`
-	StartMsgID int64       `json:"start_msg_id"`
-	EndMsgID   int64       `json:"end_msg_id"`
-	CreatedAt  time.Time   `json:"created_at"`
-	Importance int         `json:"importance"`
-	Tier       string      `json:"tier"`
-	Summary    string      `json:"summary"`
+	ID         string       `json:"id"`
+	StartMsgID int64        `json:"start_msg_id"`
+	EndMsgID   int64        `json:"end_msg_id"`
+	CreatedAt  time.Time    `json:"created_at"`
+	Importance int          `json:"importance"`
+	Tier       string       `json:"tier"`
+	Summary    string       `json:"summary"`
 	Facts      []store.Fact `json:"facts"`
 }
 
@@ -62,6 +66,7 @@ func (m *Manager) Snapshot() Status {
 	}
 	status := Status{
 		Enabled:      m.Enabled(),
+		Scope:        "local_bootstrap_history",
 		BudgetTokens: m.cfg.BudgetTokens,
 		Memories:     mems,
 		Compartments: []CompView{},
@@ -106,6 +111,20 @@ func (m *Manager) Snapshot() Status {
 		Compartments: stats.CompartmentTokens,
 		Memories:     stats.MemoryTokens,
 		RawTail:      stats.TailTokens,
+	}
+	m.previewMu.RLock()
+	provider := m.preview
+	m.previewMu.RUnlock()
+	if provider != nil {
+		if history, err := provider(convID); err == nil {
+			status.BootstrapPreviewAvailable = true
+			status.BootstrapPreviewMessages = len(history)
+			for _, msg := range history {
+				if text, ok := msg.Content.(string); ok {
+					status.BootstrapPreviewTokens += EstimateTokens(text)
+				}
+			}
+		}
 	}
 
 	tierByStart := make(map[int64]string)
@@ -180,7 +199,9 @@ func (m *Manager) getContext(w http.ResponseWriter, r *http.Request) {
 
 func (m *Manager) postCompact(w http.ResponseWriter, r *http.Request) {
 	if err := m.ForceCompact(r.Context()); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, map[string]bool{"ok": true})

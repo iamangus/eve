@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 
 	"github.com/iamangus/eve/internal/tasks"
@@ -49,6 +48,7 @@ func newMCP(mgr *Manager, withSend bool) *MCP {
 			mcp.WithString("channel", mcp.Description("Optional explicit channel to deliver through (e.g. 'web', 'email', 'matrix'). Omit to let the router decide.")),
 			mcp.WithString("purpose", mcp.Description("Purpose: 'notification' (default), 'question', or 'reminder'.")),
 			mcp.WithString("conversation_id", mcp.Description("Optional conversation id. Defaults to the primary conversation.")),
+			mcp.WithString("delivery_id", mcp.Description("Stable idempotency key for this notification. Reuse when retrying the same notification.")),
 		)
 		mcpServer.AddTool(sendTool, m.handleSendMessage)
 
@@ -67,8 +67,23 @@ func newMCP(mgr *Manager, withSend bool) *MCP {
 
 	m.addTaskTools(mcpServer)
 	m.addCalendarTools(mcpServer)
+	if mgr.ctxMgr != nil {
+		mcpServer.AddTool(mcp.NewTool("get_context_snapshot", mcp.WithDescription("Read current durable memories and the local bootstrap history estimate. Use this to refresh memory during an existing persistent run; it does not replace your live context. Use list_tasks for current task state.")), m.handleContextSnapshot)
+	}
 
 	return m
+}
+
+func (m *MCP) handleContextSnapshot(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if m.mgr.ctxMgr == nil {
+		return mcp.NewToolResultError("context manager unavailable"), nil
+	}
+	status := m.mgr.ctxMgr.Snapshot()
+	data, err := json.Marshal(map[string]any{"scope": status.Scope, "memories": status.Memories, "rendered_tokens": status.RenderedTokens, "budget_tokens": status.BudgetTokens})
+	if err != nil {
+		return nil, err
+	}
+	return mcp.NewToolResultText(string(data)), nil
 }
 
 func (m *MCP) handleTriggerFrontend(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -102,6 +117,9 @@ func (m *MCP) addTaskTools(s *server.MCPServer) {
 	list := mcp.NewTool("list_tasks",
 		mcp.WithDescription("List background tasks and their statuses (running, needs_input, completed, failed, cancelled)."),
 		mcp.WithString("conversation_id", mcp.Description("Optional conversation id to filter by.")),
+		mcp.WithBoolean("archived", mcp.Description("List archived terminal results instead of the current board.")),
+		mcp.WithNumber("offset", mcp.Description("Archived result offset, default 0.")),
+		mcp.WithNumber("limit", mcp.Description("Archived page size, default 100, maximum 500.")),
 	)
 	s.AddTool(list, m.handleListTasks)
 
@@ -162,7 +180,20 @@ func (m *MCP) handleListTasks(ctx context.Context, req mcp.CallToolRequest) (*mc
 	}
 	args := req.GetArguments()
 	var list []tasks.Task
-	if convID, _ := args["conversation_id"].(string); convID != "" {
+	if req.GetBool("archived", false) {
+		offset, limit := req.GetInt("offset", 0), req.GetInt("limit", 100)
+		if offset < 0 || limit < 1 || limit > 500 {
+			return mcp.NewToolResultError("invalid archive page"), nil
+		}
+		if convID, _ := args["conversation_id"].(string); convID != "" {
+			return mcp.NewToolResultError("archive pages are global; use get_task for a known task ID"), nil
+		}
+		var err error
+		list, err = tm.ListArchived(offset, limit)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+	} else if convID, _ := args["conversation_id"].(string); convID != "" {
 		list = tm.ListByConversation(convID)
 	} else {
 		list = tm.List()
@@ -243,16 +274,12 @@ func (m *MCP) handleSendMessage(ctx context.Context, req mcp.CallToolRequest) (*
 		convID = m.mgr.store.PrimaryConversationID()
 	}
 
-	// Fire-and-forget: return to Eve immediately; delivery proceeds in the
-	// background through the routing pipeline. The store append is serialized.
-	// Delivery failures are logged, never silent.
-	go func() {
-		if err := m.mgr.Router.Notify(context.Background(), convID, message, purpose, channel); err != nil {
-			slog.Warn("send_message delivery", "conv", convID, "error", err)
-		}
-	}()
-
-	return mcp.NewToolResultText("Message accepted for delivery"), nil
+	deliveryID, _ := args["delivery_id"].(string)
+	id, err := m.mgr.EnqueueNotification(deliveryID, convID, message, purpose, channel)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText("Message durably queued for delivery: " + id), nil
 }
 
 func (m *MCP) handleListChannels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

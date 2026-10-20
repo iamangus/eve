@@ -46,7 +46,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 
 .app-shell { display: flex; flex: 1; min-height: 0; overflow: hidden; }
 
-.bubble :global(pre) {
+.bubble pre {
   background: var(--bg-deep);
   border: 1px solid var(--border);
   border-radius: 2px;
@@ -54,19 +54,19 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   overflow-x: auto;
   margin: 8px 0;
 }
-.bubble :global(code) { font-family: var(--mono); font-size: 0.84em; }
-.bubble :global(p) { margin: 6px 0; }
-.bubble :global(p:first-child) { margin-top: 0; }
-.bubble :global(p:last-child) { margin-bottom: 0; }
-.bubble :global(ul), .bubble :global(ol) { padding-left: 22px; margin: 6px 0; }
-.bubble :global(h1), .bubble :global(h2), .bubble :global(h3) { margin: 10px 0 6px; font-weight: 600; }
-.bubble :global(h1) { font-size: 1.2em; }
-.bubble :global(h2) { font-size: 1.1em; }
-.bubble :global(h3) { font-size: 1.0em; }
-.bubble :global(a) { color: var(--accent); text-underline-offset: 3px; }
-.bubble :global(table) { border-collapse: collapse; width: 100%; font-size: 0.9em; }
-.bubble :global(th), .bubble :global(td) { border-bottom: 1px solid var(--border); padding: 7px 10px; text-align: left; }
-.bubble :global(th) { color: var(--text-muted); font-family: var(--mono); font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.06em; }
+.bubble code { font-family: var(--mono); font-size: 0.84em; }
+.bubble p { margin: 6px 0; }
+.bubble p:first-child { margin-top: 0; }
+.bubble p:last-child { margin-bottom: 0; }
+.bubble ul, .bubble ol { padding-left: 22px; margin: 6px 0; }
+.bubble h1, .bubble h2, .bubble h3 { margin: 10px 0 6px; font-weight: 600; }
+.bubble h1 { font-size: 1.2em; }
+.bubble h2 { font-size: 1.1em; }
+.bubble h3 { font-size: 1.0em; }
+.bubble a { color: var(--accent); text-underline-offset: 3px; }
+.bubble table { border-collapse: collapse; width: 100%; font-size: 0.9em; display: block; overflow-x: auto; }
+.bubble th, .bubble td { border-bottom: 1px solid var(--border); padding: 7px 10px; text-align: left; }
+.bubble th { color: var(--text-muted); font-family: var(--mono); font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.06em; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }

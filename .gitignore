@@ -11,6 +11,8 @@ vendor/
 # Frontend build artifacts
 /frontend/dist
 /frontend/node_modules
+/frontend/test-results
+/frontend/playwright-report
 
 # Local data / SQLite
 /data
@@ -26,3 +28,5 @@ vendor/
 .DS_Store
 .idea/
 .vscode/
+.env
+.env.*

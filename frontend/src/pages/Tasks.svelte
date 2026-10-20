@@ -6,6 +6,10 @@
   let error = $state('')
   let now = $state(Date.now())
   let replies = $state({})
+  let pending = $state({})
+  let showArchived = $state(false)
+  let archiveOffset = $state(0)
+  let loadVersion = 0
 
   $effect(() => {
     load()
@@ -17,36 +21,49 @@
   })
 
   async function load() {
+    const version = ++loadVersion
     try {
-      const list = await api.get('/api/tasks')
+      const list = await api.get(showArchived ? '/api/tasks/archive?offset=' + archiveOffset : '/api/tasks')
+      if (version !== loadVersion) return
       tasks = Array.isArray(list) ? list.slice().sort((a, b) => new Date(b.updated_at || b.created_at) - new Date(a.updated_at || a.created_at)) : []
       error = ''
     } catch (e) {
-      error = e.message
+      if (version === loadVersion) error = e.message
     } finally {
-      loading = false
+      if (version === loadVersion) loading = false
     }
   }
 
+  async function archiveTask(id) {
+    if (pending[id]) return
+    pending[id] = true
+    try { await api.post('/api/tasks/' + id + '/archive', {}); await load() }
+    catch (e) { error = e.message } finally { pending[id] = false }
+  }
+
   async function replyToTask(id) {
+    if (pending[id]) return
     const content = (replies[id] || '').trim()
     if (!content) return
+    pending[id] = true
     try {
       await api.post('/api/tasks/' + id + '/reply', { content })
       replies[id] = ''
       load()
     } catch (e) {
       error = e.message
-    }
+    } finally { pending[id] = false }
   }
 
   async function cancelTask(id) {
+    if (pending[id]) return
+    pending[id] = true
     try {
       await api.post('/api/tasks/' + id + '/cancel', {})
       load()
     } catch (e) {
       error = e.message
-    }
+    } finally { pending[id] = false }
   }
 
   function fmtTime(t) {
@@ -65,7 +82,8 @@
 <div class="ts-page">
   <header class="ts-head">
     <div><div class="ts-kicker">SYSTEM / WORK QUEUE</div><h2 class="ts-title">Tasks</h2></div>
-    <div class="ts-count">{activeCount()} active · {tasks.length} total tasks</div>
+    <div class="ts-count">{activeCount()} active · {tasks.length} {showArchived ? 'archived tasks on this page' : 'current tasks'}</div>
+    <button class="ts-cancel" onclick={() => { showArchived = !showArchived; archiveOffset = 0; loading = true }}>{showArchived ? 'Current tasks' : 'Archived tasks'}</button>
   </header>
 
   {#if loading}
@@ -83,11 +101,13 @@
             <span class="ts-status ts-{t.status}">{t.status.replaceAll('_', ' ')}</span>
             <span class="ts-name">{t.agent_name || t.agent_id}</span>
             {#if activeStatuses.includes(t.status)}
-              <button class="ts-cancel" onclick={() => cancelTask(t.id)}>Cancel task</button>
+              <button class="ts-cancel" disabled={pending[t.id]} onclick={() => cancelTask(t.id)}>Cancel task</button>
             {/if}
+            {#if !showArchived && t.reported && !activeStatuses.includes(t.status)}<button class="ts-cancel" disabled={pending[t.id]} onclick={() => archiveTask(t.id)}>Archive task</button>{/if}
           </div>
           <div class="ts-detail">
             <div class="ts-msg">{t.message}</div>
+            {#if t.status === 'running' && t.dispatch_error}<div class="ts-question">Queued for dispatch retry: {t.dispatch_error}</div>{/if}
 
             {#if t.question}
               <div class="ts-question">Question: {t.question}</div>
@@ -125,6 +145,10 @@
         </div>
       {/each}
     </div>
+  {/if}
+  {#if showArchived && !loading}
+    <button disabled={archiveOffset === 0} onclick={() => { archiveOffset = Math.max(0, archiveOffset - 100) }}>Previous archive page</button>
+    <button disabled={tasks.length < 100} onclick={() => { archiveOffset += 100 }}>Next archive page</button>
   {/if}
 </div>
 

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/iamangus/eve/internal/agentfoundry"
@@ -13,6 +15,7 @@ import (
 	"github.com/iamangus/eve/internal/io"
 	"github.com/iamangus/eve/internal/store"
 	"github.com/iamangus/eve/internal/tasks"
+	"github.com/iamangus/eve/internal/web"
 )
 
 type Handler struct {
@@ -41,14 +44,79 @@ func NewHandler(store *store.Store, client *agentfoundry.Client, ctxMgr *ctxmgr.
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/conversations", h.listConversations)
+	mux.HandleFunc("GET /api/conversations/primary", h.primaryConversation)
 	mux.HandleFunc("POST /api/conversations", h.createConversation)
 	mux.HandleFunc("GET /api/conversations/{id}", h.getConversation)
+	mux.HandleFunc("GET /api/conversations/{id}/export", h.exportConversation)
 	mux.HandleFunc("DELETE /api/conversations/{id}", h.deleteConversation)
 	mux.HandleFunc("POST /api/conversations/{id}/messages", h.sendMessage)
 	mux.HandleFunc("GET /runs/{id}/events", h.runEvents)
 	mux.HandleFunc("GET /api/tasks", h.listTasks)
+	mux.HandleFunc("GET /api/tasks/archive", h.archivedTasks)
+	mux.HandleFunc("POST /api/tasks/{id}/archive", h.archiveTask)
 	mux.HandleFunc("POST /api/tasks/{id}/reply", h.replyTask)
 	mux.HandleFunc("POST /api/tasks/{id}/cancel", h.cancelTask)
+}
+
+func (h *Handler) primaryConversation(w http.ResponseWriter, r *http.Request) {
+	id := h.store.PrimaryConversationID()
+	if id == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func (h *Handler) exportConversation(w http.ResponseWriter, r *http.Request) {
+	conv, err := h.store.GetConversation(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Disposition", `attachment; filename="eve-conversation.json"`)
+	writeJSON(w, http.StatusOK, map[string]any{"format": "eve-conversation-v1", "conversation": conv, "compartments": h.store.Compartments(conv.ID)})
+}
+
+func (h *Handler) archiveTask(w http.ResponseWriter, r *http.Request) {
+	if h.tasks == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tasks unavailable"})
+		return
+	}
+	if err := h.tasks.Archive(r.PathValue("id")); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) archivedTasks(w http.ResponseWriter, r *http.Request) {
+	if h.tasks == nil {
+		writeJSON(w, http.StatusOK, []tasks.Task{})
+		return
+	}
+	offset, limit := 0, 100
+	if value := r.URL.Query().Get("offset"); value != "" {
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "offset must be nonnegative"})
+			return
+		}
+		offset = n
+	}
+	if value := r.URL.Query().Get("limit"); value != "" {
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 || n > 500 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be between 1 and 500"})
+			return
+		}
+		limit = n
+	}
+	list, err := h.tasks.ListArchived(offset, limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "archive unavailable"})
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
 }
 
 // SetTasks attaches the background-task manager so the task board can be
@@ -67,10 +135,24 @@ func (h *Handler) listConversations(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) createConversation(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Title string `json:"title"`
+		Title   string `json:"title"`
+		Primary bool   `json:"primary,omitempty"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	conv, err := h.store.CreateConversation(req.Title)
+	if err := web.Decode(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	var conv *store.Conversation
+	var err error
+	if req.Primary {
+		var id string
+		id, err = h.store.EnsurePrimaryConversation()
+		if err == nil {
+			conv, err = h.store.GetConversation(id)
+		}
+	} else {
+		conv, err = h.store.CreateConversation(req.Title)
+	}
 	if err != nil {
 		slog.Error("create conversation", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -98,19 +180,50 @@ func (h *Handler) getConversation(w http.ResponseWriter, r *http.Request) {
 	if conv.Messages == nil {
 		conv.Messages = []store.Message{}
 	}
+	limit := 200
+	if value := r.URL.Query().Get("limit"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 || parsed > 1000 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be between 1 and 1000"})
+			return
+		}
+		limit = parsed
+	}
+	end := len(conv.Messages)
+	if value := r.URL.Query().Get("before_id"); value != "" {
+		before, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || before < 1 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "before_id must be positive"})
+			return
+		}
+		end = sort.Search(len(conv.Messages), func(i int) bool { return conv.Messages[i].ID >= before })
+	}
+	start := max(0, end-limit)
+	conv.HasMore = start > 0
+	conv.Messages = conv.Messages[start:end]
 	writeJSON(w, http.StatusOK, conv)
 }
 
 func (h *Handler) deleteConversation(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if err := h.removeConversation(r.Context(), id); err != nil {
+		code := http.StatusBadGateway
+		if errors.Is(err, store.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		if errors.Is(err, store.ErrDeleteInProgress) {
+			code = http.StatusConflict
+		}
+		writeJSON(w, code, map[string]string{"error": err.Error()})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) removeConversation(ctx context.Context, id string) error {
 	activeRunIDs, err := h.store.BeginConversationDelete(id)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		if errors.Is(err, store.ErrDeleteInProgress) {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
-		} else {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		}
-		return
+		return err
 	}
 	if err == nil {
 		defer h.store.EndConversationDelete(id)
@@ -126,28 +239,30 @@ func (h *Handler) deleteConversation(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for runID := range runIDs {
-		if err := h.client.CancelRun(r.Context(), runID); err != nil && !agentfoundry.IsStaleRun(err) {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to stop conversation run"})
-			return
+		if err := h.client.CancelRun(ctx, runID); err != nil && !agentfoundry.IsStaleRun(err) {
+			return err
+		}
+	}
+	if h.tasks != nil {
+		for _, task := range h.tasks.ListByConversation(id) {
+			if task.Active() {
+				if err := h.tasks.Cancel(ctx, task.ID); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	for _, scope := range scopes {
 		if h.store.PersistentRun(scope) != "" {
 			if err := h.store.SetPersistentRun(scope, ""); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to clear conversation run"})
-				return
+				return err
 			}
 		}
 	}
-	if err := h.store.DeleteConversation(id); errors.Is(err, store.ErrNotFound) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
-		return
-	} else if err != nil {
-		slog.Error("delete conversation", "id", id, "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return
+	if err := h.store.DeleteConversation(id); err != nil {
+		return err
 	}
-	w.WriteHeader(http.StatusNoContent)
+	return h.store.FinishDelete(id)
 }
 
 type sendMessageRequest struct {
@@ -166,7 +281,7 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 	convID := r.PathValue("id")
 
 	var req sendMessageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := web.Decode(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
@@ -181,21 +296,11 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 
 	h.ioMgr.Reg.Touch("web")
 
-	userCount, err := h.store.UserMessageCount(convID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
-			return
-		}
-		slog.Error("count user messages", "conv", convID, "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return
-	}
-
 	steerRun := h.store.SteerTarget(convID)
 
 	var appended *store.Message
 	var steerTarget string
+	var err error
 	if steerRun != "" {
 		appended, _, steerTarget, err = h.store.AppendSteeredOwnerMessageWithSource(convID, req.Content, "web", "owner", "", "", req.ClientID, steerRun)
 	} else {
@@ -213,14 +318,6 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		slog.Error("append user message", "conv", convID, "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
-	}
-
-	if userCount == 0 {
-		defaultTitle := req.Content
-		if len(defaultTitle) > 40 {
-			defaultTitle = strings.TrimSpace(defaultTitle[:40]) + "…"
-		}
-		_ = h.store.SetTitle(convID, defaultTitle)
 	}
 
 	if steerTarget != "" {
@@ -321,7 +418,7 @@ func (h *Handler) replyTask(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Content string `json:"content"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Content) == "" {
+	if err := web.Decode(r, &req); err != nil || strings.TrimSpace(req.Content) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content is required"})
 		return
 	}

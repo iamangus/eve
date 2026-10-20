@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 )
 
 // Event is pushed to browser clients over the persistent /api/events stream.
@@ -56,7 +57,14 @@ func (h *Hub) Broadcast(ev Event) {
 		select {
 		case ch <- ev:
 		default:
-			// Slow subscriber: drop rather than block the broadcaster.
+			select {
+			case <-ch:
+			default:
+			}
+			select {
+			case ch <- Event{Type: "resync"}:
+			default:
+			}
 		}
 	}
 }
@@ -82,10 +90,17 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	ctx := r.Context()
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-ticker.C:
+			if _, err := w.Write([]byte(": heartbeat\n\n")); err != nil {
+				return
+			}
+			flusher.Flush()
 		case ev := <-ch:
 			data, err := json.Marshal(ev)
 			if err != nil {

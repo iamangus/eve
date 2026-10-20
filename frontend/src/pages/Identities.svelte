@@ -1,9 +1,11 @@
 <script>
   import { api } from '../lib/api.js'
+  import { dialog } from '../lib/dialog.js'
 
   let identities = $state([])
   let loading = $state(true)
   let error = $state('')
+  let saving = $state(false)
   let editorOpen = $state(false)
   let editingName = $state('')
   let form = $state({ name: '', owner: false, channels: [{ type: 'email', address: '' }] })
@@ -58,6 +60,7 @@
   }
 
   async function save() {
+    if (saving) return
     const body = {
       name: form.name.trim(),
       owner: form.owner,
@@ -66,6 +69,7 @@
         .filter((c) => c.address !== ''),
     }
     if (!body.name) return
+    saving = true
     try {
       if (editingName) {
         await api.put(`/api/identities/${encodeURIComponent(editingName)}`, body)
@@ -76,7 +80,7 @@
       await load()
     } catch (e) {
       error = e.message
-    }
+    } finally { saving = false }
   }
 
   async function remove(name) {
@@ -135,8 +139,8 @@
 
 {#if editorOpen}
   <div class="id-overlay" role="presentation" onclick={closeEditor}>
-    <div class="id-modal" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
-      <h3 class="id-modal-title">{editingName ? `Edit ${editingName}` : 'New identity'}</h3>
+    <div class="id-modal" use:dialog={closeEditor} role="dialog" aria-modal="true" aria-labelledby="identity-dialog-title" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+      <h3 id="identity-dialog-title" class="id-modal-title">{editingName ? `Edit ${editingName}` : 'New identity'}</h3>
       <label class="id-field">
         <span>Name</span>
         <input

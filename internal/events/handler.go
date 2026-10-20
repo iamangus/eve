@@ -9,10 +9,12 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/iamangus/eve/internal/agentfoundry"
 	"github.com/iamangus/eve/internal/store"
+	"github.com/iamangus/eve/internal/web"
 )
 
 type Handler struct {
@@ -38,6 +40,12 @@ func (h *Handler) EnqueueFrontend(content, conversationID string) error {
 	if conversationID == "" {
 		conversationID = h.store.PrimaryConversationID()
 	}
+	if _, err := h.store.GetConversation(conversationID); err != nil {
+		return err
+	}
+	if strings.TrimSpace(content) == "" || len(content) > 512*1024 {
+		return errors.New("frontend trigger content must be nonempty and at most 512 KiB")
+	}
 	payload, err := json.Marshal(map[string]string{"conversation_id": conversationID, "content": content})
 	if err != nil {
 		return err
@@ -50,6 +58,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	if h.token != "" {
 		mux.HandleFunc("POST /api/inbound/opendev", h.openDev)
 		mux.HandleFunc("GET /api/inbound/opendev/events/{id}", h.openDevStatus)
+		mux.HandleFunc("GET /api/inbound/opendev/events", h.listEvents)
+		mux.HandleFunc("POST /api/inbound/opendev/events/{id}/retry", h.retryEvent)
 	}
 }
 
@@ -76,11 +86,26 @@ func (h *Handler) openDev(w http.ResponseWriter, r *http.Request) {
 		Category string          `json:"category"`
 		Payload  json.RawMessage `json:"payload"`
 	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&in); err != nil || (in.Category != "backend" && in.Category != "frontend") || in.ID == "" || !json.Valid(in.Payload) {
+	if err := web.Decode(r, &in); err != nil || (in.Category != "backend" && in.Category != "frontend") || in.ID == "" || !json.Valid(in.Payload) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id, category (backend or frontend), and payload are required"})
 		return
+	}
+	if len(in.ID) > 256 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "event ID is too long"})
+		return
+	}
+	if in.Category == "frontend" {
+		var payload struct {
+			ConversationID string `json:"conversation_id"`
+		}
+		if err := json.Unmarshal(in.Payload, &payload); err != nil || payload.ConversationID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "frontend payload requires conversation_id"})
+			return
+		}
+		if _, err := h.store.GetConversation(payload.ConversationID); err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "conversation not found"})
+			return
+		}
 	}
 	queued, err := h.queue.Enqueue("opendev", in.Category, in.ID, in.Payload)
 	if err != nil {
@@ -92,6 +117,15 @@ func (h *Handler) openDev(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Run(ctx context.Context) {
+	var workers sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		workers.Add(1)
+		go func() { defer workers.Done(); h.work(ctx) }()
+	}
+	workers.Wait()
+}
+
+func (h *Handler) work(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -111,8 +145,10 @@ func (h *Handler) processOne(ctx context.Context) error {
 	if err != nil || event == nil {
 		return err
 	}
-	if err := h.deliver(ctx, event); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+	deliveryCtx, cancel := context.WithTimeout(ctx, 55*time.Second)
+	defer cancel()
+	if err := h.deliver(deliveryCtx, event); err != nil {
+		if errors.Is(err, store.ErrNotFound) || agentfoundry.IsInvalidRequest(err) {
 			if failErr := h.queue.Fail(event, err.Error()); failErr != nil {
 				return fmt.Errorf("deliver: %v; record rejection: %w", err, failErr)
 			}
@@ -127,12 +163,32 @@ func (h *Handler) processOne(ctx context.Context) error {
 			}
 			return err
 		}
-		if retryErr := h.queue.Retry(event); retryErr != nil {
+		if retryErr := h.queue.RetryError(event, err.Error()); retryErr != nil {
 			return fmt.Errorf("deliver: %v; release: %w", err, retryErr)
 		}
 		return err
 	}
 	return h.queue.Complete(event)
+}
+
+func (h *Handler) listEvents(w http.ResponseWriter, r *http.Request) {
+	if !validToken(r, h.token) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "bad token"})
+		return
+	}
+	writeJSON(w, http.StatusOK, h.queue.Snapshot())
+}
+
+func (h *Handler) retryEvent(w http.ResponseWriter, r *http.Request) {
+	if !validToken(r, h.token) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "bad token"})
+		return
+	}
+	if err := h.queue.Requeue("opendev", r.PathValue("id")); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]bool{"queued": true})
 }
 
 func (h *Handler) deliver(ctx context.Context, event *Event) error {

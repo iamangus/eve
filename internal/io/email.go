@@ -5,9 +5,14 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net"
+	"net/mail"
 	"net/smtp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/iamangus/eve/internal/store"
 )
@@ -15,12 +20,16 @@ import (
 // SMTPConfig configures outbound email delivery. Empty host disables the
 // email channel entirely.
 type SMTPConfig struct {
-	Host     string
-	Port     int
-	Username string
-	Password string
-	From     string
+	Host      string
+	Port      int
+	Username  string
+	Password  string
+	From      string
+	Recipient string
+	tlsConfig *tls.Config
 }
+
+var ErrSMTPAmbiguous = errors.New("SMTP delivery acknowledgement unknown; retry may duplicate mail")
 
 func (c SMTPConfig) Enabled() bool {
 	return c.Host != ""
@@ -34,6 +43,7 @@ type emailAdapter struct {
 	reg   *Registry
 	store *store.Store
 	hub   *Hub
+	ident *Resolver
 }
 
 func (a *emailAdapter) Type() ChannelType { return ChannelEmail }
@@ -47,11 +57,13 @@ func (a *emailAdapter) Send(ctx context.Context, msg OutboundMessage) error {
 		return fmt.Errorf("email: no recipient")
 	}
 	if !strings.Contains(to, "@") {
-		if snap, ok := a.reg.Lookup("email", to); ok {
-			to = snap.DefaultRecipient
-		}
-		if !strings.Contains(to, "@") {
+		if a.ident == nil {
 			return fmt.Errorf("email: unresolved recipient %q", msg.Recipient)
+		}
+		var err error
+		to, err = a.ident.Destination(to, ChannelEmail)
+		if err != nil {
+			return err
 		}
 	}
 	if err := a.cfg.Send(ctx, to, msg.Text, msg.TurnID); err != nil {
@@ -77,37 +89,60 @@ func (a *emailAdapter) Send(ctx context.Context, msg OutboundMessage) error {
 // Send delivers a plain-text email to one recipient through the configured
 // SMTP server.
 func (c SMTPConfig) Send(ctx context.Context, to, body string, turnIDs ...string) error {
-	addr := fmt.Sprintf("%s:%d", c.Host, c.Port)
+	fromAddr, err := mail.ParseAddress(c.From)
+	if err != nil {
+		return fmt.Errorf("email: invalid sender: %w", err)
+	}
+	toAddr, err := mail.ParseAddress(to)
+	if err != nil {
+		return fmt.Errorf("email: invalid recipient: %w", err)
+	}
+	addr := net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 	var auth smtp.Auth
 	if c.Username != "" || c.Password != "" {
 		auth = smtp.PlainAuth("", c.Username, c.Password, c.Host)
 	}
 	headers := []string{
-		"From: " + c.From,
-		"To: " + to,
+		"From: " + fromAddr.String(),
+		"To: " + toAddr.String(),
 		"Subject: Eve",
+		"Date: " + time.Now().Format(time.RFC1123Z),
+		"MIME-Version: 1.0",
+		"Content-Type: text/plain; charset=utf-8",
+		"Content-Transfer-Encoding: 8bit",
 	}
 	if len(turnIDs) > 0 && turnIDs[0] != "" {
 		headers = append(headers, "Message-ID: "+stableMessageID(turnIDs[0], to, c.From))
 	}
 	msg := strings.Join(append(headers, "", body), "\r\n")
 	var conn *smtp.Client
-	var err error
+	nconn, err := (&net.Dialer{Timeout: 15 * time.Second}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("email: dial: %w", err)
+	}
+	defer nconn.Close()
+	deadline := time.Now().Add(60 * time.Second)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = nconn.SetDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() { nconn.Close() })
+	defer stop()
 	if c.Port == 465 {
-		tconn, terr := tls.Dial("tcp", addr, &tls.Config{ServerName: c.Host})
-		if terr != nil {
-			return fmt.Errorf("email: tls dial %s: %w", addr, terr)
+		tconn := tls.Client(nconn, c.transportTLS())
+		if err := tconn.HandshakeContext(ctx); err != nil {
+			return fmt.Errorf("email: TLS: %w", err)
 		}
 		conn, err = smtp.NewClient(tconn, c.Host)
 	} else {
-		conn, err = smtp.Dial(addr)
+		conn, err = smtp.NewClient(nconn, c.Host)
 	}
 	if err != nil {
 		return fmt.Errorf("email: dial %s: %w", addr, err)
 	}
 	defer conn.Close()
 	if c.Port != 465 {
-		if err := conn.StartTLS(&tls.Config{ServerName: c.Host}); err != nil {
+		if err := conn.StartTLS(c.transportTLS()); err != nil {
 			return fmt.Errorf("email: starttls: %w", err)
 		}
 	}
@@ -116,10 +151,10 @@ func (c SMTPConfig) Send(ctx context.Context, to, body string, turnIDs ...string
 			return fmt.Errorf("email: auth: %w", err)
 		}
 	}
-	if err := conn.Mail(c.From); err != nil {
+	if err := conn.Mail(fromAddr.Address); err != nil {
 		return fmt.Errorf("email: mail from: %w", err)
 	}
-	if err := conn.Rcpt(to); err != nil {
+	if err := conn.Rcpt(toAddr.Address); err != nil {
 		return fmt.Errorf("email: rcpt %s: %w", to, err)
 	}
 	w, err := conn.Data()
@@ -127,15 +162,20 @@ func (c SMTPConfig) Send(ctx context.Context, to, body string, turnIDs ...string
 		return fmt.Errorf("email: data: %w", err)
 	}
 	if _, err := w.Write([]byte(msg)); err != nil {
-		return fmt.Errorf("email: write: %w", err)
+		return fmt.Errorf("%w: write: %v", ErrSMTPAmbiguous, err)
 	}
 	if err := w.Close(); err != nil {
-		return fmt.Errorf("email: close: %w", err)
+		return fmt.Errorf("%w: close: %v", ErrSMTPAmbiguous, err)
 	}
-	if err := conn.Quit(); err != nil {
-		return fmt.Errorf("email: quit: %w", err)
-	}
+	_ = conn.Quit()
 	return nil
+}
+
+func (c SMTPConfig) transportTLS() *tls.Config {
+	if c.tlsConfig != nil {
+		return c.tlsConfig.Clone()
+	}
+	return &tls.Config{ServerName: c.Host, MinVersion: tls.VersionTLS12}
 }
 
 func stableMessageID(turnID, to, from string) string {

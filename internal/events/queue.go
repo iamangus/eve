@@ -3,6 +3,7 @@ package events
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/iamangus/eve/internal/durable"
 )
 
 const (
@@ -30,6 +33,7 @@ type Event struct {
 	AgentFailures int             `json:"agent_failures,omitempty"`
 	LastError     string          `json:"last_error,omitempty"`
 	Payload       json.RawMessage `json:"payload"`
+	PayloadDigest string          `json:"payload_digest,omitempty"`
 	Attempt       int             `json:"attempt"`
 	State         string          `json:"state"`
 	LeaseUntil    time.Time       `json:"lease_until,omitempty"`
@@ -46,7 +50,7 @@ type Queue struct {
 }
 
 func NewQueue(dir string) (*Queue, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	q := &Queue{dir: dir, events: make(map[string]*Event)}
@@ -74,6 +78,9 @@ func NewQueue(dir string) (*Queue, error) {
 		if event.InputID == "" {
 			event.InputID = event.ID
 		}
+		if event.PayloadDigest == "" {
+			event.PayloadDigest = payloadDigest(event.Payload)
+		}
 	}
 	return q, nil
 }
@@ -81,15 +88,7 @@ func NewQueue(dir string) (*Queue, error) {
 func eventKey(source, id string) string { return source + "\x00" + id }
 
 func (q *Queue) saveLocked() error {
-	data, err := json.MarshalIndent(q.events, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := filepath.Join(q.dir, "internal_events.json.tmp")
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(q.dir, "internal_events.json"))
+	return durable.JSON(filepath.Join(q.dir, "internal_events.json"), q.events)
 }
 
 func (q *Queue) Enqueue(source, category, id string, payload json.RawMessage) (bool, error) {
@@ -99,11 +98,22 @@ func (q *Queue) Enqueue(source, category, id string, payload json.RawMessage) (b
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	key := eventKey(source, id)
-	if _, exists := q.events[key]; exists {
+	if prior, exists := q.events[key]; exists {
+		if prior.Category != category || prior.PayloadDigest != payloadDigest(payload) {
+			return false, errors.New("event ID already belongs to a different payload")
+		}
 		return false, nil
 	}
+	if prior, err := q.archived(source, id); err == nil {
+		if prior.Category != category || prior.PayloadDigest != payloadDigest(payload) {
+			return false, errors.New("event ID already belongs to a different payload")
+		}
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
 	now := time.Now().UTC()
-	q.events[key] = &Event{Source: source, Category: category, ID: id, InputID: id, Payload: append(json.RawMessage(nil), payload...), State: StatePending, CreatedAt: now, UpdatedAt: now}
+	q.events[key] = &Event{Source: source, Category: category, ID: id, InputID: id, Payload: append(json.RawMessage(nil), payload...), PayloadDigest: payloadDigest(payload), State: StatePending, CreatedAt: now, UpdatedAt: now}
 	if err := q.saveLocked(); err != nil {
 		delete(q.events, key)
 		return false, err
@@ -111,12 +121,25 @@ func (q *Queue) Enqueue(source, category, id string, payload json.RawMessage) (b
 	return true, nil
 }
 
+func payloadDigest(data json.RawMessage) string {
+	var value any
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if decoder.Decode(&value) != nil {
+		return ""
+	}
+	canonical, _ := json.Marshal(value)
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:])
+}
+
 func (q *Queue) Status(source, id string) (*Event, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	event := q.events[eventKey(source, id)]
 	if event == nil {
-		return nil, false
+		archived, err := q.archived(source, id)
+		return archived, err == nil
 	}
 	copy := *event
 	copy.Payload = append(json.RawMessage(nil), event.Payload...)
@@ -127,7 +150,19 @@ func (q *Queue) Lease(now time.Time, duration time.Duration) (*Event, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	var candidates []*Event
+	first := make(map[string]*Event)
 	for _, event := range q.events {
+		if event.State == StatePending || event.State == StateLeased {
+			scope := queueScope(event)
+			if prior := first[scope]; prior == nil || event.CreatedAt.Before(prior.CreatedAt) || (event.CreatedAt.Equal(prior.CreatedAt) && event.ID < prior.ID) {
+				first[scope] = event
+			}
+		}
+	}
+	for _, event := range q.events {
+		if first[queueScope(event)] != event {
+			continue
+		}
 		if (event.State == StatePending && !event.NextAttemptAt.After(now)) || (event.State == StateLeased && !event.LeaseUntil.After(now)) {
 			candidates = append(candidates, event)
 		}
@@ -153,12 +188,98 @@ func (q *Queue) Lease(now time.Time, duration time.Duration) (*Event, error) {
 	return &copy, nil
 }
 
+func queueScope(event *Event) string {
+	if event.Category == "backend" {
+		return "backend"
+	}
+	if event.Category == "frontend" {
+		var payload struct {
+			ConversationID string `json:"conversation_id"`
+		}
+		if json.Unmarshal(event.Payload, &payload) == nil {
+			return "frontend:" + payload.ConversationID
+		}
+	}
+	return eventKey(event.Source, event.ID)
+}
+
 func (q *Queue) Complete(event *Event) error {
 	return q.finish(event, StateDone)
 }
 
 func (q *Queue) Retry(event *Event) error {
 	return q.finish(event, StatePending)
+}
+
+func (q *Queue) RetryError(event *Event, reason string) error {
+	event.LastError = reason
+	return q.finish(event, StatePending)
+}
+
+func (q *Queue) Snapshot() []Event {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := make([]Event, 0, len(q.events))
+	for _, event := range q.events {
+		copy := *event
+		copy.Payload = nil
+		out = append(out, copy)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+type Metrics struct {
+	Pending         int       `json:"pending"`
+	Leased          int       `json:"leased"`
+	Done            int       `json:"done"`
+	Failed          int       `json:"failed"`
+	OldestPendingAt time.Time `json:"oldest_pending_at,omitempty"`
+}
+
+func (q *Queue) Metrics() Metrics {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var metrics Metrics
+	for _, event := range q.events {
+		switch event.State {
+		case StatePending:
+			metrics.Pending++
+		case StateLeased:
+			metrics.Leased++
+		case StateDone:
+			metrics.Done++
+		case StateFailed:
+			metrics.Failed++
+		}
+		if (event.State == StatePending || event.State == StateLeased) && (metrics.OldestPendingAt.IsZero() || event.CreatedAt.Before(metrics.OldestPendingAt)) {
+			metrics.OldestPendingAt = event.CreatedAt
+		}
+	}
+	return metrics
+}
+
+func (q *Queue) Requeue(source, id string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	event := q.events[eventKey(source, id)]
+	if event == nil {
+		return os.ErrNotExist
+	}
+	if event.State != StateFailed {
+		return errors.New("only failed events can be retried")
+	}
+	before := *event
+	event.State = StatePending
+	event.AgentFailures = 0
+	event.InputID = randomID()
+	event.NextAttemptAt = time.Time{}
+	event.UpdatedAt = time.Now().UTC()
+	if err := q.saveLocked(); err != nil {
+		*event = before
+		return err
+	}
+	return nil
 }
 
 func (q *Queue) Fail(event *Event, reason string) error {
@@ -219,6 +340,10 @@ func (q *Queue) finish(event *Event, state string) error {
 	}
 	before := *stored
 	stored.State = state
+	stored.LastError = event.LastError
+	if state == StateDone {
+		stored.Payload = nil
+	}
 	stored.LeaseToken = ""
 	stored.LeaseUntil = time.Time{}
 	stored.UpdatedAt = time.Now().UTC()

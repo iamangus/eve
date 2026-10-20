@@ -60,6 +60,7 @@ type runInputRequest struct {
 }
 
 type RunStatus struct {
+	ID             string `json:"id"`
 	Status         string `json:"status"`
 	Response       string `json:"response"`
 	Error          string `json:"error"`
@@ -91,6 +92,18 @@ func IsNotFound(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }
 
+func IsInvalidRequest(err error) bool {
+	var apiErr *HTTPError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.StatusCode {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusUnprocessableEntity, http.StatusRequestEntityTooLarge:
+		return true
+	}
+	return false
+}
+
 // IsStaleRun reports whether AgentFoundry rejected a run reference because the
 // run no longer exists or is no longer active, for example after a server
 // restart or when the run failed. Callers should recreate the run.
@@ -108,9 +121,12 @@ func NewClient(baseURL, apiKey string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse agentfoundry URL: %w", err)
 	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return nil, fmt.Errorf("agentfoundry URL must be an absolute HTTP(S) URL without user credentials")
+	}
 	return &Client{
 		baseURL:    u,
-		httpClient: &http.Client{Timeout: 0},
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 		apiKey:     apiKey,
 	}, nil
 }
@@ -154,8 +170,8 @@ func (c *Client) CreatePersistentRun(ctx context.Context, agentID string, opts P
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("agentfoundry create persistent run: %s: %s", resp.Status, string(b))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(b)}
 	}
 	var out runResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -193,7 +209,7 @@ func (c *Client) SendPersistentRunInputWithMetadata(ctx context.Context, runID, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return "", &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(b)}
 	}
 	var out runResponse
@@ -231,12 +247,15 @@ func (c *Client) RunAgentWith(ctx context.Context, agentID string, opts RunOptio
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("agentfoundry run: %s: %s", resp.Status, string(b))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(b)}
 	}
 	var out runResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", fmt.Errorf("decode run response: %w", err)
+	}
+	if out.RunID == "" {
+		return "", fmt.Errorf("agentfoundry run response has no run_id")
 	}
 	return out.RunID, nil
 }
@@ -257,11 +276,11 @@ func (c *Client) GetRun(ctx context.Context, runID string) (*RunStatus, error) {
 		return &RunStatus{Status: "unknown"}, nil
 	}
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("agentfoundry get run: %s: %s", resp.Status, string(b))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(b)}
 	}
 	var rs RunStatus
-	if err := json.NewDecoder(resp.Body).Decode(&rs); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&rs); err != nil {
 		return nil, fmt.Errorf("decode run status: %w", err)
 	}
 	return &rs, nil
@@ -309,7 +328,7 @@ func (c *Client) CancelRun(ctx context.Context, runID string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(b)}
 	}
 	return nil
@@ -337,8 +356,8 @@ func (c *Client) FindRunByTaskID(ctx context.Context, taskID string) (*RunStatus
 		return nil, nil
 	}
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("agentfoundry find run by task: %s: %s", resp.Status, string(b))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(b)}
 	}
 	var rs RunStatus
 	if err := json.NewDecoder(resp.Body).Decode(&rs); err != nil {
@@ -355,12 +374,14 @@ func (c *Client) StreamRunEvents(ctx context.Context, runID string) (io.ReadClos
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	c.withAuth(req)
-	resp, err := c.httpClient.Do(req)
+	streamClient := *c.httpClient
+	streamClient.Timeout = 0
+	resp, err := streamClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
 		return nil, fmt.Errorf("agentfoundry SSE: %s: %s", resp.Status, string(b))
 	}
@@ -388,12 +409,18 @@ func (c *Client) StreamRunEventsChan(ctx context.Context, runID string) (<-chan 
 			// A completed automation run may have no final text after a tool
 			// call. Its empty-data done event is still the completion signal.
 			if eventType != "" {
-				ch <- SSEEvent{Type: eventType, Data: dataLines}
+				select {
+				case ch <- SSEEvent{Type: eventType, Data: dataLines}:
+				case <-ctx.Done():
+				}
 			}
 			eventType = ""
 			dataLines = ""
 		}
 		for scanner.Scan() {
+			if ctx.Err() != nil {
+				return
+			}
 			line := scanner.Text()
 			switch {
 			case line == "":
@@ -402,7 +429,7 @@ func (c *Client) StreamRunEventsChan(ctx context.Context, runID string) (<-chan 
 			case strings.HasPrefix(line, "event:"):
 				eventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 			case strings.HasPrefix(line, "data:"):
-				d := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				d := strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ")
 				if dataLines == "" {
 					dataLines = d
 				} else {
@@ -411,6 +438,12 @@ func (c *Client) StreamRunEventsChan(ctx context.Context, runID string) (<-chan 
 			}
 		}
 		flush()
+		if err := scanner.Err(); err != nil && ctx.Err() == nil {
+			select {
+			case ch <- SSEEvent{Type: "error", Data: err.Error()}:
+			case <-ctx.Done():
+			}
+		}
 	}()
 	return ch, nil
 }

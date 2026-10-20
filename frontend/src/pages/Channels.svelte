@@ -1,5 +1,6 @@
 <script>
   import { api } from '../lib/api.js'
+  import { HUB_EVENT, parseHubEvent } from '../lib/events.js'
 
   let data = $state({ channels: [], health: {} })
   let loading = $state(true)
@@ -14,12 +15,12 @@
       load()
     }, 5000)
     const src = new EventSource('/api/events')
-    src.onmessage = (ev) => {
+    src.addEventListener(HUB_EVENT, (ev) => {
       try {
-        const e = JSON.parse(ev.data)
-        if (e.type === 'channels') load()
+        const e = parseHubEvent(ev.data)
+        if (e?.type === 'channels') load()
       } catch {}
-    }
+    })
     es = src
     return () => {
       clearInterval(iv)
@@ -57,7 +58,9 @@
   function healthState(id) {
     const h = health()[id]
     if (!h) return null
-    return h.last_error ? 'error' : 'ok'
+    if (h.last_error) return 'error'
+    if (Date.now() - new Date(h.last_check).getTime() > Math.max(120000, (h.expected_interval_seconds || 60) * 2500)) return 'stale'
+    return 'ok'
   }
 </script>
 
@@ -69,6 +72,12 @@
     </div>
     <div class="ch-summary">{channels().length} registered channels · refresh interval 5 seconds</div>
   </header>
+  {#each Object.entries(data.queues || {}) as [name, queue]}
+    <div class="ch-empty">{name}: {queue.pending} pending · {queue.leased} delivering · {queue.failed} failed{#if queue.pending || queue.leased} · oldest queued {fmtTime(queue.oldest_pending_at)}{/if}</div>
+  {/each}
+  {#each Object.entries(data.health || {}) as [name, poller]}
+    {#if !channels().some(channel => channel.id === name)}<div class="ch-empty">{name} poller · last checked {fmtTime(poller.last_check)}{#if poller.last_error} · {poller.last_error}{/if}</div>{/if}
+  {/each}
   {#if loading}
     <div class="ch-empty">Loading channels…</div>
   {:else if error}

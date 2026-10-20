@@ -6,10 +6,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/iamangus/eve/internal/store"
 
@@ -23,6 +25,7 @@ type MatrixConfig struct {
 	Homeserver  string // e.g. https://matrix.example.com
 	AccessToken string
 	UserID      string // the bot account, e.g. @eve:example.com
+	OwnerRoom   string
 	// JoinRooms are room IDs to join at startup (best effort).
 	JoinRooms []string
 }
@@ -42,6 +45,7 @@ type matrixAdapter struct {
 	store *store.Store
 	hub   *Hub
 	e2ee  *MatrixE2EE
+	ident *Resolver
 }
 
 func (a *matrixAdapter) Type() ChannelType { return ChannelMatrix }
@@ -55,16 +59,34 @@ func (a *matrixAdapter) Send(ctx context.Context, msg OutboundMessage) error {
 		roomID = msg.Recipient
 	}
 	if roomID == "" {
+		var err error
+		roomID, err = a.cfg.ownerRoom(ctx, a.ident)
+		if err != nil {
+			return err
+		}
+	}
+	if roomID == "" {
 		return fmt.Errorf("matrix: no room id")
 	}
-	// Resolve an identity name (not a room or @user) through the registry.
-	if !strings.HasPrefix(roomID, "!") && !strings.HasPrefix(roomID, "@") {
-		if snap, ok := a.reg.Lookup("matrix", roomID); ok {
-			roomID = snap.DefaultRecipient
+	if !strings.HasPrefix(roomID, "!") {
+		if a.ident == nil {
+			return fmt.Errorf("matrix: identity resolver unavailable")
 		}
-		if !strings.HasPrefix(roomID, "!") && !strings.HasPrefix(roomID, "@") {
-			return fmt.Errorf("matrix: unresolved recipient %q", msg.Recipient)
+		identity := a.ident.ResolveName(roomID)
+		if strings.HasPrefix(roomID, "@") {
+			identity = a.ident.Resolve(ChannelMatrix, roomID)
 		}
+		if identity == nil || !identity.Owner {
+			return fmt.Errorf("matrix: recipient is not the configured owner")
+		}
+		var err error
+		roomID, err = a.cfg.ownerRoom(ctx, a.ident)
+		if err != nil {
+			return err
+		}
+	}
+	if err := a.cfg.privateRoom(ctx, roomID, a.ident); err != nil {
+		return err
 	}
 	if err := a.sendText(ctx, roomID, msg.Text, msg.TurnID); err != nil {
 		return err
@@ -95,6 +117,19 @@ func (a *matrixAdapter) sendText(ctx context.Context, roomID, body, turnID strin
 		return err
 	}
 	if a.e2ee != nil {
+		var enc event.EncryptionEventContent
+		if err := a.e2ee.Client().StateEvent(ctx, id.RoomID(roomID), event.StateEncryption, "", &enc); err != nil {
+			if !errors.Is(err, mautrix.MNotFound) {
+				return fmt.Errorf("matrix: cannot verify room encryption: %w", err)
+			}
+			wasEncrypted, stateErr := a.e2ee.Client().StateStore.IsEncrypted(ctx, id.RoomID(roomID))
+			if stateErr != nil || wasEncrypted {
+				return fmt.Errorf("matrix: encryption state unavailable for previously encrypted room")
+			}
+		}
+		if err := a.cfg.privateRoom(ctx, roomID, a.ident); err != nil {
+			return err
+		}
 		_, err := a.e2ee.Client().SendMessageEvent(ctx, id.RoomID(roomID), event.EventMessage,
 			&event.MessageEventContent{MsgType: event.MsgText, Body: body}, mautrix.ReqSendEvent{TransactionID: txnID})
 		if err != nil {
@@ -102,7 +137,7 @@ func (a *matrixAdapter) sendText(ctx context.Context, roomID, body, turnID strin
 		}
 		return nil
 	}
-	return a.cfg.SendRoom(ctx, roomID, body, txnID)
+	return fmt.Errorf("matrix: encryption client unavailable")
 }
 
 // SendRoom delivers a plain-text message to a matrix room using the client
@@ -124,7 +159,7 @@ func (c MatrixConfig) SendRoom(ctx context.Context, roomID, body, transactionID 
 	}
 	req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
 	if err != nil {
 		return fmt.Errorf("matrix: send: %w", err)
 	}

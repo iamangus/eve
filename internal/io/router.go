@@ -85,6 +85,10 @@ func (r *Router) RegisterAdapter(a Adapter) {
 // reminders). forceChannel optionally pins the destination channel; empty
 // lets the router decide. Delivery is dispatched to the chosen adapter.
 func (r *Router) Notify(ctx context.Context, convID, content, purpose, forceChannel string) error {
+	return r.NotifyForDelivery(ctx, convID, content, purpose, forceChannel, "")
+}
+
+func (r *Router) NotifyForDelivery(ctx context.Context, convID, content, purpose, forceChannel, deliveryID string) error {
 	if !r.proactiveEnabled {
 		return ErrDisabled
 	}
@@ -99,6 +103,7 @@ func (r *Router) Notify(ctx context.Context, convID, content, purpose, forceChan
 		participants = []string{"owner"}
 	}
 	req := SendRequest{
+		TurnID:         deliveryID,
 		ConversationID: convID,
 		Content:        content,
 		Purpose:        purpose,
@@ -189,12 +194,21 @@ func (r *Router) Deliver(ctx context.Context, req SendRequest, dest EndpointSnap
 		Channel:        dest.Type,
 		Recipient:      dest.DefaultRecipient,
 		Text:           adaptContent(req.Content, dest),
-		ThreadRef:      req.OriginThread,
 		ConversationID: req.ConversationID,
 		TurnID:         req.TurnID,
 	}
-	if req.Recipient != "" {
+	if req.Origin == dest.Type {
+		msg.ThreadRef = req.OriginThread
+	}
+	if req.Recipient != "" && req.Origin == dest.Type {
 		msg.Recipient = req.Recipient
+	}
+	if req.Origin != dest.Type && dest.Type == ChannelEmail && msg.Recipient == "" {
+		var err error
+		msg.Recipient, err = r.ident.Destination(r.ident.Owner().Name, ChannelEmail)
+		if err != nil {
+			return err
+		}
 	}
 	return adapter.Send(ctx, msg)
 }
@@ -306,9 +320,6 @@ func (r *Router) askRouterAgent(ctx context.Context, req SendRequest) (EndpointS
 func adaptContent(s string, dest EndpointSnapshot) string {
 	if !dest.RichText {
 		s = stripMarkdown(s)
-	}
-	if !dest.RichText && len(s) > 4000 {
-		s = s[:4000] + "…"
 	}
 	return s
 }

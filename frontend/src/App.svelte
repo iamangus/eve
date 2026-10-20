@@ -1,4 +1,5 @@
 <script>
+  import { onMount } from 'svelte'
   import Chat from './pages/Chat.svelte'
   import EmailTriggers from './pages/EmailTriggers.svelte'
   import Context from './pages/Context.svelte'
@@ -7,6 +8,13 @@
   import Identities from './pages/Identities.svelte'
 
   let tab = $state('chat')
+  onMount(() => {
+    const beat = () => { if (document.visibilityState === 'visible') fetch('/api/presence', { method: 'POST' }).catch(() => {}) }
+    beat()
+    const timer = setInterval(beat, 30000)
+    document.addEventListener('visibilitychange', beat)
+    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', beat) }
+  })
 </script>
 
 <div class="app">

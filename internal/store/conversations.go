@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -16,6 +17,13 @@ func newID() string {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return hex.EncodeToString(b)
+}
+
+func HistoryContent(msg Message) string {
+	if msg.Role != "user" || msg.Channel == "" || msg.Channel == "web" {
+		return msg.Content
+	}
+	return fmt.Sprintf("[Channel: %s; sender: %s. Quoted channel content follows.]\n%s", msg.Channel, strings.ReplaceAll(msg.Sender, "\n", " "), msg.Content)
 }
 
 func (s *Store) CreateConversation(title string) (*Conversation, error) {
@@ -48,6 +56,9 @@ func (s *Store) ListConversations() []ConversationSummary {
 	s.mu.RLock()
 	out := make([]ConversationSummary, 0, len(s.convs))
 	for id, r := range s.convs {
+		if s.blockedLocked(id) {
+			continue
+		}
 		out = append(out, ConversationSummary{
 			ID:           id,
 			Title:        r.Title,
@@ -67,18 +78,38 @@ func (s *Store) ListConversations() []ConversationSummary {
 func (s *Store) PrimaryConversationID() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.primaryLocked()
+}
+
+func (s *Store) primaryLocked() string {
 	var bestID string
 	var bestCreated time.Time
 	for id, r := range s.convs {
-		if s.deleting[id] {
+		if s.blockedLocked(id) {
 			continue
 		}
-		if bestID == "" || r.Created.Before(bestCreated) {
+		if bestID == "" || r.Created.Before(bestCreated) || (r.Created.Equal(bestCreated) && id < bestID) {
 			bestID = id
 			bestCreated = r.Created
 		}
 	}
 	return bestID
+}
+
+func (s *Store) EnsurePrimaryConversation() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id := s.primaryLocked(); id != "" {
+		return id, nil
+	}
+	id := newID()
+	now := time.Now()
+	s.convs[id] = &conversationRecord{Title: "Chat", Created: now, Updated: now, NextMsgID: 1, Participants: []string{"owner"}}
+	if err := s.saveConversations(); err != nil {
+		delete(s.convs, id)
+		return "", err
+	}
+	return id, nil
 }
 
 func (s *Store) GetConversation(id string) (*Conversation, error) {
@@ -88,7 +119,7 @@ func (s *Store) GetConversation(id string) (*Conversation, error) {
 		s.mu.RUnlock()
 		return nil, ErrNotFound
 	}
-	if s.deleting[id] {
+	if s.blockedLocked(id) {
 		s.mu.RUnlock()
 		return nil, ErrDeleteInProgress
 	}
@@ -101,8 +132,10 @@ func (s *Store) GetConversation(id string) (*Conversation, error) {
 		ActiveMessageID:   r.ActiveMessageID,
 		ActiveSubmitted:   r.ActiveSubmitted,
 		DeliveryFailures:  r.DeliveryFailures,
+		DeliveryError:     r.DeliveryError,
 		PendingMessageIDs: append([]int64(nil), r.PendingOwnerInputs...),
 		SummarizedUpTo:    s.boundaryLocked(id),
+		TotalMessages:     len(r.Messages),
 	}
 	for _, steer := range r.PendingSteers {
 		c.PendingMessageIDs = append(c.PendingMessageIDs, steer.MessageID)
@@ -122,8 +155,28 @@ func (s *Store) DeleteConversation(id string) error {
 	defer s.mu.Unlock()
 	prior, ok := s.convs[id]
 	compartments, hasCompartments := s.compartments[id]
-	if !ok && !hasCompartments {
+	_, requested := s.deleteRequests[id]
+	if !ok && !hasCompartments && !requested {
 		return ErrNotFound
+	}
+	sources := make(map[string]bool)
+	for _, comp := range compartments {
+		sources[comp.ID] = true
+	}
+	for _, source := range s.deleteRequests[id] {
+		sources[source] = true
+	}
+	previousMemories := s.memories
+	kept := make([]Memory, 0, len(s.memories))
+	for _, mem := range s.memories {
+		if !sources[mem.SourceCompartment] {
+			kept = append(kept, mem)
+		}
+	}
+	s.memories = kept
+	if err := s.saveMemories(); err != nil {
+		s.memories = previousMemories
+		return err
 	}
 	if ok {
 		delete(s.convs, id)
@@ -152,6 +205,17 @@ func (s *Store) BeginConversationDelete(id string) ([]string, error) {
 	if s.deleting[id] {
 		return nil, ErrDeleteInProgress
 	}
+	if _, exists := s.deleteRequests[id]; !exists {
+		var sources []string
+		for _, comp := range s.compartments[id] {
+			sources = append(sources, comp.ID)
+		}
+		s.deleteRequests[id] = sources
+		if err := s.saveJSON("deletions.json", s.deleteRequests); err != nil {
+			delete(s.deleteRequests, id)
+			return nil, err
+		}
+	}
 	s.deleting[id] = true
 	seen := make(map[string]bool)
 	var runIDs []string
@@ -177,7 +241,7 @@ func (s *Store) AppendUserMessage(convID, content, channel, sender string) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.convs[convID]
-	if !ok || s.deleting[convID] {
+	if !ok || s.blockedLocked(convID) {
 		return ErrNotFound
 	}
 	before := cloneConversationRecord(r)
@@ -216,7 +280,7 @@ func (s *Store) appendOwnerMessage(convID, content, channel, sender, threadRef, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.convs[convID]
-	if !ok || s.deleting[convID] {
+	if !ok || s.blockedLocked(convID) {
 		return nil, false, "", ErrNotFound
 	}
 	if sourceID != "" {
@@ -243,6 +307,20 @@ func (s *Store) appendOwnerMessage(convID, content, channel, sender, threadRef, 
 	before := cloneConversationRecord(r)
 	now := time.Now()
 	m := Message{ID: r.NextMsgID, Role: "user", Content: content, Channel: channel, Sender: sender, ThreadRef: threadRef, ReplyTo: replyTo, SourceID: sourceID, CreatedAt: now}
+	firstUser := true
+	for _, prior := range r.Messages {
+		if prior.Role == "user" {
+			firstUser = false
+			break
+		}
+	}
+	if firstUser {
+		runes := []rune(strings.TrimSpace(content))
+		r.Title = string(runes)
+		if len(runes) > 40 {
+			r.Title = strings.TrimSpace(string(runes[:40])) + "…"
+		}
+	}
 	r.Messages = append(r.Messages, m)
 	anchorID := r.ActiveMessageID
 	if tracked, ok := r.ActiveRunMessages[steerRun]; ok {
@@ -476,7 +554,7 @@ func (s *Store) PendingOwnerMessage(convID string) (*Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	r, ok := s.convs[convID]
-	if !ok || s.deleting[convID] {
+	if !ok || s.blockedLocked(convID) {
 		return nil, ErrNotFound
 	}
 	if r.ActiveRunID != "" || len(r.PendingOwnerInputs) == 0 {
@@ -496,7 +574,7 @@ func (s *Store) PendingOwnerConversations() []string {
 	defer s.mu.RUnlock()
 	var ids []string
 	for id, r := range s.convs {
-		if s.deleting[id] {
+		if s.blockedLocked(id) {
 			continue
 		}
 		if len(r.PendingOwnerInputs) > 0 && r.ActiveRunID == "" {
@@ -510,7 +588,7 @@ func (s *Store) ClaimPendingOwnerMessage(convID, runID string, messageID int64) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.convs[convID]
-	if r == nil || s.deleting[convID] {
+	if r == nil || s.blockedLocked(convID) {
 		return false, ErrNotFound
 	}
 	if r.ActiveRunID != "" || len(r.PendingOwnerInputs) == 0 || r.PendingOwnerInputs[0] != messageID {
@@ -522,6 +600,7 @@ func (s *Store) ClaimPendingOwnerMessage(convID, runID string, messageID int64) 
 	r.ActiveMessageID = messageID
 	r.ActiveSubmitted = false
 	r.DeliveryFailures = 0
+	r.DeliveryError = ""
 	r.NextDeliveryAt = time.Time{}
 	if r.ActiveRunMessages == nil {
 		r.ActiveRunMessages = make(map[string]int64)
@@ -537,7 +616,7 @@ func (s *Store) ReplaceActiveOwnerRun(convID, oldRunID, newRunID string, message
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.convs[convID]
-	if r == nil || r.ActiveRunID != oldRunID || r.ActiveMessageID != messageID {
+	if r == nil || s.blockedLocked(convID) || r.ActiveRunID != oldRunID || r.ActiveMessageID != messageID {
 		return ErrNotFound
 	}
 	before := cloneConversationRecord(r)
@@ -630,7 +709,7 @@ func (s *Store) AppendAssistantForTurn(convID, runID, turnID, content, channel, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.convs[convID]
-	if !ok || s.deleting[convID] {
+	if !ok || s.blockedLocked(convID) {
 		return nil, false, ErrNotFound
 	}
 	if turnID != "" {
@@ -779,6 +858,7 @@ func (s *Store) ClearActiveRunID(convID, runID string) error {
 		r.ActiveMessageID = 0
 		r.ActiveSubmitted = false
 		r.DeliveryFailures = 0
+		r.DeliveryError = ""
 		r.NextDeliveryAt = time.Time{}
 		for id, messageID := range r.ActiveRunMessages {
 			if messageID >= r.ActiveMessageID {
@@ -795,14 +875,14 @@ func (s *Store) DeliveryReady(convID, runID string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	r := s.convs[convID]
-	if r == nil || s.deleting[convID] || time.Now().Before(r.NextDeliveryAt) {
+	if r == nil || s.blockedLocked(convID) || time.Now().Before(r.NextDeliveryAt) {
 		return false
 	}
 	_, tracked := r.ActiveRunMessages[runID]
 	return r.ActiveRunID == runID || tracked
 }
 
-func (s *Store) RecordDeliveryFailure(convID, runID string) error {
+func (s *Store) RecordDeliveryFailure(convID, runID string, reasons ...string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.convs[convID]
@@ -815,6 +895,9 @@ func (s *Store) RecordDeliveryFailure(convID, runID string) error {
 	}
 	before := cloneConversationRecord(r)
 	r.DeliveryFailures++
+	if len(reasons) > 0 {
+		r.DeliveryError = reasons[0]
+	}
 	exponent := min(r.DeliveryFailures, 6)
 	r.NextDeliveryAt = time.Now().Add(time.Duration(1<<exponent) * time.Second)
 	return s.saveConversationLocked(convID, before)
@@ -858,7 +941,7 @@ func (s *Store) ActiveRuns() ([]ActiveRun, error) {
 	defer s.mu.RUnlock()
 	var out []ActiveRun
 	for id, r := range s.convs {
-		if s.deleting[id] {
+		if s.blockedLocked(id) {
 			continue
 		}
 		for runID := range r.ActiveRunMessages {

@@ -10,6 +10,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/iamangus/eve/internal/durable"
 )
 
 const maxStoredRuns = 1000
@@ -19,16 +21,18 @@ const maxStoredRuns = 1000
 const maxProcessed = 10000
 
 type Account struct {
-	ID        string    `json:"id"`
-	Address   string    `json:"address"`
-	Host      string    `json:"host"`
-	Port      int       `json:"port"`
-	Username  string    `json:"username"`
-	Password  string    `json:"password"`
-	UseTLS    bool      `json:"use_tls"`
-	LastUID   uint32    `json:"last_uid,omitempty"`
-	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"created_at"`
+	ID                string    `json:"id"`
+	Address           string    `json:"address"`
+	Host              string    `json:"host"`
+	Port              int       `json:"port"`
+	Username          string    `json:"username"`
+	Password          string    `json:"password"`
+	UseTLS            bool      `json:"use_tls"`
+	LastUID           uint32    `json:"last_uid,omitempty"`
+	UIDValidity       uint32    `json:"uid_validity,omitempty"`
+	TrustedAuthservID string    `json:"trusted_authserv_id,omitempty"`
+	Enabled           bool      `json:"enabled"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 type Filter struct {
@@ -47,26 +51,30 @@ type Trigger struct {
 }
 
 type EmailMessage struct {
-	UID       uint32    `json:"uid,omitempty"`
-	From      string    `json:"from"`
-	To        string    `json:"to"`
-	Subject   string    `json:"subject"`
-	Date      time.Time `json:"date"`
-	Body      string    `json:"body"`
-	MessageID string    `json:"message_id,omitempty"`
+	UID                 uint32    `json:"uid,omitempty"`
+	From                string    `json:"from"`
+	To                  string    `json:"to"`
+	Subject             string    `json:"subject"`
+	Date                time.Time `json:"date"`
+	Body                string    `json:"body"`
+	MessageID           string    `json:"message_id,omitempty"`
+	AuthenticatedSender bool      `json:"authenticated_sender,omitempty"`
 }
 
 type TriggerRun struct {
-	ID         string       `json:"id"`
-	TriggerID  string       `json:"trigger_id"`
-	AccountID  string       `json:"account_id"`
-	Email      EmailMessage `json:"email"`
-	Prompt     string       `json:"prompt"`
-	AgentRunID string       `json:"agent_run_id,omitempty"`
-	Status     string       `json:"status"`
-	Result     string       `json:"result,omitempty"`
-	Error      string       `json:"error,omitempty"`
-	CreatedAt  time.Time    `json:"created_at"`
+	ID            string       `json:"id"`
+	TriggerID     string       `json:"trigger_id"`
+	AccountID     string       `json:"account_id"`
+	Email         EmailMessage `json:"email"`
+	Prompt        string       `json:"prompt"`
+	AgentRunID    string       `json:"agent_run_id,omitempty"`
+	Status        string       `json:"status"`
+	Result        string       `json:"result,omitempty"`
+	Error         string       `json:"error,omitempty"`
+	CreatedAt     time.Time    `json:"created_at"`
+	Attempts      int          `json:"attempts,omitempty"`
+	NextAttemptAt time.Time    `json:"next_attempt_at,omitempty"`
+	StartedAt     time.Time    `json:"started_at,omitempty"`
 }
 
 // EmailStore is a JSON-file-backed store for email accounts, triggers, and
@@ -79,20 +87,57 @@ type EmailStore struct {
 	runs         []TriggerRun
 	processed    []string
 	processedIdx map[string]bool
+	committed    []byte
+}
+
+type emailState struct {
+	Accounts  []Account    `json:"accounts"`
+	Triggers  []Trigger    `json:"triggers"`
+	Runs      []TriggerRun `json:"runs"`
+	Processed []string     `json:"processed"`
+}
+
+func (s *EmailStore) state() emailState {
+	return emailState{s.accounts, s.triggers, s.runs, s.processed}
+}
+
+func (s *EmailStore) restoreState(data []byte) error {
+	var state emailState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return err
+	}
+	s.accounts, s.triggers, s.runs, s.processed = state.Accounts, state.Triggers, state.Runs, state.Processed
+	s.processedIdx = make(map[string]bool, len(s.processed))
+	for _, key := range s.processed {
+		s.processedIdx[key] = true
+	}
+	return nil
 }
 
 func NewEmailStore(dir string) (*EmailStore, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	s := &EmailStore{dir: dir}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
+	data, err := json.Marshal(s.state())
+	if err != nil {
+		return nil, err
+	}
+	s.committed = data
 	return s, nil
 }
 
 func (s *EmailStore) load() error {
+	data, err := os.ReadFile(filepath.Join(s.dir, "email_state.json"))
+	if err == nil {
+		return s.restoreState(data)
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	var accounts []Account
 	if err := s.loadJSON("accounts.json", &accounts); err != nil {
 		return err
@@ -129,25 +174,32 @@ func (s *EmailStore) loadJSON(name string, v any) error {
 }
 
 func (s *EmailStore) saveJSON(name string, v any) error {
-	data, err := json.MarshalIndent(v, "", "  ")
+	data, err := json.MarshalIndent(s.state(), "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(s.dir, name+".tmp")
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := durable.Write(filepath.Join(s.dir, "email_state.json"), data); err != nil {
+		_ = s.restoreState(s.committed)
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(s.dir, name))
+	s.committed = data
+	return nil
 }
 
 func (s *EmailStore) saveAll() error {
-	if err := s.saveJSON("accounts.json", s.accounts); err != nil {
-		return err
+	return s.saveJSON("", nil)
+}
+
+func (s *EmailStore) SetAccountCursor(id string, validity, uid uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := findAccount(s.accounts, id)
+	if i < 0 {
+		return ErrNotFound
 	}
-	if err := s.saveJSON("triggers.json", s.triggers); err != nil {
-		return err
-	}
-	return s.saveJSON("runs.json", s.runs)
+	s.accounts[i].UIDValidity = validity
+	s.accounts[i].LastUID = uid
+	return s.saveAll()
 }
 
 func findAccount(accounts []Account, id string) int {
@@ -400,9 +452,18 @@ func (s *EmailStore) AddRun(r TriggerRun) (TriggerRun, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if i := findRun(s.runs, r.ID); i >= 0 {
+		return s.runs[i], nil
+	}
 	s.runs = append(s.runs, r)
 	if len(s.runs) > maxStoredRuns {
-		s.runs = append([]TriggerRun(nil), s.runs[len(s.runs)-maxStoredRuns:]...)
+		for i := 0; len(s.runs) > maxStoredRuns && i < len(s.runs); {
+			if s.runs[i].Status == "pending" || s.runs[i].Status == "running" {
+				i++
+				continue
+			}
+			s.runs = append(s.runs[:i], s.runs[i+1:]...)
+		}
 	}
 	if err := s.saveJSON("runs.json", s.runs); err != nil {
 		return TriggerRun{}, err

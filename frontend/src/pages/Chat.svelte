@@ -3,6 +3,7 @@
   import { api } from '../lib/api.js'
   import { marked } from 'marked'
   import DOMPurify from 'dompurify'
+  import { HUB_EVENT, parseHubEvent } from '../lib/events.js'
 
   marked.setOptions({ gfm: true, breaks: true })
 
@@ -22,13 +23,22 @@
   let heartbeatTimer = null
   let tasksTimer = null
   let queueTimer = null
+  let reconnectTimer = null
+  let destroyed = false
+  let generation = 0
+  let markdownFrame = null
+  let taskActions = $state({})
   let pendingMessageID = null
   let retryMessage = null
   let tasks = $state([])
   let taskReplies = $state({})
   let tasksOpen = $state(false)
+  let hasOlder = $state(false)
+  let loadingOlder = $state(false)
+  let loadingConversation = $state(false)
 
   onMount(() => {
+    destroyed = false
     loadPrimary()
     openGlobalEvents()
     startHeartbeat()
@@ -36,6 +46,10 @@
     tasksTimer = setInterval(loadTasks, 5000)
     window.addEventListener('popstate', handlePopState)
     return () => {
+      destroyed = true
+      generation++
+      clearTimeout(reconnectTimer)
+      if (markdownFrame !== null) cancelAnimationFrame(markdownFrame)
       eventSource?.close()
       eventSource = null
       globalEvents?.close()
@@ -52,17 +66,17 @@
   // openGlobalEvents subscribes to the IO hub: proactive messages Eve sends
   // outside a turn (via send_message) arrive here and are appended live.
   function openGlobalEvents() {
+    if (destroyed) return
     const es = new EventSource('/api/events')
     globalEvents = es
-    es.addEventListener('message', (e) => {
-      let ev
-      try {
-        ev = JSON.parse(e.data)
-      } catch {
-        return
-      }
-      if (ev.type !== 'message' || !ev.conv_id || !currentConv) return
-      if (ev.conv_id !== currentConv.id) return
+    es.onopen = () => syncConversation()
+    es.addEventListener(HUB_EVENT, (e) => {
+      if (destroyed || globalEvents !== es) return
+      const ev = parseHubEvent(e.data)
+      if (!ev) return
+      if (ev.type === 'resync') { syncConversation(); return }
+      if (ev.type !== 'message' || !ev.conversation_id || !currentConv) return
+      if (ev.conversation_id !== currentConv.id) return
       const msg = ev.data
       if (!msg || !msg.id) return
       if (messages.some((m) => m.id === msg.id)) return
@@ -77,15 +91,25 @@
     es.onerror = () => {
       es.close()
       globalEvents = null
-      setTimeout(openGlobalEvents, 3000)
+      if (!destroyed) reconnectTimer = setTimeout(openGlobalEvents, 3000)
     }
   }
 
-  // startHeartbeat marks the web channel present so the router knows the user
-  // is at the computer when deciding where to deliver proactive messages.
+  async function syncConversation() {
+    const id = currentConv?.id
+    const requestGeneration = generation
+    if (!id) return
+    try {
+      const full = await api.get('/api/conversations/' + id)
+      if (destroyed || currentConv?.id !== id || requestGeneration !== generation) return
+      mergeServerMessages(full)
+      currentConv = full
+      updateDeliveryNotice(full)
+    } catch (e) { if (!destroyed) notice = e.message }
+  }
+
   function startHeartbeat() {
     const beat = () => {
-      fetch('/api/presence', { method: 'POST' }).catch(() => {})
       if (currentConv?.active_run_id) refreshConversationMeta()
     }
     beat()
@@ -103,16 +127,24 @@
   }
 
   async function replyToTask(id) {
+    if (taskActions[id]) return
     const content = (taskReplies[id] || '').trim()
     if (!content) return
-    await api.post('/api/tasks/' + id + '/reply', { content })
-    taskReplies[id] = ''
-    loadTasks()
+    taskActions[id] = true
+    try {
+      await api.post('/api/tasks/' + id + '/reply', { content })
+      taskReplies[id] = ''
+      loadTasks()
+    } catch (e) { notice = e.message } finally { taskActions[id] = false }
   }
 
   async function cancelTask(id) {
-    await api.post('/api/tasks/' + id + '/cancel', {})
-    loadTasks()
+    if (taskActions[id]) return
+    taskActions[id] = true
+    try {
+      await api.post('/api/tasks/' + id + '/cancel', {})
+      loadTasks()
+    } catch (e) { notice = e.message } finally { taskActions[id] = false }
   }
 
   function sanitize(html) {
@@ -133,16 +165,15 @@
       if (convId) {
         conv = convs.find(s => s.id === convId)
       }
-      if (!conv && convs.length > 0) {
-        conv = convs[0]
-      }
+      if (!conv) conv = await api.get('/api/conversations/primary')
       if (!conv) {
-        conv = await api.post('/api/conversations', {})
+        conv = await api.post('/api/conversations', { primary: true })
         pushUrl('/?conv=' + conv.id)
       }
       await selectConversation(conv)
     } catch (e) {
       console.error('Failed to load conversation', e)
+      notice = e.message
     } finally {
       loading = false
     }
@@ -156,24 +187,24 @@
   }
 
   async function selectConversationById(id) {
+    const requestGeneration = ++generation
+    loadingConversation = true
     try {
       const full = await api.get('/api/conversations/' + id)
+      if (destroyed || requestGeneration !== generation) return
       applyConversation(full)
     } catch (e) {
       console.error('Failed to load conversation', e)
-    }
+      if (!destroyed && requestGeneration === generation) notice = e.message
+    } finally { if (requestGeneration === generation) loadingConversation = false }
   }
 
   async function selectConversation(conv) {
-    try {
-      const full = await api.get('/api/conversations/' + conv.id)
-      applyConversation(full)
-    } catch (e) {
-      console.error('Failed to load conversation', e)
-    }
+    return selectConversationById(conv.id)
   }
 
   function applyConversation(full) {
+    const sameConversation = currentConv?.id === full.id
     if (currentConv?.id && currentConv.id !== full.id) {
       if (queueTimer) clearInterval(queueTimer)
       queueTimer = null
@@ -181,11 +212,15 @@
       sending = false
       eventSource?.close()
       eventSource = null
+      newMessage = ''
+      retryMessage = null
+      notice = ''
     }
     currentConv = full
-    messages = full.messages || []
+    if (sameConversation) mergeServerMessages(full)
+    else { messages = full.messages || []; hasOlder = !!full.has_more }
     pushUrl('/?conv=' + full.id)
-    requestAnimationFrame(() => scrollDown())
+    requestAnimationFrame(() => scrollDown(!sameConversation))
     if (full.active_run_id && full.active_submitted) {
       startStream(full.active_run_id)
     }
@@ -203,9 +238,37 @@
     updateDeliveryNotice(full)
   }
 
+  function mergeServerMessages(full) {
+    const durable = full.messages || []
+    const firstID = durable[0]?.id
+    const older = firstID ? messages.filter(m => m.id && m.id < firstID) : []
+    const optimistic = messages.filter(m => !m.id && m.source_id && !durable.some(d => d.source_id === m.source_id))
+    messages = [...older, ...durable, ...optimistic]
+    if (!older.length) hasOlder = !!full.has_more
+  }
+
+  async function loadOlder() {
+    const convID = currentConv?.id
+    const first = messages.find(m => m.id)
+    if (!convID || !first || loadingOlder) return
+    loadingOlder = true
+    const previousHeight = messageListEl?.scrollHeight || 0
+    const previousTop = messageListEl?.scrollTop || 0
+    try {
+      const page = await api.get('/api/conversations/' + convID + '?before_id=' + first.id)
+      if (destroyed || currentConv?.id !== convID) return
+      const known = new Set(messages.filter(m => m.id).map(m => m.id))
+      messages = [...(page.messages || []).filter(m => !known.has(m.id)), ...messages]
+      hasOlder = !!page.has_more
+      requestAnimationFrame(() => { if (messageListEl) messageListEl.scrollTop = previousTop + messageListEl.scrollHeight - previousHeight })
+    } catch (e) { notice = e.message } finally { loadingOlder = false }
+  }
+
   async function sendMessage() {
-    if (posting || !newMessage.trim() || !currentConv) return
+    if (posting || loadingConversation || !newMessage.trim() || !currentConv) return
+    const sendGeneration = ++generation
     const content = newMessage
+    const convID = currentConv.id
     const clientID = retryMessage?.content === content ? retryMessage.id : (globalThis.crypto?.randomUUID?.() || String(Date.now()) + '-' + Math.random())
     retryMessage = null
     newMessage = ''
@@ -221,7 +284,9 @@
     requestAnimationFrame(() => scrollDown())
 
     try {
-      const result = await api.post('/api/conversations/' + currentConv.id + '/messages', { content, client_id: clientID })
+      const result = await api.post('/api/conversations/' + convID + '/messages', { content, client_id: clientID })
+      if (destroyed || currentConv?.id !== convID || sendGeneration !== generation) return
+      generation++
       messages = messages.map(m => m.source_id === clientID ? { ...m, id: result.message_id } : m)
       if (result.queued) {
         pendingMessageID = result.message_id
@@ -235,6 +300,7 @@
       }
     } catch (e) {
       console.error('Failed to send message', e)
+      if (destroyed || currentConv?.id !== convID || sendGeneration !== generation) return
       retryMessage = { content, id: clientID }
       newMessage = content
       notice = 'Could not confirm delivery. Retry to check the same message.'
@@ -249,6 +315,7 @@
     const check = async () => {
       try {
         const conv = await api.get('/api/conversations/' + convID)
+        if (destroyed || currentConv?.id !== convID) return
         if ((conv.steered_message_ids || []).includes(messageID)) {
           clearInterval(queueTimer)
           queueTimer = null
@@ -286,6 +353,8 @@
   }
 
   function startStream(runId) {
+    if (destroyed || !runId) return
+    if (markdownFrame !== null) { cancelAnimationFrame(markdownFrame); markdownFrame = null }
     eventSource?.close()
     eventSource = null
     stream = { runId, status: 'Thinking', raw: '', html: '' }
@@ -294,23 +363,31 @@
     eventSource = es
 
     es.addEventListener('token', (e) => {
+      if (eventSource !== es || destroyed) return
       stream.status = ''
       stream.raw += e.data
-      stream.html = renderMarkdown(stream.raw)
-      scrollDown()
+      if (markdownFrame === null) markdownFrame = requestAnimationFrame(() => {
+        markdownFrame = null
+        if (eventSource !== es || destroyed) return
+        stream.html = renderMarkdown(stream.raw)
+        scrollDown()
+      })
     })
 
     es.addEventListener('reset', () => {
+      if (eventSource !== es || destroyed) return
       stream.raw = ''
       stream.html = ''
       stream.status = 'Revising answer'
     })
 
     es.addEventListener('status', (e) => {
+      if (eventSource !== es || destroyed) return
       stream.status = e.data
     })
 
     es.addEventListener('done', (e) => {
+      if (eventSource !== es || destroyed) return
       es.close()
       eventSource = null
       if (e.data) {
@@ -320,10 +397,11 @@
       if (notice && !notice.startsWith('Reply delivery is retrying.')) notice = ''
       sending = pendingMessageID !== null
       scrollDown()
-      refreshConversationMeta()
+      healConversation()
     })
 
     es.addEventListener('error', (e) => {
+      if (eventSource !== es || destroyed) return
       if (!e.data) return
       es.close()
       eventSource = null
@@ -331,10 +409,11 @@
       messages = [...messages, { role: 'assistant', content: e.data }]
       scrollDown()
       sending = pendingMessageID !== null
-      refreshConversationMeta()
+      healConversation()
     })
 
     es.onerror = () => {
+      if (eventSource !== es || destroyed) return
       if (es.readyState === EventSource.CLOSED) return
       es.close()
       eventSource = null
@@ -352,8 +431,9 @@
   async function healConversation() {
     const convId = currentConv?.id
     if (!convId) return
-    const deadline = Date.now() + 20000
-    while (Date.now() < deadline) {
+    const requestGeneration = generation
+    const deadline = Date.now() + 120000
+    while (!destroyed && currentConv?.id === convId && requestGeneration === generation && Date.now() < deadline) {
       await sleep(500)
       let full
       try {
@@ -361,17 +441,21 @@
       } catch {
         continue
       }
+      if (destroyed || currentConv?.id !== convId || requestGeneration !== generation) return
       currentConv = full
       updateDeliveryNotice(full)
       if (full.delivery_failures) return
       if (full.active_run_id) continue
       if (full.messages && full.messages.length > 0) {
-        messages = full.messages
+        mergeServerMessages(full)
         requestAnimationFrame(() => scrollDown())
       }
       return
     }
-    notice = 'The connection to the agent was lost. The response may still be processing — try refreshing.'
+    if (!destroyed && currentConv?.id === convId) {
+      notice = 'Reconnecting to the current turn…'
+      if (currentConv.active_run_id) startStream(currentConv.active_run_id)
+    }
   }
 
   function sleep(ms) {
@@ -380,16 +464,20 @@
 
   async function refreshConversationMeta() {
     if (!currentConv) return
+    const convID = currentConv.id
+    const requestGeneration = generation
     try {
-      const full = await api.get('/api/conversations/' + currentConv.id)
+      const full = await api.get('/api/conversations/' + convID)
+      if (destroyed || currentConv?.id !== convID || requestGeneration !== generation) return
       currentConv = full
+      if (!full.active_run_id && !posting && pendingMessageID === null) mergeServerMessages(full)
       updateDeliveryNotice(full)
     } catch {}
   }
 
   function updateDeliveryNotice(full) {
     if (full.delivery_failures > 0) {
-      notice = 'Reply delivery is retrying. Queued turns will wait until the channel recovers.'
+      notice = 'Reply delivery is retrying. ' + (full.delivery_error || 'Queued turns will wait until the channel recovers.')
     } else if (notice.startsWith('Reply delivery is retrying.')) {
       notice = ''
     }
@@ -423,8 +511,9 @@
     return new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   }
 
-  function scrollDown() {
+  function scrollDown(force = false) {
     if (!messageListEl) return
+    if (!force && messageListEl.scrollHeight - messageListEl.scrollTop - messageListEl.clientHeight > 180) return
     messageListEl.scrollTop = messageListEl.scrollHeight
   }
 
@@ -456,7 +545,8 @@
           <span class="chat-kicker">CONVERSATION</span>
           <span class="chat-head-name">{currentConv.title}</span>
         </div>
-        <span class="chat-head-badge">{messages.length} {messages.length === 1 ? 'message' : 'messages'}</span>
+        <a class="chat-head-badge" href={'/api/conversations/' + currentConv.id + '/export'} download>Export</a>
+        <span class="chat-head-badge">{Math.max(messages.length, currentConv.total_messages || 0)} messages</span>
         {#if summarizedBoundary() > 0}
           <span class="chat-head-badge summary-badge">summarized</span>
         {/if}
@@ -474,14 +564,14 @@
               <div class="task-line">
                 <span class="task-status task-{t.status}">{t.status.replaceAll('_', ' ')}</span>
                 <span class="task-name">{t.agent_name}</span>
-                <button class="task-x" onclick={() => cancelTask(t.id)}>Cancel task</button>
+                <button class="task-x" disabled={taskActions[t.id]} onclick={() => cancelTask(t.id)}>Cancel task</button>
               </div>
               <div class="task-msg">{t.message}</div>
               {#if t.status === 'needs_input' && t.question}
                 <div class="task-q">→ {t.question}</div>
                 <div class="task-reply">
-                  <input bind:value={taskReplies[t.id]} placeholder="Reply…" onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); replyToTask(t.id) } }} />
-                  <button onclick={() => replyToTask(t.id)}>Reply</button>
+                  <input bind:value={taskReplies[t.id]} aria-label="Reply to background task" placeholder="Reply…" onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); replyToTask(t.id) } }} />
+                  <button disabled={taskActions[t.id]} onclick={() => replyToTask(t.id)}>Reply</button>
                 </div>
               {/if}
             </div>
@@ -490,7 +580,8 @@
       {/if}
 
       <div class="chat-body" bind:this={messageListEl}>
-        {#each messages as msg, i (msg.id ?? i)}
+        {#if hasOlder}<button onclick={loadOlder} disabled={loadingOlder}>{loadingOlder ? 'Loading…' : 'Load earlier messages'}</button>{/if}
+        {#each messages as msg, i (msg.id != null ? 'id-' + msg.id : msg.source_id ? 'source-' + msg.source_id : 'pending-' + i)}
           {#if i > 0 && gapBetween(messages[i - 1], msg)}
             <div class="time-gap">{gapBetween(messages[i - 1], msg)}</div>
           {/if}
@@ -499,7 +590,7 @@
           {/if}
           <div class="msg-row" class:msg-right={msg.role === 'user'} class:msg-left={msg.role !== 'user'}>
             <div class="msg-meta">
-              <span>{msg.role === 'user' ? 'YOU' : 'EVE'}</span>
+              <span>{msg.role === 'user' ? (msg.sender && msg.sender !== 'owner' ? msg.sender : 'YOU') : 'EVE'}</span>
               {#if msg.created_at}<time datetime={msg.created_at}>{messageTime(msg.created_at)}</time>{/if}
               {#if msg.channel && msg.channel !== 'web'}<span>{channelLabel(msg.channel)}</span>{/if}
             </div>
@@ -536,7 +627,7 @@
 
       <div class="chat-foot">
         {#if notice}
-          <div class="chat-notice">{notice}</div>
+          <div class="chat-notice" role="status">{notice}</div>
         {/if}
         <div class="input-wrap">
           <textarea
@@ -545,9 +636,10 @@
             onkeydown={handleKeydown}
             rows="1"
             placeholder={stream.runId ? 'Interrupt with a follow-up…' : 'Write a message to Eve'}
+            aria-label="Message to Eve"
             oninput={(e) => { e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px'; }}
           ></textarea>
-          <button onclick={sendMessage} class="send-btn" aria-label="Send message" disabled={posting || !currentConv}>
+          <button onclick={sendMessage} class="send-btn" aria-label="Send message" disabled={posting || loadingConversation || !currentConv}>
             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" d="M6 12 3.269 3.125A59.769 59.769 0 0 1 21.485 12 59.768 59.768 0 0 1 3.27 20.875L5.999 12Zm0 0h7.5" />
             </svg>
@@ -603,6 +695,7 @@
     padding: 14px var(--page-pad) 18px; border-top: var(--rule); background: var(--bg-deep); flex-shrink: 0;
   }
   .chat-notice {
+    overflow-wrap: anywhere;
     max-width: calc(var(--measure) + 92px); font: 0.72rem var(--mono); color: var(--text-base);
     border-left: 2px solid var(--text-base); padding: 6px 12px; margin-bottom: 10px;
   }

@@ -1,6 +1,7 @@
 package context
 
 import (
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -152,7 +153,9 @@ func (m *Manager) curate() {
 	}
 
 	if len(kept) != len(mems) {
-		_ = m.store.ReplaceMemories(kept)
+		if err := m.store.CurateMemories(mems, kept); err != nil {
+			slog.Warn("curate memories", "error", err)
+		}
 	}
 }
 

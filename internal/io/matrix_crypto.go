@@ -9,8 +9,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/iamangus/eve/internal/durable"
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix"
@@ -27,10 +31,12 @@ import (
 // implementation; the store is a plain JSON file under DATA_DIR, so no
 // database is required.
 type MatrixE2EE struct {
-	client *mautrix.Client
-	mach   *crypto.OlmMachine
-	store  *jsonCryptoStore
-	log    zerolog.Logger
+	client         *mautrix.Client
+	mach           *crypto.OlmMachine
+	store          *jsonCryptoStore
+	log            zerolog.Logger
+	privateMembers func(context.Context, id.RoomID) ([]id.UserID, error)
+	encryptMu      sync.Mutex
 }
 
 // matrixDBName is the JSON file (relative to DataDir) holding all crypto
@@ -48,6 +54,9 @@ func NewMatrixE2EE(ctx context.Context, cfg MatrixConfig, dataDir string, pickle
 	if err != nil {
 		return nil, fmt.Errorf("matrix: client: %w", err)
 	}
+	httpClient := *client.Client
+	httpClient.Timeout = 60 * time.Second
+	client.Client = &httpClient
 
 	// The compatibility token is bound to a specific device. Ask the server
 	// which one it is so device keys and to-device messages route correctly.
@@ -128,6 +137,8 @@ const crossSigningRetryInterval = 5 * time.Second
 // when approval is pending. On success the bot's device is cross-signed by the
 // new self-signing key and Element no longer flags its messages.
 func (e *MatrixE2EE) EnsureCrossSigningSetup(ctx context.Context, surfaceURL func(string)) error {
+	ctx, cancel := context.WithTimeout(ctx, crossSigningSetupTimeout)
+	defer cancel()
 	hasKeys, verified, err := e.mach.GetOwnVerificationStatus(ctx)
 	if err != nil {
 		return fmt.Errorf("matrix: check cross-signing status: %w", err)
@@ -229,19 +240,58 @@ var _ mautrix.CryptoHelper = (*matrixCryptoHelper)(nil)
 func (h *matrixCryptoHelper) Init(ctx context.Context) error { return nil }
 
 func (h *matrixCryptoHelper) Encrypt(ctx context.Context, roomID id.RoomID, evtType event.Type, content any) (*event.EncryptedEventContent, error) {
+	h.e2ee.encryptMu.Lock()
+	defer h.e2ee.encryptMu.Unlock()
+	if h.e2ee.privateMembers == nil {
+		return nil, fmt.Errorf("matrix: private room policy is not configured")
+	}
+	users, err := h.e2ee.privateMembers(ctx, roomID)
+	if err != nil {
+		return nil, err
+	}
 	mach := h.e2ee.Mach()
+	allowed := make(map[id.UserID]bool, len(users))
+	for _, user := range users {
+		allowed[user] = true
+	}
+	if session, err := h.e2ee.store.ms.GetOutboundGroupSession(ctx, roomID); err != nil {
+		return nil, err
+	} else if session != nil {
+		rotate := session.Shared && len(session.Users) == 0
+		for device := range session.Users {
+			if !allowed[device.UserID] {
+				rotate = true
+			}
+		}
+		if rotate {
+			if err := h.e2ee.store.ms.RemoveOutboundGroupSession(ctx, roomID); err != nil {
+				return nil, err
+			}
+		}
+	}
 	encrypted, err := mach.EncryptMegolmEventWithStateKey(ctx, roomID, evtType, nil, content)
 	if errors.Is(err, crypto.ErrNoGroupSession) || errors.Is(err, crypto.ErrSessionExpired) || errors.Is(err, crypto.ErrSessionNotShared) {
-		users, uerr := h.e2ee.Client().StateStore.GetRoomJoinedOrInvitedMembers(ctx, roomID)
-		if uerr != nil {
-			return nil, fmt.Errorf("matrix: get members for session: %w", uerr)
-		}
 		if serr := mach.ShareGroupSession(ctx, roomID, users); serr != nil {
 			return nil, fmt.Errorf("matrix: share group session: %w", serr)
 		}
 		encrypted, err = mach.EncryptMegolmEventWithStateKey(ctx, roomID, evtType, nil, content)
 	}
 	if err != nil {
+		return nil, err
+	}
+	fresh, err := h.e2ee.privateMembers(ctx, roomID)
+	if err != nil {
+		return nil, err
+	}
+	if len(fresh) != len(users) {
+		return nil, ErrMatrixNotPrivate
+	}
+	for i := range users {
+		if users[i] != fresh[i] {
+			return nil, ErrMatrixNotPrivate
+		}
+	}
+	if err := h.e2ee.store.ms.Flush(ctx); err != nil {
 		return nil, err
 	}
 	return encrypted, nil
@@ -287,9 +337,11 @@ type jsonCryptoStore struct {
 	path      string
 	pickleKey []byte
 
-	filterID   string
-	nextBatch  string
-	stateStore *mautrix.MemoryStateStore
+	filterID       string
+	nextBatch      string
+	committedBatch string
+	stateStore     *mautrix.MemoryStateStore
+	restoring      bool
 
 	// snapshotMu guards the on-disk files against concurrent writers. The
 	// main snapshot is written only from the save callback (which runs under
@@ -304,7 +356,7 @@ type jsonStoreMeta struct {
 }
 
 func openJSONCryptoStore(path string, pickleKey []byte) (*jsonCryptoStore, error) {
-	s := &jsonCryptoStore{path: path, pickleKey: pickleKey, stateStore: mautrix.NewMemoryStateStore().(*mautrix.MemoryStateStore)}
+	s := &jsonCryptoStore{path: path, pickleKey: pickleKey, stateStore: mautrix.NewMemoryStateStore().(*mautrix.MemoryStateStore), restoring: true}
 	s.ms = crypto.NewMemoryStore(func() error { return s.persist() })
 
 	if data, err := os.ReadFile(path); err == nil {
@@ -312,20 +364,28 @@ func openJSONCryptoStore(path string, pickleKey []byte) (*jsonCryptoStore, error
 		if err := json.Unmarshal(data, &snap); err != nil {
 			return nil, fmt.Errorf("matrix: parse crypto store %s: %w", path, err)
 		}
+		if snap.Account.Pickled == "" {
+			return nil, fmt.Errorf("matrix: existing crypto store has no account; refusing identity reset")
+		}
 		if err := s.restore(&snap); err != nil {
 			return nil, fmt.Errorf("matrix: restore crypto store: %w", err)
 		}
 		if meta, mErr := os.ReadFile(path + ".meta"); mErr == nil {
 			var m jsonStoreMeta
-			if jErr := json.Unmarshal(meta, &m); jErr == nil {
-				s.filterID = m.FilterID
-				s.nextBatch = m.NextBatch
+			if jErr := json.Unmarshal(meta, &m); jErr != nil {
+				return nil, fmt.Errorf("matrix: invalid sync metadata: %w", jErr)
 			}
+			s.filterID = m.FilterID
+			s.nextBatch = m.NextBatch
+			s.committedBatch = m.NextBatch
+		} else if !os.IsNotExist(mErr) {
+			return nil, mErr
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("matrix: read crypto store %s: %w", path, err)
 	}
 
+	s.restoring = false
 	if s.ms.Account == nil {
 		s.ms.Account = crypto.NewOlmAccount()
 		s.ms.Account.Shared = false
@@ -341,43 +401,33 @@ func openJSONCryptoStore(path string, pickleKey []byte) (*jsonCryptoStore, error
 // it). It must not be called from the sync-goroutine SyncStore methods, which
 // read no maps; those use persistMeta instead.
 func (s *jsonCryptoStore) persist() error {
+	if s.restoring {
+		return nil
+	}
 	s.snapshotMu.Lock()
 	defer s.snapshotMu.Unlock()
 
-	snap := s.snapshot()
+	snap, err := s.snapshot()
+	if err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return fmt.Errorf("matrix: encode crypto store: %w", err)
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("matrix: write crypto store tmp: %w", err)
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		return fmt.Errorf("matrix: rename crypto store: %w", err)
-	}
-	return nil
+	return durable.Write(s.path, data)
 }
 
 // persistMeta writes the filter ID / sync token sidecar without touching any
 // of the crypto maps, so it is safe to call from the sync goroutine even
 // while a send goroutine mutates the store.
 func (s *jsonCryptoStore) persistMeta() error {
-	s.snapshotMu.Lock()
-	defer s.snapshotMu.Unlock()
 
-	data, err := json.Marshal(jsonStoreMeta{FilterID: s.filterID, NextBatch: s.nextBatch})
+	data, err := json.Marshal(jsonStoreMeta{FilterID: s.filterID, NextBatch: s.committedBatch})
 	if err != nil {
 		return fmt.Errorf("matrix: encode crypto meta: %w", err)
 	}
-	tmp := s.path + ".meta.tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("matrix: write crypto meta tmp: %w", err)
-	}
-	if err := os.Rename(tmp, s.path+".meta"); err != nil {
-		return fmt.Errorf("matrix: rename crypto meta: %w", err)
-	}
-	return nil
+	return durable.Write(s.path+".meta", data)
 }
 
 // Flush is a no-op: every mutation already persists via the MemoryStore save
@@ -392,51 +442,64 @@ func (s *jsonCryptoStore) Flush(ctx context.Context) error {
 // client's Store. The values are persisted in a sidecar meta file.
 
 func (s *jsonCryptoStore) SaveFilterID(ctx context.Context, userID id.UserID, filterID string) error {
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
 	s.filterID = filterID
 	return s.persistMeta()
 }
 
 func (s *jsonCryptoStore) LoadFilterID(ctx context.Context, userID id.UserID) (string, error) {
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
 	return s.filterID, nil
 }
 
 func (s *jsonCryptoStore) SaveNextBatch(ctx context.Context, userID id.UserID, nextBatchToken string) error {
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
 	s.nextBatch = nextBatchToken
-	return s.persistMeta()
+	return nil
 }
 
 func (s *jsonCryptoStore) LoadNextBatch(ctx context.Context, userID id.UserID) (string, error) {
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
 	return s.nextBatch, nil
 }
 
 // snapshot converts the in-memory store into a serializable snapshot. Called
 // with the MemoryStore lock held (from the save callback) or from persist
 // under snapshotMu.
-func (s *jsonCryptoStore) snapshot() jsonStoreSnapshot {
+func (s *jsonCryptoStore) snapshot() (jsonStoreSnapshot, error) {
 	ms := s.ms
 	snap := jsonStoreSnapshot{
-		Account:              pickledAccount{},
-		Sessions:             map[string][]pickledSession{},
-		GroupSessions:        map[string]map[string]*pickledIGS{},
+		Account:               pickledAccount{},
+		Sessions:              map[string][]pickledSession{},
+		GroupSessions:         map[string]map[string]*pickledIGS{},
 		WithheldGroupSessions: map[string]map[string]*event.RoomKeyWithheldEventContent{},
-		OutGroupSessions:     map[string]*pickledOGS{},
-		SharedGroupSessions:  map[string]map[string][]id.SessionID{},
-		MessageIndices:       map[string]jsonMessageIndexValue{},
-		Devices:              map[string]map[string]*id.Device{},
-		CrossSigningKeys:     map[string]map[string]id.CrossSigningKey{},
-		KeySignatures:        map[string]map[string]map[string]map[string]string{},
-		OutdatedUsers:        []id.UserID{},
-		Secrets:              map[string]string{},
-		OlmHashes:            [][32]byte{},
+		OutGroupSessions:      map[string]*pickledOGS{},
+		SharedGroupSessions:   map[string]map[string][]id.SessionID{},
+		MessageIndices:        map[string]jsonMessageIndexValue{},
+		Devices:               map[string]map[string]*id.Device{},
+		CrossSigningKeys:      map[string]map[string]id.CrossSigningKey{},
+		KeySignatures:         map[string]map[string]map[string]map[string]string{},
+		OutdatedUsers:         []id.UserID{},
+		Secrets:               map[string]string{},
+		OlmHashes:             [][32]byte{},
 	}
 
-	if state, err := json.Marshal(s.stateStore); err == nil {
-		snap.State = state
+	state, err := json.Marshal(s.stateStore)
+	if err != nil {
+		return snap, err
 	}
+	snap.State = state
 
 	if ms.Account != nil {
 		acc := ms.Account
 		pickled, err := acc.Internal.Pickle(s.pickleKey)
+		if err != nil {
+			return snap, err
+		}
 		if err == nil {
 			snap.Account = pickledAccount{
 				Pickled:          base64.StdEncoding.EncodeToString(pickled),
@@ -451,13 +514,14 @@ func (s *jsonCryptoStore) snapshot() jsonStoreSnapshot {
 		for _, sess := range sessions {
 			pickled, err := sess.Internal.Pickle(s.pickleKey)
 			if err != nil {
-				continue
+				return snap, err
 			}
 			list = append(list, pickledSession{
-				Pickled:            base64.StdEncoding.EncodeToString(pickled),
-				CreationTime:       sess.CreationTime,
-				LastEncryptedTime:  sess.LastEncryptedTime,
-				LastDecryptedTime:  sess.LastDecryptedTime,
+				MaxAge:            sess.MaxAge,
+				Pickled:           base64.StdEncoding.EncodeToString(pickled),
+				CreationTime:      sess.CreationTime,
+				LastEncryptedTime: sess.LastEncryptedTime,
+				LastDecryptedTime: sess.LastDecryptedTime,
 			})
 		}
 		if len(list) > 0 {
@@ -470,21 +534,21 @@ func (s *jsonCryptoStore) snapshot() jsonStoreSnapshot {
 		for sessionID, igs := range room {
 			pickled, err := igs.Internal.Pickle(s.pickleKey)
 			if err != nil {
-				continue
+				return snap, err
 			}
 			roomMap[sessionID.String()] = &pickledIGS{
-				Pickled:            base64.StdEncoding.EncodeToString(pickled),
-				SigningKey:         igs.SigningKey,
-				SenderKey:          igs.SenderKey,
-				RoomID:             igs.RoomID,
-				ForwardingChains:   igs.ForwardingChains,
-				RatchetSafety:      igs.RatchetSafety,
-				ReceivedAt:         igs.ReceivedAt,
-				MaxAge:             igs.MaxAge,
-				MaxMessages:        igs.MaxMessages,
-				IsScheduled:        igs.IsScheduled,
-				KeyBackupVersion:   igs.KeyBackupVersion,
-				KeySource:          igs.KeySource,
+				Pickled:          base64.StdEncoding.EncodeToString(pickled),
+				SigningKey:       igs.SigningKey,
+				SenderKey:        igs.SenderKey,
+				RoomID:           igs.RoomID,
+				ForwardingChains: igs.ForwardingChains,
+				RatchetSafety:    igs.RatchetSafety,
+				ReceivedAt:       igs.ReceivedAt,
+				MaxAge:           igs.MaxAge,
+				MaxMessages:      igs.MaxMessages,
+				IsScheduled:      igs.IsScheduled,
+				KeyBackupVersion: igs.KeyBackupVersion,
+				KeySource:        igs.KeySource,
 			}
 		}
 		snap.GroupSessions[roomID.String()] = roomMap
@@ -501,7 +565,7 @@ func (s *jsonCryptoStore) snapshot() jsonStoreSnapshot {
 	for roomID, ogs := range ms.OutGroupSessions {
 		pickled, err := ogs.Internal.Pickle(s.pickleKey)
 		if err != nil {
-			continue
+			return snap, err
 		}
 		users := map[string]map[string]int{}
 		for ud, state := range ogs.Users {
@@ -511,14 +575,15 @@ func (s *jsonCryptoStore) snapshot() jsonStoreSnapshot {
 			users[ud.UserID.String()][ud.DeviceID.String()] = int(state)
 		}
 		snap.OutGroupSessions[roomID.String()] = &pickledOGS{
-			Pickled:            base64.StdEncoding.EncodeToString(pickled),
-			MaxMessages:        ogs.MaxMessages,
-			MessageCount:       ogs.MessageCount,
-			Users:              users,
-			RoomID:             ogs.RoomID,
-			Shared:             ogs.Shared,
-			CreationTime:       ogs.CreationTime,
-			LastEncryptedTime:  ogs.LastEncryptedTime,
+			MaxAge:            ogs.MaxAge,
+			Pickled:           base64.StdEncoding.EncodeToString(pickled),
+			MaxMessages:       ogs.MaxMessages,
+			MessageCount:      ogs.MessageCount,
+			Users:             users,
+			RoomID:            ogs.RoomID,
+			Shared:            ogs.Shared,
+			CreationTime:      ogs.CreationTime,
+			LastEncryptedTime: ogs.LastEncryptedTime,
 		}
 	}
 
@@ -587,7 +652,7 @@ func (s *jsonCryptoStore) snapshot() jsonStoreSnapshot {
 		}
 	}
 
-	return snap
+	return snap, nil
 }
 
 // restore loads a snapshot into the in-memory MemoryStore. Called at startup
@@ -621,15 +686,16 @@ func (s *jsonCryptoStore) restore(snap *jsonStoreSnapshot) error {
 		for _, sess := range sessions {
 			pickled, err := base64.StdEncoding.DecodeString(sess.Pickled)
 			if err != nil {
-				continue
+				return fmt.Errorf("matrix: corrupt session encoding: %w", err)
 			}
 			internal, err := olm.SessionFromPickled(pickled, s.pickleKey)
 			if err != nil {
-				continue
+				return fmt.Errorf("matrix: corrupt session: %w", err)
 			}
 			list = append(list, &crypto.OlmSession{
 				Internal: internal,
 				ExpirationMixin: crypto.ExpirationMixin{
+					MaxAge: sess.MaxAge,
 					TimeMixin: crypto.TimeMixin{
 						CreationTime:      sess.CreationTime,
 						LastEncryptedTime: sess.LastEncryptedTime,
@@ -646,13 +712,16 @@ func (s *jsonCryptoStore) restore(snap *jsonStoreSnapshot) error {
 	for roomID, room := range snap.GroupSessions {
 		roomMap := map[id.SessionID]*crypto.InboundGroupSession{}
 		for sessionID, igs := range room {
+			if igs == nil {
+				return fmt.Errorf("matrix: nil inbound group session")
+			}
 			pickled, err := base64.StdEncoding.DecodeString(igs.Pickled)
 			if err != nil {
-				continue
+				return fmt.Errorf("matrix: corrupt group session encoding: %w", err)
 			}
 			internal, err := olm.InboundGroupSessionFromPickled(pickled, s.pickleKey)
 			if err != nil {
-				continue
+				return fmt.Errorf("matrix: corrupt group session: %w", err)
 			}
 			roomMap[id.SessionID(sessionID)] = &crypto.InboundGroupSession{
 				Internal:         internal,
@@ -681,13 +750,16 @@ func (s *jsonCryptoStore) restore(snap *jsonStoreSnapshot) error {
 	}
 
 	for roomID, ogs := range snap.OutGroupSessions {
+		if ogs == nil {
+			return fmt.Errorf("matrix: nil outbound group session")
+		}
 		pickled, err := base64.StdEncoding.DecodeString(ogs.Pickled)
 		if err != nil {
-			continue
+			return fmt.Errorf("matrix: corrupt outbound session encoding: %w", err)
 		}
 		internal, err := olm.OutboundGroupSessionFromPickled(pickled, s.pickleKey)
 		if err != nil {
-			continue
+			return fmt.Errorf("matrix: corrupt outbound session: %w", err)
 		}
 		users := map[crypto.UserDevice]crypto.OGSState{}
 		for userID, devices := range ogs.Users {
@@ -698,6 +770,7 @@ func (s *jsonCryptoStore) restore(snap *jsonStoreSnapshot) error {
 		ms.OutGroupSessions[id.RoomID(roomID)] = &crypto.OutboundGroupSession{
 			Internal: internal,
 			ExpirationMixin: crypto.ExpirationMixin{
+				MaxAge: max(ogs.MaxAge, time.Nanosecond),
 				TimeMixin: crypto.TimeMixin{
 					CreationTime:      ogs.CreationTime,
 					LastEncryptedTime: ogs.LastEncryptedTime,
@@ -724,14 +797,20 @@ func (s *jsonCryptoStore) restore(snap *jsonStoreSnapshot) error {
 	}
 
 	for keyStr, val := range snap.MessageIndices {
-		var sid id.SessionID
-		var index uint
-		if _, err := fmt.Sscanf(keyStr, "%s:%d", &sid, &index); err != nil {
-			continue
+		sep := strings.LastIndexByte(keyStr, ':')
+		if sep < 1 {
+			return fmt.Errorf("matrix: invalid replay index key")
+		}
+		sid := id.SessionID(keyStr[:sep])
+		index, err := strconv.ParseUint(keyStr[sep+1:], 10, 32)
+		if err != nil {
+			return fmt.Errorf("matrix: invalid replay index: %w", err)
 		}
 		// messageIndexKey is unexported in mautrix; the exported
 		// ValidateMessageIndex is the supported way to re-add entries.
-		_, _ = ms.ValidateMessageIndex(context.Background(), sid, val.EventID, index, val.Timestamp)
+		if _, err := ms.ValidateMessageIndex(context.Background(), sid, val.EventID, uint(index), val.Timestamp); err != nil {
+			return err
+		}
 	}
 
 	for userID, devices := range snap.Devices {
@@ -785,59 +864,61 @@ func (s *jsonCryptoStore) restore(snap *jsonStoreSnapshot) error {
 // are string aliases, so plain string maps round-trip through JSON cleanly.
 
 type jsonStoreSnapshot struct {
-	State                json.RawMessage                                        `json:"state,omitempty"`
-	Account              pickledAccount                                         `json:"account"`
-	Sessions             map[string][]pickledSession                            `json:"sessions,omitempty"`
-	GroupSessions        map[string]map[string]*pickledIGS                      `json:"group_sessions,omitempty"`
+	State                 json.RawMessage                                          `json:"state,omitempty"`
+	Account               pickledAccount                                           `json:"account"`
+	Sessions              map[string][]pickledSession                              `json:"sessions,omitempty"`
+	GroupSessions         map[string]map[string]*pickledIGS                        `json:"group_sessions,omitempty"`
 	WithheldGroupSessions map[string]map[string]*event.RoomKeyWithheldEventContent `json:"withheld,omitempty"`
-	OutGroupSessions     map[string]*pickledOGS                                 `json:"out_group_sessions,omitempty"`
-	SharedGroupSessions  map[string]map[string][]id.SessionID                   `json:"shared,omitempty"`
-	MessageIndices       map[string]jsonMessageIndexValue                       `json:"message_indices,omitempty"`
-	Devices              map[string]map[string]*id.Device                       `json:"devices,omitempty"`
-	CrossSigningKeys     map[string]map[string]id.CrossSigningKey               `json:"cross_signing_keys,omitempty"`
-	KeySignatures        map[string]map[string]map[string]map[string]string     `json:"key_signatures,omitempty"`
-	OutdatedUsers        []id.UserID                                            `json:"outdated_users,omitempty"`
-	Secrets              map[string]string                                      `json:"secrets,omitempty"`
-	OlmHashes            [][32]byte                                             `json:"olm_hashes,omitempty"`
+	OutGroupSessions      map[string]*pickledOGS                                   `json:"out_group_sessions,omitempty"`
+	SharedGroupSessions   map[string]map[string][]id.SessionID                     `json:"shared,omitempty"`
+	MessageIndices        map[string]jsonMessageIndexValue                         `json:"message_indices,omitempty"`
+	Devices               map[string]map[string]*id.Device                         `json:"devices,omitempty"`
+	CrossSigningKeys      map[string]map[string]id.CrossSigningKey                 `json:"cross_signing_keys,omitempty"`
+	KeySignatures         map[string]map[string]map[string]map[string]string       `json:"key_signatures,omitempty"`
+	OutdatedUsers         []id.UserID                                              `json:"outdated_users,omitempty"`
+	Secrets               map[string]string                                        `json:"secrets,omitempty"`
+	OlmHashes             [][32]byte                                               `json:"olm_hashes,omitempty"`
 }
 
 type pickledAccount struct {
-	Pickled          string             `json:"pickled"`
-	Shared           bool               `json:"shared"`
+	Pickled          string              `json:"pickled"`
+	Shared           bool                `json:"shared"`
 	KeyBackupVersion id.KeyBackupVersion `json:"key_backup_version,omitempty"`
 }
 
 type pickledSession struct {
-	Pickled            string    `json:"pickled"`
-	CreationTime       time.Time `json:"creation_time"`
-	LastEncryptedTime  time.Time `json:"last_encrypted_time"`
-	LastDecryptedTime  time.Time `json:"last_decrypted_time"`
+	MaxAge            time.Duration `json:"max_age,omitempty"`
+	Pickled           string        `json:"pickled"`
+	CreationTime      time.Time     `json:"creation_time"`
+	LastEncryptedTime time.Time     `json:"last_encrypted_time"`
+	LastDecryptedTime time.Time     `json:"last_decrypted_time"`
 }
 
 type pickledIGS struct {
-	Pickled            string                            `json:"pickled"`
-	SigningKey         id.Ed25519                        `json:"signing_key"`
-	SenderKey          id.Curve25519                     `json:"sender_key"`
-	RoomID             id.RoomID                         `json:"room_id"`
-	ForwardingChains   []string                          `json:"forwarding_chains,omitempty"`
-	RatchetSafety      crypto.RatchetSafety              `json:"ratchet_safety,omitempty"`
-	ReceivedAt         time.Time                         `json:"received_at,omitempty"`
-	MaxAge             int64                             `json:"max_age"`
-	MaxMessages        int                               `json:"max_messages"`
-	IsScheduled        bool                              `json:"is_scheduled,omitempty"`
-	KeyBackupVersion   id.KeyBackupVersion               `json:"key_backup_version,omitempty"`
-	KeySource          id.KeySource                      `json:"key_source,omitempty"`
+	Pickled          string               `json:"pickled"`
+	SigningKey       id.Ed25519           `json:"signing_key"`
+	SenderKey        id.Curve25519        `json:"sender_key"`
+	RoomID           id.RoomID            `json:"room_id"`
+	ForwardingChains []string             `json:"forwarding_chains,omitempty"`
+	RatchetSafety    crypto.RatchetSafety `json:"ratchet_safety,omitempty"`
+	ReceivedAt       time.Time            `json:"received_at,omitempty"`
+	MaxAge           int64                `json:"max_age"`
+	MaxMessages      int                  `json:"max_messages"`
+	IsScheduled      bool                 `json:"is_scheduled,omitempty"`
+	KeyBackupVersion id.KeyBackupVersion  `json:"key_backup_version,omitempty"`
+	KeySource        id.KeySource         `json:"key_source,omitempty"`
 }
 
 type pickledOGS struct {
-	Pickled            string                           `json:"pickled"`
-	MaxMessages        int                              `json:"max_messages"`
-	MessageCount       int                              `json:"message_count"`
-	Users              map[string]map[string]int        `json:"users,omitempty"`
-	RoomID             id.RoomID                        `json:"room_id"`
-	Shared             bool                             `json:"shared"`
-	CreationTime       time.Time                        `json:"creation_time"`
-	LastEncryptedTime  time.Time                        `json:"last_encrypted_time"`
+	MaxAge            time.Duration             `json:"max_age,omitempty"`
+	Pickled           string                    `json:"pickled"`
+	MaxMessages       int                       `json:"max_messages"`
+	MessageCount      int                       `json:"message_count"`
+	Users             map[string]map[string]int `json:"users,omitempty"`
+	RoomID            id.RoomID                 `json:"room_id"`
+	Shared            bool                      `json:"shared"`
+	CreationTime      time.Time                 `json:"creation_time"`
+	LastEncryptedTime time.Time                 `json:"last_encrypted_time"`
 }
 
 type jsonMessageIndexValue struct {

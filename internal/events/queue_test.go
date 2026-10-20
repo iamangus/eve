@@ -184,7 +184,7 @@ func TestQueueRecoversExpiredLeaseAfterRestart(t *testing.T) {
 	}
 }
 
-func TestRetryBackoffLetsNewEventProceed(t *testing.T) {
+func TestRetryBackoffPreservesScopeOrderingWithoutBlockingOtherScopes(t *testing.T) {
 	q, err := NewQueue(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -202,8 +202,18 @@ func TestRetryBackoffLetsNewEventProceed(t *testing.T) {
 	if err := q.Retry(first); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := q.Enqueue("opendev", "frontend", "independent", json.RawMessage(`{"conversation_id":"other"}`)); err != nil {
+		t.Fatal(err)
+	}
 	second, err := q.Lease(time.Now().UTC(), time.Minute)
-	if err != nil || second.ID != "ready" {
-		t.Fatalf("retry starved ready event: %+v %v", second, err)
+	if err != nil || second == nil || second.ID != "independent" {
+		t.Fatalf("scope ordering blocked independent work: %+v %v", second, err)
+	}
+	if blocked, err := q.Lease(time.Now().UTC(), time.Minute); err != nil || blocked != nil {
+		t.Fatalf("later same-scope event overtook retry: %+v %v", blocked, err)
+	}
+	retry, err := q.Lease(time.Now().Add(2*time.Second), time.Minute)
+	if err != nil || retry == nil || retry.ID != "slow" {
+		t.Fatalf("oldest retry not resumed: %+v %v", retry, err)
 	}
 }
