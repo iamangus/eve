@@ -4,6 +4,9 @@
   import { marked } from 'marked'
   import DOMPurify from 'dompurify'
   import { HUB_EVENT, parseHubEvent } from '../lib/events.js'
+  import Icon from '../components/Icon.svelte'
+  import EmptyState from '../components/EmptyState.svelte'
+  import { scrollRegion } from '../lib/scrollRegion.js'
 
   marked.setOptions({ gfm: true, breaks: true })
 
@@ -120,7 +123,6 @@
     try {
       const list = await api.get('/api/tasks')
       tasks = Array.isArray(list) ? list.filter(t => t.status === 'running' || t.status === 'needs_input') : []
-      if (tasks.length > 0) tasksOpen = true
     } catch {
       // tasks endpoint unavailable; ignore
     }
@@ -531,47 +533,53 @@
       sendMessage()
     }
   }
+
+  function startDraft(text) {
+    newMessage = text
+    inputEl?.focus()
+  }
 </script>
 
 <main class="chat">
   {#if loading}
-    <div class="empty-state">
-      <p class="empty-title">Loading…</p>
-    </div>
+    <EmptyState loading title="Opening your conversation" description="Bringing your messages together." />
   {:else if currentConv}
     <div class="chat-layout">
       <div class="chat-head">
         <div>
-          <span class="chat-kicker">CONVERSATION</span>
-          <span class="chat-head-name">{currentConv.title}</span>
+          <p class="eyebrow">Your conversation</p>
+          <h1 class="chat-head-name">{currentConv.title}</h1>
+          <span class="chat-head-description">A place to think, plan, and get things done.</span>
         </div>
-        <a class="chat-head-badge" href={'/api/conversations/' + currentConv.id + '/export'} download>Export</a>
+        <div class="chat-actions">
+        <a class="button quiet small" href={'/api/conversations/' + currentConv.id + '/export'} download><Icon name="download" size={16} /><span>Export</span></a>
         <span class="chat-head-badge">{Math.max(messages.length, currentConv.total_messages || 0)} messages</span>
         {#if summarizedBoundary() > 0}
-          <span class="chat-head-badge summary-badge">summarized</span>
+          <span class="badge">Earlier messages summarized</span>
         {/if}
         {#if tasks.length > 0}
-          <button class="tasks-toggle" onclick={() => { tasksOpen = !tasksOpen }}>
-            View {tasks.length} active {tasks.length === 1 ? 'task' : 'tasks'}
+          <button class="button small" aria-expanded={tasksOpen} aria-controls="chat-tasks" onclick={() => { tasksOpen = !tasksOpen }}>
+            <Icon name="tasks" size={16} />{tasks.length} active {tasks.length === 1 ? 'task' : 'tasks'}
           </button>
         {/if}
+        </div>
       </div>
 
       {#if tasksOpen && tasks.length > 0}
-        <div class="tasks-panel">
+        <div class="tasks-panel" id="chat-tasks">
           {#each tasks as t (t.id)}
             <div class="task-item">
               <div class="task-line">
-                <span class="task-status task-{t.status}">{t.status.replaceAll('_', ' ')}</span>
+                <span class="badge" data-tone={t.status === 'needs_input' ? 'warning' : 'accent'}>{t.status === 'needs_input' ? 'Needs your input' : 'In progress'}</span>
                 <span class="task-name">{t.agent_name}</span>
-                <button class="task-x" disabled={taskActions[t.id]} onclick={() => cancelTask(t.id)}>Cancel task</button>
+                <button class="button danger small" disabled={taskActions[t.id]} onclick={() => cancelTask(t.id)}>Cancel task</button>
               </div>
               <div class="task-msg">{t.message}</div>
               {#if t.status === 'needs_input' && t.question}
                 <div class="task-q">→ {t.question}</div>
                 <div class="task-reply">
-                  <input bind:value={taskReplies[t.id]} aria-label="Reply to background task" placeholder="Reply…" onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); replyToTask(t.id) } }} />
-                  <button disabled={taskActions[t.id]} onclick={() => replyToTask(t.id)}>Reply</button>
+                  <input class="input" bind:value={taskReplies[t.id]} aria-label="Reply to background task" placeholder="Your reply…" onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); replyToTask(t.id) } }} />
+                  <button class="button primary" disabled={taskActions[t.id] || !taskReplies[t.id]?.trim()} onclick={() => replyToTask(t.id)}>Reply</button>
                 </div>
               {/if}
             </div>
@@ -579,8 +587,22 @@
         </div>
       {/if}
 
-      <div class="chat-body" bind:this={messageListEl}>
-        {#if hasOlder}<button onclick={loadOlder} disabled={loadingOlder}>{loadingOlder ? 'Loading…' : 'Load earlier messages'}</button>{/if}
+      <div class="chat-body" role="region" aria-label="Conversation messages" use:scrollRegion bind:this={messageListEl}>
+        <div class="conversation">
+        {#if hasOlder}<div class="history-control"><button class="button quiet small" onclick={loadOlder} disabled={loadingOlder}><Icon name="clock" size={16} />{loadingOlder ? 'Loading…' : 'Load earlier messages'}</button></div>{/if}
+        {#if messages.length === 0 && !stream.raw && !stream.status}
+          <div class="welcome">
+            <span class="welcome-mark"><Icon name="sparkle" size={32} /></span>
+            <p class="eyebrow">A little clarity, a little momentum</p>
+            <h2>What’s on your mind?</h2>
+            <p>Bring an idea, a question, or something on your list.<br />We can work through it together.</p>
+            <div class="starters" aria-label="Conversation starters">
+              {#each [{ icon: 'tasks', label: 'Plan my day', draft: 'Help me make a plan for today.' }, { icon: 'sparkle', label: 'Think it through', draft: 'I’d like to think something through with you. ' }, { icon: 'email', label: 'Find the right words', draft: 'Help me draft a message. ' }] as starter}
+                <button onclick={() => startDraft(starter.draft)}><Icon name={starter.icon} size={18} /><span>{starter.label}</span><Icon name="chevron" size={14} /></button>
+              {/each}
+            </div>
+          </div>
+        {/if}
         {#each messages as msg, i (msg.id != null ? 'id-' + msg.id : msg.source_id ? 'source-' + msg.source_id : 'pending-' + i)}
           {#if i > 0 && gapBetween(messages[i - 1], msg)}
             <div class="time-gap">{gapBetween(messages[i - 1], msg)}</div>
@@ -589,8 +611,10 @@
             <div class="summ-divider">↑ earlier conversation summarized</div>
           {/if}
           <div class="msg-row" class:msg-right={msg.role === 'user'} class:msg-left={msg.role !== 'user'}>
+            <div class="msg-avatar" aria-hidden="true">{#if msg.role === 'user'}Y{:else}<Icon name="sparkle" size={18} />{/if}</div>
+            <div class="message-content">
             <div class="msg-meta">
-              <span>{msg.role === 'user' ? (msg.sender && msg.sender !== 'owner' ? msg.sender : 'YOU') : 'EVE'}</span>
+              <span>{msg.role === 'user' ? (msg.sender && msg.sender !== 'owner' ? msg.sender : 'You') : 'Eve'}</span>
               {#if msg.created_at}<time datetime={msg.created_at}>{messageTime(msg.created_at)}</time>{/if}
               {#if msg.channel && msg.channel !== 'web'}<span>{channelLabel(msg.channel)}</span>{/if}
             </div>
@@ -601,12 +625,15 @@
                 {@html renderMarkdown(msg.content)}
               {/if}
             </div>
+            </div>
           </div>
         {/each}
 
         {#if stream.raw || stream.status}
           <div class="msg-row msg-left">
-            <div class="msg-meta"><span>EVE</span><span>LIVE</span></div>
+            <div class="msg-avatar" aria-hidden="true"><Icon name="sparkle" size={18} /></div>
+            <div class="message-content">
+            <div class="msg-meta"><span>Eve</span><span class="live-label">Responding</span></div>
             <div class="bubble bubble-bot">
               {#if stream.html}
                 {@html stream.html}
@@ -619,15 +646,17 @@
                 </div>
               {/if}
             </div>
+            </div>
           </div>
         {/if}
 
         <div class="scroll-anchor"></div>
+        </div>
       </div>
 
       <div class="chat-foot">
         {#if notice}
-          <div class="chat-notice" role="status">{notice}</div>
+          <div class="chat-notice notice" role="status"><Icon name="info" size={17} /><span>{notice}</span></div>
         {/if}
         <div class="input-wrap">
           <textarea
@@ -635,162 +664,100 @@
             bind:value={newMessage}
             onkeydown={handleKeydown}
             rows="1"
-            placeholder={stream.runId ? 'Interrupt with a follow-up…' : 'Write a message to Eve'}
+            placeholder={stream.runId ? 'Add a thought while Eve is working…' : 'Message Eve…'}
             aria-label="Message to Eve"
             oninput={(e) => { e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px'; }}
           ></textarea>
-          <button onclick={sendMessage} class="send-btn" aria-label="Send message" disabled={posting || loadingConversation || !currentConv}>
+          <button onclick={sendMessage} class="send-btn" aria-label="Send message" disabled={posting || loadingConversation || !newMessage.trim() || !currentConv}>
             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" d="M6 12 3.269 3.125A59.769 59.769 0 0 1 21.485 12 59.768 59.768 0 0 1 3.27 20.875L5.999 12Zm0 0h7.5" />
             </svg>
           </button>
         </div>
+        <div class="composer-hint"><span>{stream.runId ? 'You can add a follow-up without waiting.' : 'One thought at a time. Eve is here to help.'}</span><span class="keyboard-hint"><kbd>Enter</kbd> to send · <kbd>Shift + Enter</kbd> for a new line</span></div>
       </div>
     </div>
   {:else}
-    <div class="empty-state">
-      <p class="empty-title">No chat selected</p>
-      <p class="empty-sub">A conversation is created automatically the first time you send a message.</p>
-    </div>
+    <EmptyState icon="chat" title="Let’s get your conversation open" description={notice || 'Your conversation is not available right now. Try again to reconnect.'}><button class="button primary" onclick={() => { loading = true; loadPrimary() }}>Try again</button></EmptyState>
   {/if}
 </main>
 
 <style>
-  .chat { display: flex; flex-direction: column; height: 100%; overflow: hidden; flex: 1; }
-  .chat-layout { display: flex; flex-direction: column; height: 100%; }
-  .chat-head {
-    padding: 18px var(--page-pad); border-bottom: var(--rule);
-    display: flex; align-items: center; gap: 18px; max-width: 100%;
-    background: var(--bg-base); flex-shrink: 0;
-  }
-  .chat-head > div { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 14px; }
-  .chat-kicker { font-family: var(--mono); color: var(--text-faint); font-size: 0.65rem; letter-spacing: 0.1em; }
-  .chat-head-name { font-size: 1rem; font-weight: 600; color: var(--text-base); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .chat-head-badge {
-    font: 0.68rem var(--mono); color: var(--text-muted); white-space: nowrap;
-  }
-  .summary-badge { border-left: var(--rule); padding-left: 14px; }
-  .chat-body {
-    flex: 1; overflow-y: auto; padding: 12px var(--page-pad) 40px;
-    display: flex; flex-direction: column; max-width: calc(var(--content-max) + 2 * var(--page-pad));
-  }
-  .msg-row { display: grid; grid-template-columns: 92px minmax(0, var(--measure)); border-bottom: var(--rule); padding: 24px 0; width: 100%; }
-  .msg-left, .msg-right { align-self: stretch; }
-  .msg-meta { display: flex; flex-direction: column; gap: 3px; padding-top: 2px; font: 0.65rem/1.35 var(--mono); letter-spacing: 0.08em; color: var(--text-faint); }
-  .msg-meta span:first-child { color: var(--text-muted); font-weight: 700; }
-  .bubble {
-    padding: 0; border-radius: 0; font-size: 0.94rem; line-height: 1.65;
-    word-wrap: break-word; overflow-wrap: anywhere;
-  }
-  .bubble-user { color: var(--text-base); }
-  .bubble-bot { color: oklch(87% 0.01 65); }
-  .time-gap {
-    font: 0.65rem var(--mono); color: var(--text-faint); padding: 12px 0 0 92px;
-  }
-  .summ-divider {
-    font: 0.64rem var(--mono); color: var(--text-muted); border-bottom: 1px dashed var(--border-strong);
-    padding: 18px 0 8px 92px; text-transform: uppercase; letter-spacing: 0.08em;
-  }
-  .chat-foot {
-    padding: 14px var(--page-pad) 18px; border-top: var(--rule); background: var(--bg-deep); flex-shrink: 0;
-  }
-  .chat-notice {
-    overflow-wrap: anywhere;
-    max-width: calc(var(--measure) + 92px); font: 0.72rem var(--mono); color: var(--text-base);
-    border-left: 2px solid var(--text-base); padding: 6px 12px; margin-bottom: 10px;
-  }
-  .input-wrap {
-    display: flex; gap: 10px; align-items: flex-end; max-width: calc(var(--measure) + 92px);
-    background: var(--bg-raised); border: 1px solid var(--border-strong);
-    border-radius: 2px; padding: 9px 9px 9px 15px;
-    transition: border-color 0.15s, box-shadow 0.15s;
-  }
-  .input-wrap:focus-within {
-    border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent);
-  }
-  .input-wrap textarea {
-    flex: 1; resize: none; background: transparent; border: none; outline: none;
-    color: var(--text-base); font-family: inherit; font-size: 0.92rem;
-    line-height: 1.6; max-height: 140px; overflow-y: auto;
-  }
+  .chat { display: flex; flex-direction: column; height: 100%; overflow: hidden; flex: 1; min-width: 0; }
+  .chat-layout { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+  .chat-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-5); padding: var(--space-6) var(--page-pad); border-bottom: var(--rule); flex-shrink: 0; }
+  .chat-head > div:first-child { min-width: 0; }
+  .chat-head .eyebrow { margin-bottom: var(--space-1); }
+  .chat-head-name { font-size: 1.125rem; font-weight: 600; letter-spacing: -.025em; line-height: 1.4; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chat-head-description { display: block; font-size: .75rem; color: var(--text-muted); margin-top: var(--space-1); }
+  .chat-actions { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; flex-shrink: 0; }
+  .chat-head-badge { font-size: .75rem; color: var(--text-muted); }
+  .chat-body { flex: 1; min-height: 0; overflow-y: auto; padding: var(--space-6) var(--page-pad) var(--space-8); display: flex; flex-direction: column; }
+  .conversation { width: min(100%, var(--measure)); margin-inline: auto; display: flex; flex-direction: column; flex: 1; }
+  .history-control { text-align: center; }
+  .msg-row { display: flex; gap: var(--space-3); padding: var(--space-5) 0; width: 100%; }
+  .msg-avatar { flex-shrink: 0; width: 32px; height: 32px; display: grid; place-items: center; color: var(--accent-text); background: var(--accent-dim); border-radius: var(--radius); font-size: .6875rem; font-weight: 600; }
+  .message-content { flex: 1; min-width: 0; padding-top: var(--space-1); }
+  .msg-right { flex-direction: row-reverse; padding-left: var(--space-8); }
+  .msg-right .msg-avatar { background: var(--bg-hover); color: var(--text-muted); }
+  .msg-right .msg-meta { justify-content: flex-end; }
+  .msg-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); font-size: .6875rem; color: var(--text-muted); margin-bottom: var(--space-2); }
+  .msg-meta > span:first-child { color: var(--text-base); font-size: .75rem; font-weight: 600; }
+  .bubble { font-size: .9375rem; line-height: 1.8; overflow-wrap: anywhere; color: var(--text-base); }
+  .bubble-user { background: var(--user-bubble); padding: var(--space-3) var(--space-4); border: 1px solid var(--accent-dim); border-radius: var(--radius-lg) var(--radius-sm) var(--radius-lg) var(--radius-lg); width: fit-content; margin-left: auto; white-space: pre-wrap; }
+  .time-gap, .summ-divider { text-align: center; font-size: .6875rem; color: var(--text-muted); margin: var(--space-4) 0; }
+  .summ-divider { padding-top: var(--space-3); border-top: 1px dashed var(--border); }
+  .chat-foot { flex-shrink: 0; padding: var(--space-3) var(--page-pad) var(--space-5); background: var(--bg-base); }
+  .chat-notice { width: min(100%, var(--measure)); margin: 0 auto var(--space-3); }
+  .input-wrap { display: flex; align-items: flex-end; gap: var(--space-3); width: min(100%, var(--measure)); margin-inline: auto; padding: var(--space-3); border: 1px solid var(--border-strong); border-radius: var(--radius-lg); background: var(--bg-raised); box-shadow: var(--composer-shadow); transition: border-color var(--duration); }
+  .input-wrap:focus-within { border-color: var(--accent); }
+  .input-wrap textarea { flex: 1; padding: var(--space-2) var(--space-1); min-height: 42px; resize: none; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-base); font-size: .9375rem; line-height: 1.6; max-height: 140px; overflow-y: auto; }
   .input-wrap textarea::placeholder { color: var(--text-muted); }
-  .send-btn {
-    flex-shrink: 0; width: 38px; height: 38px; border-radius: 1px;
-    background: var(--accent); border: none; cursor: pointer;
-    display: flex; align-items: center; justify-content: center;
-    transition: background 0.15s, transform 0.1s; color: var(--bg-deep);
-  }
-  .send-btn:hover { background: var(--accent-strong); }
-  .send-btn:active { transform: scale(0.93); }
-  .send-btn:disabled { opacity: 0.5; pointer-events: none; }
-  .send-btn svg { width: 16px; height: 16px; }
-
-  .thinking-bubble {
-    display: flex; align-items: baseline; gap: 4px;
-  }
-  .thinking-label { font-size: 0.9rem; color: var(--text-muted); }
-  .thinking-dot {
-    width: 5px; height: 5px; border-radius: 50%; background: var(--text-muted);
-    animation: thinkanim 1.4s infinite both;
-  }
-  @keyframes thinkanim {
-    0%, 80%, 100% { opacity: 0.2; transform: scale(0.85); }
-    40%           { opacity: 1;   transform: scale(1.15); }
-  }
-
+  .send-btn { flex-shrink: 0; width: 42px; height: 42px; border-radius: var(--radius); background: var(--accent); color: var(--on-accent); border: 0; display: grid; place-items: center; transition: background var(--duration); }
+  .send-btn:hover:not(:disabled) { background: var(--accent-strong); }
+  .send-btn svg { width: 18px; height: 18px; }
+  .composer-hint { display: flex; justify-content: space-between; gap: var(--space-3); width: min(100%, var(--measure)); margin: var(--space-2) auto 0; font-size: .625rem; color: var(--text-muted); }
+  kbd { font-family: inherit; }
+  .thinking-bubble { display: flex; align-items: center; gap: var(--space-1); }
+  .thinking-label { color: var(--text-muted); margin-right: var(--space-2); font-size: .875rem; }
+  .thinking-dot { width: 4px; height: 4px; border-radius: 50%; background: var(--accent); animation: thinkanim 1.4s infinite both; }
+  .live-label { color: var(--accent-text); }
+  @keyframes thinkanim { 0%, 80%, 100% { opacity: .3; } 40% { opacity: 1; } }
   .scroll-anchor { overflow-anchor: auto; height: 1px; }
-
-  .empty-state { flex: 1; padding: 64px var(--page-pad); color: var(--text-muted); }
-  .empty-title { font-size: 1.05rem; font-weight: 600; color: var(--text-base); margin: 14px 0 4px; }
-  .empty-sub { font-size: 0.85rem; margin: 0; }
-
-  .tasks-toggle {
-    font: 0.68rem var(--mono); cursor: pointer; background: transparent; color: var(--accent);
-    border: 0; border-bottom: 1px solid currentColor; padding: 2px 0; flex-shrink: 0;
-  }
-  .tasks-toggle:hover { color: var(--text-base); }
-
-  .tasks-panel {
-    flex-shrink: 0; max-height: 40%; overflow-y: auto;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg-base); padding: 0 var(--page-pad);
-    display: flex; flex-direction: column;
-  }
-  .task-item {
-    border-bottom: var(--rule); padding: 12px 0; max-width: calc(var(--measure) + 92px);
-  }
-  .task-line { display: flex; align-items: center; gap: 8px; }
-  .task-status {
-    font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
-    color: var(--text-muted);
-  }
-  .task-needs_input { color: var(--text-base); }
-  .task-name { font-size: 0.82rem; font-weight: 600; color: var(--text-base); flex: 1; }
-  .task-x {
-    border: none; background: transparent; color: var(--text-muted);
-    cursor: pointer; font: 0.68rem var(--mono); padding: 2px 0; border-bottom: 1px solid transparent;
-  }
-  .task-x:hover { color: var(--accent); border-bottom-color: currentColor; }
-  .task-msg { font-size: 0.78rem; color: var(--text-muted); margin: 2px 0 0; }
-  .task-q { font-size: 0.8rem; color: var(--text-base); margin: 6px 0 0; }
-  .task-reply { display: flex; gap: 6px; margin-top: 6px; }
-  .task-reply input {
-    flex: 1; background: var(--bg-deep); border: 1px solid var(--border-strong);
-    border-radius: 1px; padding: 5px 10px; color: var(--text-base);
-    font-size: 0.8rem; outline: none;
-  }
-  .task-reply input:focus { border-color: var(--accent); }
-  .task-reply button {
-    border: none; background: var(--accent); color: var(--bg-deep);
-    border-radius: 1px; padding: 5px 12px; font-size: 0.78rem; cursor: pointer;
-  }
+  .welcome { display: flex; flex: 1; flex-direction: column; justify-content: center; align-items: center; text-align: center; padding: var(--space-8) 0 var(--space-12); }
+  .welcome-mark { display: grid; place-items: center; width: 64px; height: 64px; background: var(--accent-dim); color: var(--accent-text); border-radius: var(--radius-lg); margin-bottom: var(--space-6); }
+  .welcome h2 { font-size: clamp(1.5rem, 3vw, 2rem); font-weight: 550; line-height: 1.3; letter-spacing: -.04em; margin: var(--space-1) 0 var(--space-3); }
+  .welcome > p:not(.eyebrow) { color: var(--text-muted); font-size: .875rem; line-height: 1.8; margin: 0; }
+  .welcome .eyebrow { font-size: .625rem; }
+  .starters { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--space-2); margin-top: var(--space-8); }
+  .starters button { display: flex; align-items: center; gap: var(--space-2); min-height: 44px; padding: var(--space-3); background: var(--bg-raised); color: var(--text-muted); border: var(--rule); border-radius: var(--radius); font-size: .75rem; transition: background var(--duration), border-color var(--duration); }
+  .starters button:hover { background: var(--accent-dim); border-color: var(--accent); color: var(--accent-text); }
+  .tasks-panel { flex-shrink: 0; max-height: 40%; overflow-y: auto; border-bottom: var(--rule); background: var(--bg-raised); padding: var(--space-3) var(--page-pad); }
+  .task-item { padding: var(--space-3) 0; width: min(100%, var(--measure)); margin: auto; }
+  .task-item + .task-item { border-top: var(--rule); }
+  .task-line { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); }
+  .task-name { font-size: .875rem; font-weight: 600; flex: 1; }
+  .task-msg { font-size: .8125rem; color: var(--text-muted); margin-top: var(--space-2); overflow-wrap: anywhere; }
+  .task-q { font-size: .875rem; margin-top: var(--space-3); }
+  .task-reply { display: flex; gap: var(--space-2); margin-top: var(--space-3); }
+  @media (max-width: 1000px) { .chat-head-description { display: none; } .chat-head-badge { display: none; } .keyboard-hint { display: none; } }
   @media (max-width: 640px) {
-    .chat-head { align-items: flex-start; flex-wrap: wrap; }
-    .chat-head > div { width: 100%; flex-basis: 100%; display: block; }
-    .chat-kicker { display: block; margin-bottom: 3px; }
-    .msg-row { grid-template-columns: 1fr; gap: 8px; padding: 20px 0; }
-    .msg-meta { flex-direction: row; gap: 10px; }
-    .time-gap, .summ-divider { padding-left: 0; }
-    .summary-badge { padding-left: 10px; }
+    .chat-head { padding: var(--space-4) var(--page-pad); gap: var(--space-3); align-items: flex-start; }
+    .chat-head .eyebrow { display: none; }
+    .chat-head-name { font-size: .9375rem; white-space: normal; }
+    .chat-actions { gap: var(--space-1); justify-content: flex-end; max-width: 50%; }
+    .chat-actions .badge { display: none; }
+    .chat-body { padding-top: var(--space-3); }
+    .chat-foot { padding-bottom: max(var(--space-3), env(safe-area-inset-bottom)); }
+    .msg-row { gap: var(--space-2); padding-block: var(--space-4); }
+    .msg-avatar { width: 28px; height: 28px; }
+    .msg-right { padding-left: var(--space-3); }
+    .bubble { font-size: .875rem; }
+    .welcome { padding-block: var(--space-6); }
+    .welcome > p:not(.eyebrow) br { display: none; }
+    .starters { flex-direction: column; width: min(100%, 270px); margin-top: var(--space-6); }
+    .starters button { justify-content: flex-start; }
+    .starters button > span { flex: 1; text-align: left; }
+    .composer-hint { font-size: .625rem; }
   }
 </style>

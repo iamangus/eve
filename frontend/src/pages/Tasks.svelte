@@ -1,5 +1,7 @@
 <script>
   import { api } from '../lib/api.js'
+  import Icon from '../components/Icon.svelte'
+  import EmptyState from '../components/EmptyState.svelte'
 
   let tasks = $state([])
   let loading = $state(true)
@@ -10,6 +12,10 @@
   let showArchived = $state(false)
   let archiveOffset = $state(0)
   let loadVersion = 0
+  let filter = $state('all')
+  const labels = { running: 'In progress', needs_input: 'Needs your input', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' }
+  const tones = { running: 'accent', needs_input: 'warning', completed: 'success', failed: 'error' }
+  let visibleTasks = $derived(filter === 'all' || showArchived ? tasks : tasks.filter(task => task.status === filter))
 
   $effect(() => {
     load()
@@ -79,31 +85,38 @@
   const activeCount = () => tasks.filter(t => activeStatuses.includes(t.status)).length
 </script>
 
-<div class="ts-page">
-  <header class="ts-head">
-    <div><div class="ts-kicker">SYSTEM / WORK QUEUE</div><h2 class="ts-title">Tasks</h2></div>
-    <div class="ts-count">{activeCount()} active · {tasks.length} {showArchived ? 'archived tasks on this page' : 'current tasks'}</div>
-    <button class="ts-cancel" onclick={() => { showArchived = !showArchived; archiveOffset = 0; loading = true }}>{showArchived ? 'Current tasks' : 'Archived tasks'}</button>
+<main class="page" aria-labelledby="tasks-title"><div class="page-inner">
+  <header class="page-heading">
+    <div><p class="eyebrow">Workspace</p><h1 class="page-title" id="tasks-title">Tasks</h1><p class="page-description">See what Eve is working on, and step in when she needs you.</p></div>
+    <span class="badge" data-tone={activeCount() ? 'accent' : undefined}>{activeCount()} active</span>
   </header>
+  <div class="ts-toolbar">
+    <div class="segmented" role="group" aria-label="Task view"><button aria-pressed={!showArchived} onclick={() => { if (showArchived) { showArchived = false; archiveOffset = 0; loading = true } }}>Current tasks</button><button aria-pressed={showArchived} onclick={() => { if (!showArchived) { showArchived = true; archiveOffset = 0; loading = true } }}><Icon name="archive" size={15} />Archived tasks</button></div>
+    {#if !showArchived}<label class="ts-filter">Show<select class="input" aria-label="Filter tasks" bind:value={filter}><option value="all">All tasks</option><option value="needs_input">Needs your input</option><option value="running">In progress</option><option value="completed">Completed</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option></select></label>{/if}
+  </div>
 
   {#if loading}
-    <div class="ts-empty">Loading tasks…</div>
+    <EmptyState loading title="Loading tasks" />
   {:else if error}
-    <div class="ts-empty ts-error">{error}</div>
+    <div class="notice error" role="alert"><Icon name="warning" /><span>{error}</span></div><button class="button retry" onclick={load}>Try again</button>
   {:else if tasks.length === 0}
-    <div class="ts-empty">No background tasks yet.</div>
+    <EmptyState icon="tasks" title={showArchived ? 'Your archive is clear' : 'No background tasks yet.'} description={showArchived ? 'Completed tasks you archive will stay here for later.' : 'Ask Eve to work on something in the background. You can track progress and reply to questions here.'} />
+  {:else if visibleTasks.length === 0}
+    <EmptyState icon="tasks" title="No tasks in this view" description="Try another filter to see the rest of your tasks."><button class="button" onclick={() => { filter = 'all' }}>Show all tasks</button></EmptyState>
   {:else}
     <div class="ts-list">
-      <div class="ts-list-head"><span>Status / agent</span><span>Detail</span><span>Updated</span></div>
-      {#each tasks as t (t.id)}
-        <div class="ts-item">
+      {#each visibleTasks as t (t.id)}
+        <article class="ts-item" class:needs-input={t.status === 'needs_input'}>
           <div class="ts-line">
-            <span class="ts-status ts-{t.status}">{t.status.replaceAll('_', ' ')}</span>
-            <span class="ts-name">{t.agent_name || t.agent_id}</span>
+            <span class="badge" data-tone={tones[t.status]}>{labels[t.status] || t.status}</span>
+            <h2 class="ts-name">{t.agent_name || t.agent_id}</h2>
+            <time class="ts-time" datetime={t.updated_at || t.created_at}>{fmtTime(t.updated_at || t.created_at)}</time>
+            <div class="ts-actions">
             {#if activeStatuses.includes(t.status)}
-              <button class="ts-cancel" disabled={pending[t.id]} onclick={() => cancelTask(t.id)}>Cancel task</button>
+              <button class="button danger small" disabled={pending[t.id]} onclick={() => cancelTask(t.id)}>Cancel task</button>
             {/if}
-            {#if !showArchived && t.reported && !activeStatuses.includes(t.status)}<button class="ts-cancel" disabled={pending[t.id]} onclick={() => archiveTask(t.id)}>Archive task</button>{/if}
+            {#if !showArchived && t.reported && !activeStatuses.includes(t.status)}<button class="button quiet small" disabled={pending[t.id]} onclick={() => archiveTask(t.id)}><Icon name="archive" size={15} />Archive task</button>{/if}
+            </div>
           </div>
           <div class="ts-detail">
             <div class="ts-msg">{t.message}</div>
@@ -132,61 +145,45 @@
             {#if t.status === 'needs_input'}
               <div class="ts-input-row">
                 <input
-                  class="ts-input"
+                  class="input"
+                  aria-label={'Reply to ' + (t.agent_name || t.agent_id)}
                   placeholder="Reply to the task…"
                   bind:value={replies[t.id]}
                   onkeydown={(e) => { if (e.key === 'Enter' && !e.isComposing) replyToTask(t.id) }}
                 />
-                <button class="ts-send" onclick={() => replyToTask(t.id)}>Reply</button>
+                <button class="button primary" disabled={pending[t.id] || !replies[t.id]?.trim()} onclick={() => replyToTask(t.id)}>Reply</button>
               </div>
             {/if}
           </div>
-          <time class="ts-time" datetime={t.updated_at || t.created_at}>{fmtTime(t.updated_at || t.created_at)}</time>
-        </div>
+        </article>
       {/each}
     </div>
   {/if}
   {#if showArchived && !loading}
-    <button disabled={archiveOffset === 0} onclick={() => { archiveOffset = Math.max(0, archiveOffset - 100) }}>Previous archive page</button>
-    <button disabled={tasks.length < 100} onclick={() => { archiveOffset += 100 }}>Next archive page</button>
+    <div class="ts-pagination"><button class="button small" disabled={archiveOffset === 0} onclick={() => { archiveOffset = Math.max(0, archiveOffset - 100) }}>Previous archive page</button><button class="button small" disabled={tasks.length < 100} onclick={() => { archiveOffset += 100 }}>Next archive page</button></div>
   {/if}
-</div>
+</div></main>
 
 <style>
-  .ts-page { padding: 38px var(--page-pad) 64px; width: 100%; overflow-y: auto; }
-  .ts-head { max-width: var(--content-max); display: flex; justify-content: space-between; align-items: end; padding-bottom: 24px; }
-  .ts-kicker, .ts-count, .ts-list-head, .ts-status, .ts-time { font-family: var(--mono); }
-  .ts-kicker { color: var(--text-faint); font-size: 0.65rem; letter-spacing: 0.1em; }
-  .ts-title { font-size: 1.65rem; font-weight: 500; letter-spacing: -0.02em; margin: 3px 0 0; color: var(--text-base); }
-  .ts-count { font-size: 0.68rem; color: var(--text-muted); }
-  .ts-empty { color: var(--text-muted); padding: 24px 0; border-top: var(--rule); max-width: var(--content-max); font-size: 0.88rem; }
-  .ts-error { color: var(--text-base); border-top-color: var(--text-base); }
-  .ts-list { max-width: var(--content-max); border-top: 1px solid var(--border-strong); }
-  .ts-list-head, .ts-item { display: grid; grid-template-columns: 210px minmax(0, 1fr) 110px; gap: 24px; }
-  .ts-list-head { padding: 9px 0; border-bottom: var(--rule); color: var(--text-faint); font-size: 0.63rem; text-transform: uppercase; letter-spacing: 0.08em; }
-  .ts-item { padding: 18px 0 20px; border-bottom: var(--rule); align-items: start; }
-  .ts-line { display: flex; align-items: flex-start; flex-direction: column; gap: 4px; }
-  .ts-status { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); font-weight: 700; }
-  .ts-needs_input, .ts-failed { color: var(--text-base); }
-  .ts-name { font-weight: 650; font-size: 0.9rem; color: var(--text-base); }
-  .ts-time { font-size: 0.68rem; color: var(--text-muted); }
-  .ts-cancel { background: none; border: 0; border-bottom: 1px solid transparent; color: var(--text-muted); cursor: pointer; font: 0.66rem var(--mono); padding: 4px 0 0; }
-  .ts-cancel:hover { color: var(--accent); border-bottom-color: currentColor; }
-  .ts-msg { font-size: 0.88rem; color: var(--text-base); margin-bottom: 4px; white-space: pre-wrap; }
-  .ts-question { font-size: 0.85rem; color: var(--text-base); margin-top: 10px; padding-left: 12px; border-left: 2px solid var(--text-base); }
-  .ts-result { font-size: 0.85rem; color: var(--text-muted); margin-top: 4px; white-space: pre-wrap; }
-  .ts-replies { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; }
-  .ts-reply { font: 0.75rem var(--mono); color: var(--text-muted); }
-  .ts-input-row { display: flex; gap: 8px; margin-top: 10px; }
-  .ts-input { flex: 1; background: var(--bg-deep); border: 1px solid var(--border-strong); color: var(--text-base); border-radius: 1px; padding: 7px 10px; font-size: 0.85rem; }
-  .ts-input:focus { border-color: var(--accent); }
-  .ts-send { background: var(--accent); color: var(--bg-deep); border: none; border-radius: 1px; padding: 7px 14px; font-size: 0.85rem; cursor: pointer; }
-  .ts-send:hover { background: var(--accent-strong); }
-  @media (max-width: 720px) {
-    .ts-head { display: block; }
-    .ts-count { margin-top: 12px; }
-    .ts-list-head { display: none; }
-    .ts-item { grid-template-columns: 1fr; gap: 12px; }
-    .ts-line { padding-right: 0; }
-  }
+  .ts-toolbar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-6); flex-wrap: wrap; }
+  .ts-filter { display: flex; align-items: center; gap: var(--space-2); color: var(--text-muted); font-size: .8125rem; }
+  .ts-filter select { width: auto; }
+  .ts-list { border: var(--rule); border-radius: var(--radius); overflow: hidden; background: var(--bg-raised); }
+  .ts-item { padding: var(--space-5) var(--space-6); overflow-wrap: anywhere; }
+  .ts-item + .ts-item { border-top: var(--rule); }
+  .ts-item.needs-input { border-left: 3px solid var(--warning); }
+  .ts-line { display: flex; flex-wrap: wrap; gap: var(--space-3); align-items: center; margin-bottom: var(--space-3); }
+  .ts-name { margin: 0; font-size: .875rem; font-weight: 600; }
+  .ts-actions { display: flex; gap: var(--space-2); margin-left: auto; }
+  .ts-time { font-size: .6875rem; color: var(--text-muted); }
+  .ts-msg { font-size: .875rem; color: var(--text-base); white-space: pre-wrap; }
+  .ts-question { background: var(--warning-bg); color: var(--warning); padding: var(--space-3) var(--space-4); margin-top: var(--space-4); border-radius: var(--radius-sm); font-size: .875rem; }
+  .ts-result { font-size: .875rem; color: var(--text-muted); white-space: pre-wrap; margin-top: var(--space-3); }
+  .ts-failed { color: var(--danger); }
+  .ts-replies { margin-top: var(--space-4); padding-left: var(--space-4); border-left: var(--rule); }
+  .ts-reply { font-size: .8125rem; color: var(--text-muted); }
+  .ts-input-row { display: flex; gap: var(--space-2); margin-top: var(--space-4); max-width: 600px; }
+  .ts-pagination { display: flex; flex-wrap: wrap; gap: var(--space-3); margin-top: var(--space-6); }
+  .retry { margin-top: var(--space-4); }
+  @media (max-width: 640px) { .ts-item { padding: var(--space-4); } .ts-actions { margin-left: 0; } .ts-filter { width: 100%; } .ts-filter select { flex: 1; } }
 </style>

@@ -1,10 +1,15 @@
 <script>
   import { api } from '../lib/api.js'
+  import Icon from '../components/Icon.svelte'
+  import EmptyState from '../components/EmptyState.svelte'
 
   let accounts = $state([])
   let triggers = $state([])
   let runs = $state([])
   let loading = $state(true)
+  let pageError = $state('')
+  let savingTrigger = $state(false)
+  let pending = $state({})
 
   let showAccountForm = $state(false)
   let editingAccountID = $state('')
@@ -40,9 +45,10 @@
       accounts = a
       triggers = t
       runs = r
+      pageError = ''
     } catch (e) {
       console.error('Failed to load email data', e)
-      acctError = e.message
+      pageError = e.message
     } finally {
       loading = false
     }
@@ -53,6 +59,7 @@
       runs = await api.get('/api/triggers/runs')
     } catch (e) {
       console.error('Failed to load runs', e)
+      pageError = 'Run history could not be refreshed. ' + e.message
     }
   }
 
@@ -92,13 +99,15 @@
   }
 
   async function testAccount(id) {
+    if (pending[id]) return
+    pending[id] = true
     acctResults = { ...acctResults, [id]: 'testing…' }
     try {
       const res = await api.post('/api/email/accounts/' + id + '/test', {})
       acctResults = { ...acctResults, [id]: res.ok ? 'OK' : 'Failed: ' + res.error }
     } catch (e) {
       acctResults = { ...acctResults, [id]: 'Failed: ' + e.message }
-    }
+    } finally { pending[id] = false }
   }
 
   async function deleteAccount(id) {
@@ -108,6 +117,7 @@
       await loadAll()
     } catch (e) {
       console.error('Failed to delete account', e)
+      pageError = e.message
     }
   }
 
@@ -147,6 +157,8 @@
   }
 
   async function saveTrigger() {
+    if (savingTrigger) return
+    savingTrigger = true
     triggerError = ''
     const filters = triggerForm.filters
       .map((f) => ({ field: f.field, contains: f.contains }))
@@ -162,7 +174,7 @@
       await loadAll()
     } catch (e) {
       triggerError = e.message
-    }
+    } finally { savingTrigger = false }
   }
 
   async function toggleEnabled(t) {
@@ -171,6 +183,7 @@
       await loadAll()
     } catch (e) {
       console.error('Failed to update trigger', e)
+      pageError = e.message
     }
   }
 
@@ -182,6 +195,7 @@
       await loadAll()
     } catch (e) {
       console.error('Failed to delete trigger', e)
+      pageError = e.message
     }
   }
 
@@ -210,27 +224,25 @@
   }
 </script>
 
-<div class="et-page">
+<main class="page" aria-labelledby="email-title"><div class="page-inner">
+  <header class="page-heading"><div><p class="eyebrow">Manage</p><h1 class="page-title" id="email-title">Email</h1><p class="page-description">Turn incoming mail into useful work, with rules you control.</p></div></header>
   {#if loading}
-    <div class="et-empty">Loading…</div>
+    <EmptyState loading title="Loading your email setup" />
   {:else}
-    <header class="et-header">
-      <div class="et-kicker">AUTOMATION / INBOUND MAIL</div>
-      <h1>Email</h1>
-      <p>Accounts, matching rules, and execution history.</p>
-    </header>
+    {#if pageError}<div class="notice error" role="alert"><Icon name="warning" /><span>{pageError}</span><button class="button small" onclick={loadAll}>Try again</button></div>{/if}
     <section class="card">
       {#if acctError && !showAccountForm}<div class="form-error" role="alert">{acctError}</div>{/if}
       <div class="card-head">
-        <h2>Email accounts</h2>
-        <button class="btn" onclick={openAccountForm}>{showAccountForm ? 'Cancel' : '+ Add account'}</button>
+        <div><h2>Email accounts <span class="badge">{accounts.length}</span></h2><p class="section-description">Mailboxes Eve checks for new messages.</p></div>
+        <button class="button small" onclick={openAccountForm}>{#if !showAccountForm}<Icon name="plus" size={16} />{/if}{showAccountForm ? 'Cancel' : 'Add account'}</button>
       </div>
 
       {#if showAccountForm}
         <div class="panel">
+          <h3>{editingAccountID ? 'Edit email account' : 'Connect an email account'}</h3>
           <div class="form-grid">
             <label>Address
-              <input bind:value={acctForm.address} placeholder="inbox@example.com" />
+              <input type="email" bind:value={acctForm.address} placeholder="inbox@example.com" />
             </label>
             <label>IMAP host
               <input bind:value={acctForm.host} placeholder="imap.example.com" />
@@ -242,7 +254,7 @@
               <input bind:value={acctForm.username} placeholder="inbox@example.com" />
             </label>
             <label>Password / app password
-              <input type="password" bind:value={acctForm.password} placeholder="••••••••" />
+              <input type="password" autocomplete="new-password" bind:value={acctForm.password} placeholder={editingAccountID ? 'Leave blank to keep the existing password' : 'App password'} />
             </label>
             <label class="check">
               <input type="checkbox" bind:checked={acctForm.use_tls} />
@@ -254,12 +266,13 @@
             <label class="check"><input type="checkbox" bind:checked={acctForm.enabled} />Enabled</label>
           </div>
           {#if acctError}<div class="form-error">{acctError}</div>{/if}
-          <button class="btn primary" onclick={saveAccount} disabled={savingAccount}>{savingAccount ? 'Saving…' : 'Save account'}</button>
+          <p class="hint">Owner commands also need a trusted mail gateway that verifies sender provenance. Leave the authentication server ID empty if this mailbox is only for automation.</p>
+          <button class="button primary" onclick={saveAccount} disabled={savingAccount}>{savingAccount ? 'Saving…' : 'Save account'}</button>
         </div>
       {/if}
 
       {#if accounts.length === 0}
-        <div class="et-empty">No accounts yet.</div>
+        <EmptyState icon="email" title="Your inbox, with a little help" description="Connect an email account so Eve can check incoming messages and run the rules you choose." />
       {:else}
         <div class="list">
           {#each accounts as a}
@@ -267,7 +280,7 @@
               <div class="row-main">
                 <div class="row-title">
                   {a.address}
-                  <span class="tag" class:off={!a.enabled}>{a.enabled ? 'enabled' : 'disabled'}</span>
+                  <span class="badge" data-tone={a.enabled ? 'success' : undefined}>{a.enabled ? 'Enabled' : 'Disabled'}</span>
                 </div>
                 <div class="row-sub">{a.host}:{a.port} · {a.username}</div>
                 {#if acctResults[a.id]}
@@ -275,9 +288,9 @@
                 {/if}
               </div>
               <div class="row-actions">
-                <button class="btn" onclick={() => editAccount(a)}>Edit</button>
-                <button class="btn" onclick={() => testAccount(a.id)}>Test</button>
-                <button class="btn danger" onclick={() => deleteAccount(a.id)}>Delete</button>
+                <button class="button small" onclick={() => editAccount(a)}>Edit</button>
+                <button class="button small" disabled={pending[a.id]} onclick={() => testAccount(a.id)}>{pending[a.id] ? 'Testing…' : 'Test connection'}</button>
+                <button class="button danger small" onclick={() => deleteAccount(a.id)}>Delete</button>
               </div>
             </div>
           {/each}
@@ -287,12 +300,13 @@
 
     <section class="card">
       <div class="card-head">
-        <h2>Triggers</h2>
-        <button class="btn" onclick={openNewTrigger} disabled={accounts.length === 0}>+ New trigger</button>
+        <div><h2>Automation rules <span class="badge">{triggers.length}</span></h2><p class="section-description">When a message matches, tell Eve what to do.</p></div>
+        <button class="button small" onclick={openNewTrigger} disabled={accounts.length === 0}><Icon name="plus" size={16} />New rule</button>
       </div>
 
       {#if editorOpen}
         <div class="panel">
+          <h3>{editingId ? 'Edit automation rule' : 'New automation rule'}</h3>
           <div class="form-grid">
             <label>Account
               <select bind:value={triggerForm.account_id}>
@@ -310,23 +324,23 @@
             <div class="field-label">Filters <span class="hint">all must match</span></div>
             {#each triggerForm.filters as f, i}
               <div class="filter-row">
-                <select bind:value={f.field}>
+                <select aria-label={'Filter field ' + (i + 1)} bind:value={f.field}>
                   <option value="sender">sender</option>
                   <option value="recipient">recipient</option>
                   <option value="subject">subject</option>
                   <option value="body">body</option>
                 </select>
                 <span class="hint">contains</span>
-                <input bind:value={f.contains} placeholder="text to match" />
-                <button class="btn icon danger" onclick={() => removeFilter(i)} aria-label="Remove filter">✕</button>
+                <input aria-label={'Filter text ' + (i + 1)} bind:value={f.contains} placeholder="Text to match" />
+                <button class="button danger small" onclick={() => removeFilter(i)} aria-label="Remove filter"><Icon name="close" size={16} /></button>
               </div>
             {/each}
-            <button class="btn" onclick={addFilter}>+ Add filter</button>
+            <button class="button small" onclick={addFilter}><Icon name="plus" size={16} />Add filter</button>
           </div>
 
           <div class="field">
-            <div class="field-label">Agent prompt</div>
-            <textarea bind:value={triggerForm.prompt} rows="4" placeholder="Summarize this email and extract the key action items."></textarea>
+            <label class="field-label" for="rule-prompt">Instructions for Eve</label>
+            <textarea id="rule-prompt" bind:value={triggerForm.prompt} rows="4" placeholder="Summarize this email and extract the key action items."></textarea>
           </div>
 
           <label class="check">
@@ -336,14 +350,14 @@
 
           {#if triggerError}<div class="form-error">{triggerError}</div>{/if}
           <div class="form-actions">
-            <button class="btn primary" onclick={saveTrigger}>{editingId ? 'Save changes' : 'Create trigger'}</button>
-            <button class="btn" onclick={closeEditor}>Cancel</button>
+            <button class="button primary" disabled={savingTrigger} onclick={saveTrigger}>{savingTrigger ? 'Saving…' : editingId ? 'Save changes' : 'Create rule'}</button>
+            <button class="button" onclick={closeEditor}>Cancel</button>
           </div>
         </div>
       {/if}
 
       {#if triggers.length === 0}
-        <div class="et-empty">No triggers yet.</div>
+        <EmptyState icon="sparkle" title="Make the routine a little easier" description={accounts.length ? 'Create a rule to summarize mail, collect action items, or follow up on messages that matter.' : 'Connect an account first, then choose which messages should start an automation.'} />
       {:else}
         <div class="list">
           {#each triggers as t}
@@ -351,15 +365,15 @@
               <div class="row-main">
                 <div class="row-title">
                   {t.name}
-                  <span class="tag" class:off={!t.enabled}>{t.enabled ? 'enabled' : 'disabled'}</span>
+                  <span class="badge" data-tone={t.enabled ? 'success' : undefined}>{t.enabled ? 'Enabled' : 'Disabled'}</span>
                 </div>
                 <div class="row-sub">{accountName(t.account_id)} · {filtersSummary(t)}</div>
               </div>
               <div class="row-actions">
-                <button class="btn" onclick={() => { testingId = t.id; testOut = null; sample = { from: '', to: '', subject: '', body: '' } }}>Test</button>
-                <button class="btn" onclick={() => editTrigger(t)}>Edit</button>
-                <button class="btn" onclick={() => toggleEnabled(t)}>{t.enabled ? 'Disable' : 'Enable'}</button>
-                <button class="btn danger" onclick={() => deleteTrigger(t.id)}>Delete</button>
+                <button class="button small" onclick={() => { testingId = t.id; testOut = null; sample = { from: '', to: '', subject: '', body: '' } }}>Test rule</button>
+                <button class="button small" onclick={() => editTrigger(t)}>Edit</button>
+                <button class="button small" onclick={() => toggleEnabled(t)}>{t.enabled ? 'Disable' : 'Enable'}</button>
+                <button class="button danger small" onclick={() => deleteTrigger(t.id)}>Delete</button>
               </div>
             </div>
 
@@ -397,7 +411,7 @@
                     {/if}
                   </div>
                 {/if}
-                <button class="btn primary" onclick={() => testTrigger(t)}>Run test</button>
+                <div class="form-actions"><button class="button primary" onclick={() => testTrigger(t)}>Run test</button><button class="button" onclick={() => { testingId = null }}>Close test</button></div>
               </div>
             {/if}
           {/each}
@@ -407,10 +421,10 @@
 
     <section class="card">
       <div class="card-head">
-        <h2>Runs</h2>
+        <div><h2>Recent runs <span class="badge">{runs.length}</span></h2><p class="section-description">The work your rules have started.</p></div>
       </div>
       {#if runs.length === 0}
-        <div class="et-empty">No runs yet.</div>
+        <EmptyState icon="clock" title="No rules have run yet" description="When an incoming message matches a rule, its progress and result will appear here." />
       {:else}
         <div class="list">
           {#each runs as run}
@@ -418,11 +432,11 @@
               <div class="row-main">
                 <div class="row-title">
                   {run.trigger_name || run.trigger_id}
-                  <span class="tag" class:ok={run.status === 'completed'} class:fail={run.status === 'failed'}>{run.status}</span>
+                  <span class="badge" data-tone={run.status === 'completed' ? 'success' : run.status === 'failed' ? 'error' : 'accent'}>{run.status}</span>
                 </div>
                 <div class="row-sub">{fmtTime(run.created_at)} · {run.account_address || run.account_id}</div>
                 <div class="row-sub">From: {run.email?.from} · Subject: {run.email?.subject}</div>
-                <button class="btn" onclick={() => (expandedRun = expandedRun === run.id ? null : run.id)}>
+                <button class="button quiet small" aria-expanded={expandedRun === run.id} onclick={() => (expandedRun = expandedRun === run.id ? null : run.id)}>
                   {expandedRun === run.id ? 'Hide details' : 'Show details'}
                 </button>
                 {#if expandedRun === run.id}
@@ -446,197 +460,45 @@
       {/if}
     </section>
   {/if}
-</div>
+</div></main>
 
 <style>
-  .et-page {
-    flex: 1;
-    overflow-y: auto;
-    padding: 38px var(--page-pad) 64px;
-    display: flex;
-    flex-direction: column;
-    gap: 0;
-    background: var(--bg-base);
-  }
-  .et-header { max-width: var(--content-max); padding-bottom: 28px; }
-  .et-kicker { font: 0.65rem var(--mono); letter-spacing: 0.1em; color: var(--text-faint); }
-  .et-header h1 { font-size: 1.65rem; line-height: 1.2; font-weight: 500; letter-spacing: -0.02em; margin: 3px 0 5px; }
-  .et-header p { color: var(--text-muted); margin: 0; font-size: 0.88rem; }
-  .card {
-    max-width: var(--content-max);
-    border-top: 1px solid var(--border-strong);
-    padding: 26px 0 38px;
-  }
-  .card-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 18px;
-  }
-  .card-head h2 {
-    margin: 0;
-    font: 700 0.68rem var(--mono);
-    text-transform: uppercase;
-    letter-spacing: 0.09em;
-    color: var(--text-muted);
-  }
-  .et-empty {
-    color: var(--text-muted);
-    font-size: 0.85rem;
-    padding: 8px 0;
-  }
-  .list {
-    display: flex;
-    flex-direction: column;
-    border-top: var(--rule);
-  }
-  .row {
-    border-bottom: var(--rule);
-    padding: 16px 0;
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-  }
+  .card { border-top: var(--rule); padding: var(--space-6) 0 var(--space-10); }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-5); }
+  .card-head h2 { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); margin: 0; font-size: 1rem; font-weight: 600; letter-spacing: -.015em; }
+  .section-description { color: var(--text-muted); font-size: .8125rem; margin: var(--space-1) 0 0; }
+  .list { border: var(--rule); border-radius: var(--radius); background: var(--bg-raised); }
+  .row { display: flex; align-items: flex-start; gap: var(--space-4); padding: var(--space-5); }
+  .row + .row { border-top: var(--rule); }
   .row-main { flex: 1; min-width: 0; }
-  .row-actions {
-    display: flex;
-    gap: 6px;
-    flex-shrink: 0;
-  }
-  .row-title {
-    font-size: 0.88rem;
-    font-weight: 600;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .row-sub {
-    font: 0.72rem var(--mono);
-    color: var(--text-muted);
-    margin-top: 3px;
-    word-break: break-word;
-  }
-  .tag {
-    font: 600 0.64rem var(--mono);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-base);
-    padding: 2px 0;
-  }
-  .tag.off { color: var(--text-faint); }
-  .tag.ok { color: var(--text-base); }
-  .tag.fail { color: var(--text-base); text-decoration: underline; text-decoration-thickness: 2px; }
-
-  .panel {
-    border: 1px solid var(--border-strong);
-    border-radius: 2px;
-    padding: 18px;
-    margin-bottom: 20px;
-    background: var(--bg-deep);
-  }
-  .panel.sub { margin-bottom: 0; }
-  .form-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 12px;
-    margin-bottom: 12px;
-  }
-  .form-grid label {
-    display: flex;
-    flex-direction: column;
-    gap: 5px;
-    font: 0.7rem var(--mono);
-    color: var(--text-muted);
-  }
-  .field { margin-bottom: 12px; }
-  .field-label {
-    font: 0.7rem var(--mono);
-    color: var(--text-muted);
-    margin-bottom: 6px;
-  }
-  .hint {
-    font-size: 0.7rem;
-    color: var(--text-muted);
-    font-weight: 400;
-  }
-  input, select, textarea {
-    background: var(--bg-base); border: 1px solid var(--border-strong); border-radius: 1px;
-    color: var(--text-base);
-    font-family: inherit;
-    font-size: 0.85rem;
-    padding: 7px 9px;
-    width: 100%;
-    outline: none;
-  }
-  input:focus, select:focus, textarea:focus {
-    border-color: var(--accent);
-  }
-  textarea { resize: vertical; line-height: 1.5; }
-  .check {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 0.82rem;
-    color: var(--text-base);
-    margin-bottom: 12px;
-  }
-  .check input { width: auto; }
-  .filter-row {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    margin-bottom: 8px;
-  }
+  .row-actions { display: flex; gap: var(--space-2); min-width: 0; max-width: 100%; flex-wrap: wrap; }
+  .row-title { font-size: .875rem; font-weight: 600; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); overflow-wrap: anywhere; }
+  .row-sub { font-size: .75rem; color: var(--text-muted); margin-top: var(--space-2); overflow-wrap: anywhere; }
+  .panel { background: var(--bg-deep); padding: var(--space-6); border: var(--rule); border-radius: var(--radius); margin-bottom: var(--space-6); }
+  .panel h3 { font-size: 1rem; font-weight: 550; margin: 0 0 var(--space-5); }
+  .panel.sub { margin: 0 var(--space-4) var(--space-4); }
+  .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); margin-bottom: var(--space-5); }
+  .form-grid label { display: flex; flex-direction: column; gap: var(--space-2); font-size: .8125rem; font-weight: 500; }
+  .field { margin-bottom: var(--space-5); }
+  .field-label { display: block; color: var(--text-base); font-size: .8125rem; font-weight: 500; margin-bottom: var(--space-2); }
+  .hint { color: var(--text-muted); font-size: .75rem; font-weight: 400; }
+  input:not([type='checkbox']), select, textarea { width: 100%; min-height: 40px; padding: var(--space-2) var(--space-3); border: 1px solid var(--border-strong); background: var(--bg-raised); border-radius: var(--radius-sm); color: var(--text-base); font-size: .875rem; font-weight: 400; }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  textarea { resize: vertical; line-height: 1.6; }
+  .check, .form-grid label.check { display: flex; flex-direction: row; align-items: center; gap: var(--space-2); min-height: 40px; font-size: .8125rem; }
+  .filter-row { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-3); }
   .filter-row select { width: 130px; flex-shrink: 0; }
   .filter-row input { flex: 1; }
-  .filter-row .btn { flex-shrink: 0; }
-  .form-error {
-    color: var(--text-base); border-left: 2px solid var(--text-base); padding-left: 10px;
-    font-size: 0.8rem;
-    margin: 8px 0;
-  }
-  .form-actions {
-    display: flex;
-    gap: 8px;
-    margin-top: 4px;
-  }
-  .test-result { color: var(--text-base); }
-  .test-out { margin-bottom: 12px; }
-  .prompt-preview pre, .run-detail pre {
-    background: var(--bg-deep);
-    border: 1px solid var(--border);
-    border-radius: 1px;
-    padding: 12px;
-    overflow-x: auto;
-    font-size: 0.78rem;
-    line-height: 1.5;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-  .run-detail { margin-top: 10px; }
-  .run-detail .err { color: var(--text-base); border-left: 2px solid var(--text-base); }
-  .btn {
-    background: transparent; border: 1px solid var(--border-strong); color: var(--accent); border-radius: 1px;
-    padding: 6px 11px;
-    font-family: inherit;
-    font-size: 0.8rem;
-    cursor: pointer;
-    transition: background 0.12s, border-color 0.12s;
-    white-space: nowrap;
-  }
-  .btn:hover { background: var(--accent-dim); border-color: var(--accent); }
-  .btn:disabled { opacity: 0.5; pointer-events: none; }
-  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--bg-deep); }
-  .btn.primary:hover { background: var(--accent-strong); }
-  .btn.danger { color: var(--text-muted); }
-  .btn.danger:hover { color: var(--accent); }
-  .btn.icon { padding: 6px 9px; }
-  @media (max-width: 700px) {
-    .row { display: block; }
-    .row-actions { margin-top: 14px; flex-wrap: wrap; }
-    .filter-row { flex-wrap: wrap; }
-    .filter-row select { width: 100%; }
-  }
+  .filter-row .button { flex-shrink: 0; }
+  .form-error { color: var(--danger); background: var(--danger-bg); padding: var(--space-3); border-radius: var(--radius-sm); font-size: .8125rem; margin-block: var(--space-3); }
+  .form-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-4); }
+  .test-result { color: var(--accent-text); }
+  .test-out { margin-bottom: var(--space-4); }
+  .prompt-preview pre, .run-detail pre { background: var(--bg-deep); border: var(--rule); border-radius: var(--radius-sm); padding: var(--space-4); max-width: 100%; overflow-x: auto; font-family: var(--mono); font-size: .75rem; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .run-detail { margin-top: var(--space-4); }
+  .run-detail .err { color: var(--danger); background: var(--danger-bg); }
+  .row-main > .button { margin-top: var(--space-3); }
+  .notice { margin-bottom: var(--space-6); }
+  @media (max-width: 1000px) { .row { flex-wrap: wrap; } .row-main { flex-basis: 100%; } }
+  @media (max-width: 640px) { .card-head { flex-wrap: wrap; } .form-grid { grid-template-columns: 1fr; } .panel { padding: var(--space-4); } .row { padding: var(--space-4); } .filter-row { flex-wrap: wrap; } .filter-row select { width: 100%; } .filter-row .hint { display: none; } .panel.sub { margin-inline: var(--space-2); } }
 </style>

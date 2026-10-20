@@ -1,249 +1,118 @@
 <script>
   import { api } from '../lib/api.js'
+  import Icon from '../components/Icon.svelte'
+  import EmptyState from '../components/EmptyState.svelte'
 
   let status = $state(null)
   let loading = $state(true)
   let error = $state('')
   let compacting = $state(false)
   let now = $state(Date.now())
+  let version = 0
 
   $effect(() => {
     load()
-    const iv = setInterval(() => {
-      now = Date.now()
-      load()
-    }, 5000)
-    return () => clearInterval(iv)
+    const timer = setInterval(() => { now = Date.now(); load() }, 5000)
+    return () => { version++; clearInterval(timer) }
   })
 
   async function load() {
+    const request = ++version
     try {
-      status = await api.get('/api/context')
+      const result = await api.get('/api/context')
+      if (request !== version) return
+      status = result
       error = ''
-    } catch (e) {
-      error = e.message
-    } finally {
-      loading = false
-    }
+    } catch (e) { if (request === version) error = e.message }
+    finally { if (request === version) loading = false }
   }
 
   async function compactNow() {
+    if (compacting) return
     compacting = true
-    try {
-      await api.post('/api/context/compact', {})
-      await load()
-    } catch (e) {
-      error = e.message
-    } finally {
-      compacting = false
-    }
+    try { await api.post('/api/context/compact', {}); await load() }
+    catch (e) { error = e.message }
+    finally { compacting = false }
   }
 
-  function pressureClass(p) {
-    if (p >= 0.9) return 'warn'
-    if (p >= 0.7) return 'mid'
-    return 'ok'
+  const number = value => Number(value || 0).toLocaleString()
+  const category = value => String(value || 'Fact').replaceAll('_', ' ').toLowerCase()
+  function fmtTime(value) {
+    if (!value || String(value).startsWith('0001')) return 'Not yet'
+    const elapsed = now - new Date(value).getTime()
+    if (elapsed < 60000) return 'Just now'
+    if (elapsed < 3600000) return Math.floor(elapsed / 60000) + 'm ago'
+    if (elapsed < 86400000) return Math.floor(elapsed / 3600000) + 'h ago'
+    return new Date(value).toLocaleDateString()
   }
-
-  function fmtTime(t) {
-    if (!t || String(t).startsWith('0001')) return 'never'
-    const d = Date.now() - new Date(t).getTime()
-    if (d < 60000) return 'just now'
-    if (d < 3600000) return Math.floor(d / 60000) + 'm ago'
-    if (d < 86400000) return Math.floor(d / 3600000) + 'h ago'
-    return new Date(t).toLocaleDateString()
-  }
-
-  function fmtDate(t) {
-    return new Date(t).toLocaleString()
-  }
-
-  const catColors = {
-    USER_PREFERENCES: 'pref',
-    DECISIONS: 'decision',
-    CONSTRAINTS: 'constraint',
-    FACTS: 'fact',
-    NAMING: 'naming',
-  }
-
-  const arr = (x) => (x || [])
 </script>
 
-<div class="ctx-page">
-  {#if loading}
-    <div class="ctx-empty">Loading context…</div>
-  {:else if error}
-    <div class="ctx-empty ctx-error">{error}</div>
-  {:else if !status}
-    <div class="ctx-empty">No context yet.</div>
+<main class="page" aria-labelledby="context-title"><div class="page-inner">
+  <header class="page-heading"><div><p class="eyebrow">Manage</p><h1 class="page-title" id="context-title">Context</h1><p class="page-description">The memories and conversation history Eve carries forward.</p></div><button class="button" onclick={compactNow} disabled={!status?.enabled || compacting || status?.historian?.running}><Icon name="context" size={16} />{compacting || status?.historian?.running ? 'Summarizing…' : 'Summarize history'}</button></header>
+  {#if loading}<EmptyState loading title="Gathering context" />
   {:else}
-    <div class="ctx-section">
-      <div class="ctx-kicker">SYSTEM / WORKING MEMORY</div>
-      <h2 class="ctx-page-title">Context</h2>
-      <h3 class="ctx-title">Status</h3>
-      <div class="ctx-banner">Local history prepared for new or replacement runs. Existing persistent runs retain their own context; this is not their live token usage.</div>
-      {#if status.bootstrap_preview_available}<div class="ctx-banner">Next-run preview after task context and safety limits: {status.bootstrap_preview_messages} messages, approximately {status.bootstrap_preview_tokens.toLocaleString()} tokens. The breakdown below describes the local renderer before those final limits.</div>{/if}
-      {#if !status.enabled}
-        <div class="ctx-banner">Context management is disabled (no historian agent configured).</div>
-      {/if}
-      <div class="status-grid">
-        <div class="status-card">
-          <div class="status-label">Context budget</div>
-          <div class="budget-bar">
-            <div class="budget-fill {pressureClass(status.pressure)}" style="width:{Math.min(status.pressure * 100, 100)}%"></div>
-          </div>
-          <div class="status-sub">
-            {status.rendered_tokens.toLocaleString()} / {status.budget_tokens.toLocaleString()} tokens
-            ({Math.round(status.pressure * 100)}%)
-          </div>
-        </div>
-        <div class="status-card">
-          <div class="status-label">Sources</div>
-          <div class="src-row"><span>Summaries</span><b>{status.sources.compartments.toLocaleString()}</b></div>
-          <div class="src-row"><span>Memory</span><b>{status.sources.memories.toLocaleString()}</b></div>
-          <div class="src-row"><span>Raw tail</span><b>{status.sources.raw_tail.toLocaleString()}</b></div>
-        </div>
-        <div class="status-card">
-          <div class="status-label">Historian</div>
-          <div class="src-row">
-            <span>Status</span>
-            <b>{status.historian.running ? 'running…' : 'idle'}</b>
-          </div>
-          <div class="src-row"><span>Last run</span><b>{fmtTime(status.historian.last_run_at)}</b></div>
-          <div class="src-row">
-            <span>Unsummarized</span>
-            <b>{status.historian.unsummarized_tokens.toLocaleString()} / {status.historian.trigger_threshold.toLocaleString()} tokens</b>
-          </div>
-          <div class="src-row"><span>Boundary msg</span><b>{status.historian.boundary_msg_id || '—'}</b></div>
-          {#if status.historian.last_error}
-            <div class="hist-error" title="{status.historian.last_error}">last error: {status.historian.last_error}</div>
-          {/if}
-        </div>
-        <div class="status-card">
-          <div class="status-label">Coverage</div>
-          <div class="src-row"><span>Total messages</span><b>{status.coverage.total_messages}</b></div>
-          <div class="src-row"><span>Summarized</span><b>{status.coverage.compartmentalized}</b></div>
-          <div class="src-row"><span>Raw</span><b>{status.coverage.raw}</b></div>
-        </div>
+    {#if error}<div class="notice error" role="alert"><Icon name="warning" /><span>{error}</span><button class="button small" onclick={load}>Try again</button></div>{/if}
+    {#if status}
+      <div class="context-overview">
+        <section class="budget-panel" aria-labelledby="budget-title">
+          <div class="section-header"><h2 class="section-title" id="budget-title">History budget</h2><span class="badge" data-tone={(status.pressure || 0) > .9 ? 'warning' : 'accent'}>{Math.round((status.pressure || 0) * 100)}% estimated</span></div>
+          <div class="budget-value">{number(status.rendered_tokens)}<span> / {number(status.budget_tokens)} tokens</span></div>
+          <progress max={Math.max(1, status.budget_tokens || 0)} value={Math.min(status.rendered_tokens || 0, status.budget_tokens || 0)} aria-label="Estimated local history budget"></progress>
+          <p class="budget-description">Local history prepared for a new or replacement run—not the live context of an existing run.</p>
+          <dl class="source-list"><div><dt><span class="source-dot summaries"></span>Summaries</dt><dd>{number(status.sources?.compartments)}</dd></div><div><dt><span class="source-dot memories"></span>Memories</dt><dd>{number(status.sources?.memories)}</dd></div><div><dt><span class="source-dot history"></span>Recent messages</dt><dd>{number(status.sources?.raw_tail)}</dd></div></dl>
+        </section>
+        <section class="historian-panel" aria-labelledby="historian-title"><div class="section-header"><h2 class="section-title" id="historian-title">History summaries</h2><span class="badge" data-tone={status.historian?.running ? 'accent' : undefined}>{!status.enabled ? 'Not configured' : status.historian?.running ? 'Working' : 'Ready'}</span></div><p>Eve keeps recent messages intact and condenses older history when a historian is configured.</p><dl><div><dt>Last summary</dt><dd>{fmtTime(status.historian?.last_run_at)}</dd></div><div><dt>Messages retained</dt><dd>{number(status.coverage?.total_messages)}</dd></div><div><dt>Already summarized</dt><dd>{number(status.coverage?.compartmentalized)}</dd></div></dl>{#if status.historian?.last_error}<div class="notice error" role="status">{status.historian.last_error}</div>{/if}</section>
       </div>
-      <div class="ctx-actions">
-        <button class="compact-btn" onclick={compactNow} disabled={compacting || status.historian.running}>
-          {compacting || status.historian.running ? 'Compacting…' : 'Compact now'}
-        </button>
-      </div>
-    </div>
-
-    <div class="ctx-section">
-      <h2 class="ctx-title">Compartments <span class="count-badge">{arr(status.compartments).length}</span></h2>
-      {#if arr(status.compartments).length === 0}
-        <div class="ctx-empty">Nothing summarized yet. The historian runs automatically once the conversation grows past the trigger threshold.</div>
-      {:else}
-        <div class="comp-list">
-          {#each arr(status.compartments) as c}
-            <div class="comp-card">
-              <div class="comp-head">
-                <span class="tier-badge tier-{c.tier}">{c.tier}</span>
-                <span class="comp-range">msgs {c.start_msg_id}–{c.end_msg_id}</span>
-                <span class="comp-importance">imp {c.importance}</span>
-                <span class="comp-date">{fmtDate(c.created_at)}</span>
-              </div>
-              <div class="comp-summary">{c.summary}</div>
-              {#if arr(c.facts).length > 0}
-                <div class="comp-facts">
-                  {#each arr(c.facts) as f}
-                    <span class="fact-chip cat-{catColors[f.category] || 'fact'}">{f.category}: {f.content}</span>
-                  {/each}
-                </div>
-              {/if}
-            </div>
-          {/each}
-        </div>
-      {/if}
-    </div>
-
-    <div class="ctx-section">
-      <h2 class="ctx-title">Memories <span class="count-badge">{arr(status.memories).length}</span></h2>
-      {#if arr(status.memories).length === 0}
-        <div class="ctx-empty">No memories captured yet. Durable facts from your conversation appear here.</div>
-      {:else}
-        <div class="mem-list">
-          {#each arr(status.memories) as m}
-            <div class="mem-row">
-              <span class="cat-chip cat-{catColors[m.category] || 'fact'}">{m.category}</span>
-              <span class="mem-content">{m.content}</span>
-              <span class="mem-imp">imp {m.importance}</span>
-            </div>
-          {/each}
-        </div>
-      {/if}
-    </div>
+      <details class="context-explainer"><summary><Icon name="info" size={16} />What these numbers mean</summary><div><p>The estimate above describes the local renderer before final message and byte limits. Existing persistent runs keep their own context; these are not live AgentFoundry token counts.</p>{#if status.bootstrap_preview_available}<p>After adding task context and applying safety limits, the next-run preview contains <strong>{number(status.bootstrap_preview_messages)} messages</strong> and approximately <strong>{number(status.bootstrap_preview_tokens)} tokens</strong>.</p>{/if}{#if !status.enabled}<p>Automatic summarization is off. Configure HISTORIAN_AGENT_ID on the server to enable it.</p>{/if}</div></details>
+      <section class="memory-section" aria-labelledby="memories-title"><div class="section-header"><h2 class="section-title" id="memories-title">Durable memories <span class="badge">{status.memories?.length || 0}</span></h2><span class="section-note">Useful details, kept for later</span></div>
+        {#if !status.memories?.length}<EmptyState icon="context" title="Memories start with a conversation" description="Preferences, decisions, and useful facts captured from your conversations will appear here." />
+        {:else}<div class="memory-list">{#each status.memories as memory}<article class="memory-row"><span class="badge memory-category">{category(memory.category)}</span><p>{memory.content}</p><span class="importance" title="Importance assigned during memory capture">Importance {memory.importance}</span></article>{/each}</div>{/if}
+      </section>
+      <section class="summary-section" aria-labelledby="summaries-title"><div class="section-header"><h2 class="section-title" id="summaries-title">Conversation summaries <span class="badge">{status.compartments?.length || 0}</span></h2></div>
+        {#if !status.compartments?.length}<EmptyState icon="archive" title="Nothing summarized yet" description="As your conversation grows, older messages can become concise summaries without losing the recent thread." />
+        {:else}<div class="summary-list">{#each status.compartments as compartment}<details class="summary-row"><summary><Icon name="chevron" size={16} /><span>Messages {compartment.start_msg_id}–{compartment.end_msg_id}</span><span class="badge">{compartment.tier === 'dropped' ? 'Not included' : compartment.tier.toUpperCase()}</span><time datetime={compartment.created_at}>{fmtTime(compartment.created_at)}</time></summary><div class="summary-body"><p>{compartment.summary}</p>{#if compartment.facts?.length}<ul>{#each compartment.facts as fact}<li><strong>{category(fact.category)}:</strong> {fact.content}</li>{/each}</ul>{/if}</div></details>{/each}</div>{/if}
+      </section>
+    {:else}<EmptyState icon="context" title="No context available" description="Open a conversation with Eve to get started." />{/if}
   {/if}
-</div>
+</div></main>
 
 <style>
-  .ctx-page { padding: 38px var(--page-pad) 64px; overflow-y: auto; height: 100%; width: 100%; }
-  .ctx-section { max-width: var(--content-max); padding-bottom: 38px; margin-bottom: 38px; border-bottom: var(--rule); }
-  .ctx-section:last-child { margin-bottom: 0; }
-  .ctx-kicker { color: var(--text-faint); font: 0.65rem var(--mono); letter-spacing: 0.1em; }
-  .ctx-page-title { font-size: 1.65rem; font-weight: 500; letter-spacing: -0.02em; margin: 3px 0 30px; }
-  .ctx-title {
-    font: 700 0.67rem var(--mono); text-transform: uppercase; letter-spacing: 0.1em;
-    color: var(--text-muted); margin: 0 0 12px; display: flex; align-items: center; gap: 8px;
-  }
-  .count-badge { color: var(--text-faint); font-weight: 400; }
-  .ctx-empty { color: var(--text-muted); font-size: 0.85rem; padding: 8px 0; }
-  .ctx-error { color: var(--text-base); }
-  .ctx-banner {
-    color: var(--text-base); border-left: 2px solid var(--text-base); padding: 8px 14px; font-size: 0.82rem; margin-bottom: 18px;
-  }
-  .status-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--border-strong); border-bottom: var(--rule); }
-  .status-card {
-    border-right: var(--rule); padding: 16px 18px 18px 0; margin-right: 18px; font-size: 0.82rem;
-  }
-  .status-card:last-child { border-right: 0; margin-right: 0; }
-  .status-label { font: 600 0.65rem var(--mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 10px; }
-  .status-sub { color: var(--text-muted); margin-top: 8px; font: 0.7rem var(--mono); }
-  .budget-bar { height: 5px; background: var(--bg-deep); border: var(--rule); overflow: hidden; }
-  .budget-fill { height: 100%; transition: width 0.3s; background: var(--text-base); }
-  .budget-fill.mid { background: var(--text-muted); }
-  .budget-fill.warn { background: var(--text-base); }
-  .src-row { display: flex; justify-content: space-between; padding: 2px 0; color: var(--text-muted); }
-  .src-row b { color: var(--text-base); font: 600 0.72rem var(--mono); text-align: right; }
-  .hist-error { margin-top: 6px; color: var(--text-base); font: 0.7rem var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ctx-actions { margin-top: 12px; }
-  .compact-btn {
-    background: var(--accent); color: var(--bg-deep); border: 1px solid var(--accent);
-    border-radius: 1px; padding: 8px 16px; font-size: 0.83rem; cursor: pointer;
-  }
-  .compact-btn:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
-  .compact-btn:disabled { opacity: 0.5; cursor: default; }
-  .comp-list { border-top: 1px solid var(--border-strong); }
-  .comp-card { border-bottom: var(--rule); padding: 16px 0 18px; }
-  .comp-head { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; font: 0.68rem var(--mono); color: var(--text-muted); }
-  .tier-badge {
-    font-weight: 700; color: var(--text-base); text-transform: uppercase;
-  }
-  .tier-dropped { opacity: 0.5; text-decoration: line-through; }
-  .comp-range { font-weight: 600; color: var(--text-base); }
-  .comp-importance { margin-left: auto; }
-  .comp-summary { font-size: 0.85rem; line-height: 1.55; color: var(--text-base); white-space: pre-wrap; }
-  .comp-facts { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px 14px; }
-  .fact-chip, .cat-chip {
-    font: 0.67rem var(--mono); color: var(--text-muted);
-  }
-  .mem-list { border-top: 1px solid var(--border-strong); }
-  .mem-row { display: grid; grid-template-columns: 150px 1fr 70px; align-items: start; gap: 18px; font-size: 0.83rem; padding: 11px 0; border-bottom: var(--rule); }
-  .mem-content { flex: 1; color: var(--text-base); }
-  .mem-imp { color: var(--text-muted); font: 0.68rem var(--mono); white-space: nowrap; text-align: right; }
-  @media (max-width: 860px) { .status-grid { grid-template-columns: 1fr 1fr; } .status-card:nth-child(2) { border-right: 0; } }
-  @media (max-width: 560px) {
-    .status-grid { grid-template-columns: 1fr; }
-    .status-card { border-right: 0; border-bottom: var(--rule); margin-right: 0; padding-right: 0; }
-    .status-card:last-child { border-bottom: 0; }
-    .comp-head { align-items: flex-start; flex-wrap: wrap; }
-    .comp-importance { margin-left: 0; }
-    .comp-date { width: 100%; }
-    .mem-row { grid-template-columns: 1fr; gap: 4px; }
-    .mem-imp { text-align: left; }
-  }
+  .context-overview { display: grid; grid-template-columns: 1.2fr 1fr; border: var(--rule); border-radius: var(--radius); background: var(--bg-raised); }
+  .budget-panel, .historian-panel { padding: var(--space-6); min-width: 0; }
+  .historian-panel { border-left: var(--rule); }
+  .budget-value { font-size: 1.75rem; font-weight: 550; letter-spacing: -.035em; line-height: 1.3; font-variant-numeric: tabular-nums; }
+  .budget-value > span { font-size: .75rem; font-weight: 400; color: var(--text-muted); letter-spacing: 0; }
+  progress { display: block; width: 100%; height: 6px; border: 0; border-radius: var(--radius-sm); accent-color: var(--accent); background: var(--bg-deep); overflow: hidden; margin-block: var(--space-4); }
+  progress::-webkit-progress-bar { background: var(--bg-deep); }
+  progress::-webkit-progress-value { background: var(--accent); border-radius: var(--radius-sm); }
+  progress::-moz-progress-bar { background: var(--accent); }
+  .budget-description, .historian-panel > p { font-size: .8125rem; color: var(--text-muted); margin: 0 0 var(--space-4); }
+  dl { margin: 0; }
+  dl > div { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); font-size: .8125rem; padding-block: var(--space-2); }
+  dt { color: var(--text-muted); }
+  dd { margin: 0; font-variant-numeric: tabular-nums; font-weight: 500; }
+  .source-list dt { display: flex; align-items: center; gap: var(--space-2); }
+  .source-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+  .source-dot.memories { background: var(--success); }
+  .source-dot.history { background: var(--text-muted); }
+  .context-explainer { margin-top: var(--space-4); color: var(--text-muted); font-size: .8125rem; }
+  .context-explainer summary { display: flex; align-items: center; gap: var(--space-2); cursor: pointer; min-height: 40px; width: fit-content; }
+  .context-explainer > div { padding: var(--space-1) var(--space-4); border-left: var(--rule); margin-left: var(--space-2); max-width: 80ch; }
+  .context-explainer p { margin: 0 0 var(--space-3); }
+  .memory-section, .summary-section { margin-top: var(--space-10); }
+  .section-note { font-size: .75rem; color: var(--text-muted); }
+  .memory-list, .summary-list { border: var(--rule); border-radius: var(--radius); background: var(--bg-raised); }
+  .memory-row { display: grid; grid-template-columns: 150px minmax(0, 1fr) auto; align-items: start; gap: var(--space-4); padding: var(--space-4) var(--space-5); }
+  .memory-row + .memory-row, .summary-row + .summary-row { border-top: var(--rule); }
+  .memory-category { text-transform: capitalize; }
+  .memory-row p { margin: 0; font-size: .875rem; }
+  .importance { color: var(--text-muted); font-size: .6875rem; }
+  .summary-row > summary { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); padding: var(--space-4) var(--space-5); font-size: .8125rem; font-weight: 500; cursor: pointer; }
+  .summary-row time { margin-left: auto; color: var(--text-muted); font-size: .75rem; font-weight: 400; }
+  .summary-body { padding: 0 var(--space-5) var(--space-5); font-size: .875rem; overflow-wrap: anywhere; }
+  .summary-body p { margin-top: 0; white-space: pre-wrap; }
+  .summary-body ul { padding-left: var(--space-5); color: var(--text-muted); }
+  .notice { margin-bottom: var(--space-5); }
+  @media (max-width: 900px) { .context-overview { grid-template-columns: 1fr; } .historian-panel { border-left: 0; border-top: var(--rule); } .memory-row { grid-template-columns: 1fr; gap: var(--space-2); } }
+  @media (max-width: 640px) { .budget-panel, .historian-panel { padding: var(--space-4); } .summary-row time { margin-left: 0; } .budget-value > span { display: block; margin-top: var(--space-1); } }
 </style>
