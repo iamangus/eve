@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test'
 import AxeBuilder from '@axe-core/playwright'
 import { installWorkspace } from './fixtures.js'
 
-const screens = ['chat', 'tasks', 'email', 'context', 'channels', 'identities']
+const screens = ['chat', 'tasks', 'inference', 'email', 'context', 'channels', 'identities']
 
 for (const theme of ['light', 'dark']) {
   test(`${theme} workspace screens have accessible structure and contrast`, async ({ page }, testInfo) => {

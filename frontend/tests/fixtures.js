@@ -55,6 +55,8 @@ export async function installWorkspace(page, { empty = false, errors = [] } = {}
     else if (url.pathname === '/api/identities') result = { identities }
     else if (url.pathname === '/api/channels') result = { channels: empty ? channels.slice(0, 1) : channels, health: { email: { last_check: now }, matrix: { last_check: now } }, queues: { outbound: { pending: 0, leased: 0, failed: 0 }, matrix_inbound: { pending: 0, leased: 0, failed: 0 } } }
     else if (url.pathname === '/api/context') result = context
+    else if (url.pathname === '/api/inference/providers') result = url.searchParams.has('provider_id') ? { id: 'local', name: 'Local inference', provider_type: 'custom', scope: 'server_aggregate', available: true, queue_depth: 0, queue_mean_ms: 125, ttft_mean_ms: 340, cache_hit_ratio: .8, prefill_tokens_per_second: 1200, output_tokens_per_second: 42, rate_window_seconds: 10, sampled_at: now } : { providers: [{ id: 'local', name: 'Local inference', provider_type: 'custom' }] }
+    else if (url.pathname.endsWith('/inference')) result = { attempts: [{ id: 'call', model: 'local-model', provider_id: 'local', status: 'completed', activity_attempt: 1, http_attempt: 1, metrics: { input_tokens: 100, output_tokens: 10, cached_input_tokens: 80, cache_hit_ratio: .8, time_to_first_token_ms: 100, observed_output_tokens_per_second: 42, duration_ms: 350 } }] }
     await route.fulfill({ json: result })
   })
   return { conversation, tasks }
