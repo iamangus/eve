@@ -6,6 +6,7 @@
   import { HUB_EVENT, parseHubEvent } from '../lib/events.js'
   import Icon from '../components/Icon.svelte'
   import EmptyState from '../components/EmptyState.svelte'
+  import InferenceMetrics from '../components/InferenceMetrics.svelte'
   import { scrollRegion } from '../lib/scrollRegion.js'
 
   marked.setOptions({ gfm: true, breaks: true })
@@ -625,6 +626,7 @@
                 {@html renderMarkdown(msg.content)}
               {/if}
             </div>
+            {#if msg.role === 'assistant' && msg.id && currentConv?.id}<InferenceMetrics conversationID={currentConv.id} messageID={msg.id} />{/if}
             </div>
           </div>
         {/each}

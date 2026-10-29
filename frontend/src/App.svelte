@@ -8,9 +8,10 @@
   import Channels from './pages/Channels.svelte'
   import Tasks from './pages/Tasks.svelte'
   import Identities from './pages/Identities.svelte'
+  import Inference from './pages/Inference.svelte'
 
   const sections = [
-    { label: 'Workspace', pages: [{ id: 'chat', label: 'Chat' }, { id: 'tasks', label: 'Tasks' }] },
+    { label: 'Workspace', pages: [{ id: 'chat', label: 'Chat' }, { id: 'tasks', label: 'Tasks' }, { id: 'inference', label: 'Inference' }] },
     { label: 'Manage', pages: [{ id: 'email', label: 'Email' }, { id: 'context', label: 'Context' }, { id: 'channels', label: 'Channels' }, { id: 'identities', label: 'Identities' }] },
   ]
   const pageNames = Object.fromEntries(sections.flatMap(section => section.pages.map(page => [page.id, page.label])))
@@ -112,7 +113,8 @@
       {:else if tab === 'email'}<EmailTriggers />
       {:else if tab === 'context'}<Context />
       {:else if tab === 'channels'}<Channels />
-      {:else if tab === 'identities'}<Identities />{/if}
+      {:else if tab === 'identities'}<Identities />
+      {:else if tab === 'inference'}<Inference />{/if}
     </div>
   </div>
 </div>

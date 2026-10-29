@@ -62,6 +62,14 @@ Browser ──HTTP──> eve BFF ──HTTP + Bearer API key──> agentfoundr
   `active_run_id` by polling agentfoundry's `GET /api/v1/runs/{id}`. Expired
   queue leases are eligible for delivery again after restart.
 
+### Inference observability
+
+Expand **Inference metrics** beneath an assistant reply to see its model calls, including retries and backup attempts. Eve resolves the stored message run/turn IDs server-side; the browser cannot query an arbitrary run through this route. Token totals and cache ratios remain unavailable when any included attempt lacks the required usage. Load all pages for complete totals.
+
+The **Inference** page shows accessible providers' server-wide SGLang statistics and refreshes every ten seconds. Lifetime queue/TTFT means and cache ratios are separate from interval throughput. Hosted or unsupported providers show unavailable. No credentials are sent to the browser.
+
+Requires the corresponding AgentFoundry metrics API/database migration and instrumented worker. Older replies are not backfilled. Proxy timings begin at upstream dispatch, not browser submission; streamed generation rates are observed, not exact device decode speed. Exact prefill and queue timings appear only if reported by the provider. The currently deployed SGLang streaming API does not report these per request.
+
 ### Reliability and privacy
 
 - Authentication remains an external deployment concern; Eve does not add a

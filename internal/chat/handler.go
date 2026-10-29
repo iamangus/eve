@@ -48,6 +48,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/conversations", h.createConversation)
 	mux.HandleFunc("GET /api/conversations/{id}", h.getConversation)
 	mux.HandleFunc("GET /api/conversations/{id}/export", h.exportConversation)
+	mux.HandleFunc("GET /api/conversations/{id}/messages/{message}/inference", h.messageInference)
+	mux.HandleFunc("GET /api/inference/providers", h.providerInference)
 	mux.HandleFunc("DELETE /api/conversations/{id}", h.deleteConversation)
 	mux.HandleFunc("POST /api/conversations/{id}/messages", h.sendMessage)
 	mux.HandleFunc("GET /runs/{id}/events", h.runEvents)
