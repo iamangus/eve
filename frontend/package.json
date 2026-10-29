@@ -5,6 +5,7 @@
   "scripts": {
     "build": "vite build",
     "test": "node --test src/lib/*.test.js",
+    "audit": "node scripts/audit.js",
     "test:e2e": "playwright test",
     "dev": "vite"
   },

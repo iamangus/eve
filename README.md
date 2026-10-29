@@ -64,6 +64,8 @@ Browser ──HTTP──> eve BFF ──HTTP + Bearer API key──> agentfoundr
 
 ### Inference observability
 
+The release audit temporarily allows only build-time advisory `GHSA-gcqx-w48m-w2h4` in Svelte tooling's transitive `deepmerge` dependency, which has no patched upstream release. This user-approved exception expires on 2026-11-28 UTC and fails closed for other advisories, production exposure, registry failures, or an available upstream fix. `npm run audit` applies this policy; plain `npm audit` continues to report the finding. The production bundle does not include this build tooling.
+
 Expand **Inference metrics** beneath an assistant reply to see its model calls, including retries and backup attempts. Eve resolves the stored message run/turn IDs server-side; the browser cannot query an arbitrary run through this route. Token totals and cache ratios remain unavailable when any included attempt lacks the required usage. Load all pages for complete totals.
 
 The **Inference** page shows accessible providers' server-wide SGLang statistics and refreshes every ten seconds. Lifetime queue/TTFT means and cache ratios are separate from interval throughput. Hosted or unsupported providers show unavailable. No credentials are sent to the browser.

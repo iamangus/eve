@@ -17,7 +17,7 @@ e2e:
 	cd frontend && npm run test:e2e
 
 audit: frontend
-	cd frontend && npm audit
+	cd frontend && npm run audit
 	go run golang.org/x/vuln/cmd/govulncheck@latest -tags goolm ./...
 
 check: frontend test e2e vet audit
